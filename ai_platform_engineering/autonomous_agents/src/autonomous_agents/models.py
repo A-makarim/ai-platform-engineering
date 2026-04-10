@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -26,12 +26,12 @@ class TaskStatus(str, Enum):
 # =============================================================================
 
 class CronTrigger(BaseModel):
-    type: TriggerType = TriggerType.CRON
+    type: Literal[TriggerType.CRON] = TriggerType.CRON
     schedule: str = Field(..., description="Cron expression e.g. '0 9 * * *'")
 
 
 class IntervalTrigger(BaseModel):
-    type: TriggerType = TriggerType.INTERVAL
+    type: Literal[TriggerType.INTERVAL] = TriggerType.INTERVAL
     seconds: int | None = None
     minutes: int | None = None
     hours: int | None = None
@@ -47,7 +47,7 @@ class IntervalTrigger(BaseModel):
 
 
 class WebhookTrigger(BaseModel):
-    type: TriggerType = TriggerType.WEBHOOK
+    type: Literal[TriggerType.WEBHOOK] = TriggerType.WEBHOOK
     secret: str | None = Field(None, description="Optional HMAC secret for payload validation")
 
 

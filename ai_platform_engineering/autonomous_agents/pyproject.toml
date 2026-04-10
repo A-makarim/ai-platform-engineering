@@ -42,5 +42,5 @@ testpaths = ["tests"]
 
 [dependency-groups]
 dev = [
-    "ruff>=0.15.5",
+    "ruff==0.15.5",
 ]

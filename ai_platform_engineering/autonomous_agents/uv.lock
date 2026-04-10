@@ -102,7 +102,7 @@ requires-dist = [
 provides-extras = ["dev"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "ruff", specifier = ">=0.15.5" }]
+dev = [{ name = "ruff", specifier = "==0.15.5" }]
 
 [[package]]
 name = "backoff"
