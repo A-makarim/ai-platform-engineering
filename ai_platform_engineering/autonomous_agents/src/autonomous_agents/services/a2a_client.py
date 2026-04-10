@@ -55,7 +55,13 @@ async def invoke_agent(
         "jsonrpc": "2.0",
         "id": str(uuid.uuid4()),
         "method": "message/send",
-        "params": {"message": message},
+        "params": {
+            "message": message,
+            "configuration": {
+                "blocking": True,
+                "acceptedOutputModes": ["text"],
+            },
+        },
     }
 
     logger.info(f"Invoking supervisor at {settings.supervisor_url} for task '{task_id}' (agent={agent!r}, llm_provider={effective_llm!r})")
@@ -69,19 +75,40 @@ async def invoke_agent(
     if "error" in result:
         raise RuntimeError(f"A2A error from supervisor: {result['error']}")
 
-    # Extract text from A2A response — check artifacts first, then status message
+    # Extract text from A2A response using the same 3-step fallback as
+    # utils/a2a_common/a2a_remote_agent_connect.py:
+    #   1. artifacts[].parts — most agents return results here
+    #   2. status.message.parts — used by some agents for final replies
+    #   3. history[] last agent message — fallback when neither above is populated
     try:
         task_result = result["result"]
-        # Try artifacts (most agents return results here)
+
+        # 1. Artifacts
         for artifact in task_result.get("artifacts", []):
             texts = [p["text"] for p in artifact.get("parts", []) if p.get("kind") == "text" and p.get("text")]
             if texts:
                 return " ".join(texts).strip()
-        # Fall back to status message parts
+
+        # 2. Status message parts
         status_parts = task_result.get("status", {}).get("message", {}).get("parts", [])
         texts = [p["text"] for p in status_parts if p.get("kind") == "text" and p.get("text")]
         if texts:
             return " ".join(texts).strip()
+
+        # 3. History — last agent message (skip tool-status emoji lines)
+        for message in reversed(task_result.get("history", [])):
+            if message.get("role") != "agent":
+                continue
+            texts = [
+                p["text"]
+                for p in message.get("parts", [])
+                if p.get("kind") == "text"
+                and p.get("text")
+                and not p["text"].startswith(("🔧", "✅"))
+            ]
+            if texts:
+                return " ".join(texts).strip()
+
     except (KeyError, TypeError):
         pass
 
