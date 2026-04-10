@@ -5,11 +5,10 @@ WORKDIR /app
 # Install uv
 RUN pip install uv
 
-# Copy package definition and install dependencies
-COPY pyproject.toml .
+# Copy package definition and lock file, then install dependencies reproducibly
+COPY pyproject.toml uv.lock ./
 COPY src/ src/
-RUN uv venv .venv && \
-    uv pip install --system -e .
+RUN uv pip install --system -e .
 
 # Copy task config
 COPY config.yaml .

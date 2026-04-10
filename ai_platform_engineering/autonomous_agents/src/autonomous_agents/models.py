@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class TriggerType(str, Enum):
@@ -36,10 +36,16 @@ class IntervalTrigger(BaseModel):
     minutes: int | None = None
     hours: int | None = None
 
+    @model_validator(mode="after")
+    def require_positive_interval(self) -> "IntervalTrigger":
+        total = (self.seconds or 0) + (self.minutes or 0) * 60 + (self.hours or 0) * 3600
+        if total <= 0:
+            raise ValueError("IntervalTrigger requires at least one of seconds, minutes, or hours to be a positive integer")
+        return self
+
 
 class WebhookTrigger(BaseModel):
     type: TriggerType = TriggerType.WEBHOOK
-    path: str = Field(..., description="URL path this task listens on e.g. '/hooks/pr-opened'")
     secret: str | None = Field(None, description="Optional HMAC secret for payload validation")
 
 
@@ -59,7 +65,7 @@ class TaskDefinition(BaseModel):
     trigger: CronTrigger | IntervalTrigger | WebhookTrigger = Field(..., discriminator="type")
     llm_provider: str | None = Field(None, description="Override global LLM provider for this task")
     enabled: bool = True
-    metadata: dict[str, Any] = {}
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 # =============================================================================
@@ -85,4 +91,4 @@ class WebhookPayload(BaseModel):
     """Generic webhook payload — passed as context to the agent prompt."""
     source: str | None = None
     event: str | None = None
-    data: dict[str, Any] = {}
+    data: dict[str, Any] = Field(default_factory=dict)

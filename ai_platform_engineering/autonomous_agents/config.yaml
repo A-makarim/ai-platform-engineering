@@ -52,5 +52,4 @@ tasks:
       Post a summary comment on the PR.
     trigger:
       type: webhook
-      path: "/hooks/pr-review"
     enabled: false
