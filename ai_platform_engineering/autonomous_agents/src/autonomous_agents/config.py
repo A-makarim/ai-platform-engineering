@@ -30,8 +30,8 @@ class Settings(BaseSettings):
     # Webhook secret for validating incoming webhook payloads (optional)
     webhook_secret: str | None = None
 
-    # CORS
-    cors_origins: list[str] = ["*"]
+    # CORS — keep empty by default; open only in explicit dev/test configs
+    cors_origins: list[str] = []
 
 
 @lru_cache

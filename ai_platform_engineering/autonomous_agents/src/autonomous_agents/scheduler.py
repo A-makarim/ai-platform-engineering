@@ -2,6 +2,7 @@
 
 import logging
 import uuid
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any
 
@@ -21,8 +22,8 @@ from autonomous_agents.services.a2a_client import invoke_agent
 
 logger = logging.getLogger("autonomous_agents")
 
-# In-memory run history (last 100 runs per task)
-_run_history: list[TaskRun] = []
+# In-memory run history (last 500 runs); deque provides O(1) left-drop
+_run_history: deque[TaskRun] = deque(maxlen=500)
 _scheduler: AsyncIOScheduler | None = None
 
 
@@ -37,17 +38,21 @@ def get_run_history() -> list[TaskRun]:
     return list(reversed(_run_history))
 
 
-async def _execute_task(task: TaskDefinition, context: dict[str, Any] | None = None) -> None:
-    """Run a single task and record the result."""
+async def _execute_task(task: TaskDefinition, context: dict[str, Any] | None = None) -> TaskRun:
+    """Run a single task, record the result, and return the TaskRun."""
     run_id = str(uuid.uuid4())
     run = TaskRun(run_id=run_id, task_id=task.id, task_name=task.name, status=TaskStatus.RUNNING)
     _run_history.append(run)
-    if len(_run_history) > 500:
-        _run_history.pop(0)
 
     logger.info(f"[{task.id}] Starting run {run_id}")
     try:
-        response = await invoke_agent(prompt=task.prompt, task_id=task.id, context=context)
+        response = await invoke_agent(
+            prompt=task.prompt,
+            task_id=task.id,
+            agent=task.agent,
+            llm_provider=task.llm_provider,
+            context=context,
+        )
         run.status = TaskStatus.SUCCESS
         run.response_preview = response[:500]
         logger.info(f"[{task.id}] Run {run_id} succeeded. Preview: {response[:120]}...")
@@ -57,6 +62,8 @@ async def _execute_task(task: TaskDefinition, context: dict[str, Any] | None = N
         logger.error(f"[{task.id}] Run {run_id} failed: {e}")
     finally:
         run.finished_at = datetime.now(timezone.utc)
+
+    return run
 
 
 def register_tasks(tasks: list[TaskDefinition]) -> None:
@@ -74,12 +81,16 @@ def register_tasks(tasks: list[TaskDefinition]) -> None:
             continue
 
         if trigger.type == TriggerType.CRON:
-            assert isinstance(trigger, CronTrigger)
+            if not isinstance(trigger, CronTrigger):
+                logger.warning(f"[{task.id}] Expected CronTrigger, got {type(trigger).__name__} — skipping")
+                continue
             aps_trigger = APSCronTrigger.from_crontab(trigger.schedule, timezone="UTC")
             logger.info(f"[{task.id}] Scheduling cron: {trigger.schedule}")
 
         elif trigger.type == TriggerType.INTERVAL:
-            assert isinstance(trigger, IntervalTrigger)
+            if not isinstance(trigger, IntervalTrigger):
+                logger.warning(f"[{task.id}] Expected IntervalTrigger, got {type(trigger).__name__} — skipping")
+                continue
             aps_trigger = APSIntervalTrigger(
                 seconds=trigger.seconds or 0,
                 minutes=trigger.minutes or 0,
@@ -106,12 +117,5 @@ def register_tasks(tasks: list[TaskDefinition]) -> None:
 
 
 async def fire_webhook_task(task: TaskDefinition, context: dict[str, Any]) -> TaskRun:
-    """Immediately execute a webhook-triggered task."""
-    run_id = str(uuid.uuid4())
-    run = TaskRun(run_id=run_id, task_id=task.id, task_name=task.name, status=TaskStatus.RUNNING)
-    _run_history.append(run)
-
-    await _execute_task(task, context=context)
-
-    # Return the updated run record
-    return next(r for r in reversed(_run_history) if r.run_id == run_id)
+    """Immediately execute a webhook-triggered task and return the completed run."""
+    return await _execute_task(task, context=context)

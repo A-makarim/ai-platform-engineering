@@ -2,6 +2,7 @@
 
 import hashlib
 import hmac
+import json
 import logging
 
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -41,7 +42,8 @@ async def receive_webhook(
     body = await request.body()
 
     # Validate HMAC signature if a secret is configured on the trigger
-    assert isinstance(task.trigger, WebhookTrigger)
+    if not isinstance(task.trigger, WebhookTrigger):
+        raise HTTPException(status_code=500, detail=f"Task '{task_id}' is not a webhook task")
     if task.trigger.secret:
         if not x_hub_signature_256:
             raise HTTPException(status_code=401, detail="Missing X-Hub-Signature-256 header")
@@ -54,7 +56,6 @@ async def receive_webhook(
     # Parse body as JSON context (best-effort)
     context: dict = {}
     try:
-        import json
         context = json.loads(body)
     except Exception:
         pass
