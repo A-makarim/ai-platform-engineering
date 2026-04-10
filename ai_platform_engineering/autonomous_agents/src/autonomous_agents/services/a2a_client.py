@@ -58,7 +58,7 @@ async def invoke_agent(
         "params": {"message": message},
     }
 
-    logger.info(f"Invoking supervisor at {settings.supervisor_url} for task '{task_id}' (agent={agent!r})")
+    logger.info(f"Invoking supervisor at {settings.supervisor_url} for task '{task_id}' (agent={agent!r}, llm_provider={effective_llm!r})")
 
     async with httpx.AsyncClient(timeout=300) as client:
         response = await client.post(settings.supervisor_url, json=payload)

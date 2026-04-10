@@ -38,8 +38,10 @@ class IntervalTrigger(BaseModel):
 
     @model_validator(mode="after")
     def require_positive_interval(self) -> "IntervalTrigger":
-        total = (self.seconds or 0) + (self.minutes or 0) * 60 + (self.hours or 0) * 3600
-        if total <= 0:
+        invalid = [name for name, val in [("seconds", self.seconds), ("minutes", self.minutes), ("hours", self.hours)] if val is not None and val <= 0]
+        if invalid:
+            raise ValueError(f"IntervalTrigger fields must be positive integers: {', '.join(invalid)}")
+        if not any([self.seconds, self.minutes, self.hours]):
             raise ValueError("IntervalTrigger requires at least one of seconds, minutes, or hours to be a positive integer")
         return self
 
