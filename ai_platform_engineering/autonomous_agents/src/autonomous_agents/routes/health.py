@@ -1,7 +1,7 @@
 """Health check endpoint."""
 
-from fastapi import APIRouter
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from fastapi import APIRouter
 
 from autonomous_agents.scheduler import get_scheduler
 

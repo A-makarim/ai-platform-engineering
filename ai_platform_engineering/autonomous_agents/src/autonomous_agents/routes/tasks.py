@@ -3,7 +3,7 @@
 from fastapi import APIRouter, HTTPException
 
 from autonomous_agents.models import TaskDefinition, TaskRun
-from autonomous_agents.scheduler import get_run_history, get_scheduler, _execute_task
+from autonomous_agents.scheduler import _execute_task, get_run_history, get_scheduler
 
 router = APIRouter(tags=["tasks"])
 

@@ -1,6 +1,5 @@
 """Autonomous Agents FastAPI Application."""
 
-import os
 from contextlib import asynccontextmanager
 
 from autonomous_agents.log_config import setup_logging
