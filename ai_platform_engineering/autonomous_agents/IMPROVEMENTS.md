@@ -37,27 +37,6 @@ the UI on top of. None of them change the public API shape.
 
 ---
 
-### IMP-01 — Persist run history to MongoDB
-- **Status**: TODO
-- **Why**: Today runs live in an in-memory `deque(maxlen=500)` in `scheduler.py`.
-  Lost on restart. Chatty interval tasks evict important runs. Audit trail = nil.
-  Also blocks the UI integration (the UI needs to query historical runs).
-- **Approach**:
-  1. Add `MONGODB_URI`, `MONGODB_DATABASE` to `config.py` (optional — fallback
-     to deque when unset, so dev still works).
-  2. New `services/run_store.py` with `MongoRunStore` + `InMemoryRunStore`
-     behind a small `RunStore` Protocol.
-  3. `scheduler._execute_task` writes to whichever store is configured.
-  4. `routes/tasks.py` reads runs from the store, not the deque directly.
-  5. Schema: `{ task_id, run_id, started_at, finished_at, status, prompt,
-     response, error, duration_ms, agent, llm_provider }`.
-  6. Index on `(task_id, started_at desc)`.
-- **Touches**: `config.py`, `scheduler.py`, `routes/tasks.py`,
-  `services/run_store.py` (new), `tests/test_run_store.py` (new),
-  `pyproject.toml` (`motor`).
-
----
-
 ### IMP-02 — Retries + configurable timeout in `a2a_client.py`
 - **Status**: TODO
 - **Why**: Hard-coded `httpx.AsyncClient(timeout=300)`, zero retries.
@@ -308,8 +287,32 @@ Don't do these until you have a real reason. Premature.
 
 ## Done
 
-_(Move completed items here, or just delete them. Keep this section as a
-short audit trail.)_
+_Short audit trail of completed items. Newest first._
+
+### IMP-01 — Persist run history to MongoDB
+- **Shipped on**: branch `prebuild/feat/autonomous-agents-mongo-store`
+- **What landed**:
+  - New `services/run_store.py` exposing a `RunStore` Protocol with
+    two implementations: `InMemoryRunStore` (legacy bounded deque
+    behaviour) and `MongoRunStore` (motor / async).
+  - `create_run_store(...)` factory selects the backend from settings;
+    partial Mongo config falls back to in-memory.
+  - `Settings` extended with `MONGODB_URI`, `MONGODB_DATABASE`,
+    `MONGODB_COLLECTION` (default `autonomous_runs`), and
+    `RUN_HISTORY_MAXLEN` (default 500).
+  - `scheduler._execute_task` records RUNNING and terminal
+    (SUCCESS|FAILED) states through the store via upsert-by-`run_id`.
+  - `routes/tasks.py` reads runs from the store directly; the legacy
+    deque is gone.
+  - `main.py` lifespan builds the store, calls `ensure_indexes()`
+    when applicable, and injects it into the scheduler module.
+  - Mongo indexes: unique on `run_id`, compound on
+    `(task_id ASC, started_at DESC)`.
+  - 38 new unit tests across 4 files (`test_run_store.py`,
+    `test_mongo_run_store.py`, `test_run_store_factory.py`,
+    `test_scheduler_run_store.py`); MongoDB tested via
+    `mongomock-motor` so no real DB needed.
+  - README documents the persistence model and the new env vars.
 
 ---
 

@@ -137,6 +137,45 @@ tasks:
 | `PORT` | `8002` | Server port |
 | `WEBHOOK_SECRET` | `None` | Global HMAC secret for webhook validation |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `MONGODB_URI` | `None` | Optional. Enables MongoDB-backed run history. See *Run History Persistence*. |
+| `MONGODB_DATABASE` | `None` | Optional. MongoDB database name. Required together with `MONGODB_URI`. |
+| `MONGODB_COLLECTION` | `autonomous_runs` | MongoDB collection name for run history. |
+| `RUN_HISTORY_MAXLEN` | `500` | Max runs retained by the in-memory store when MongoDB is not configured. |
+
+---
+
+## Run History Persistence
+
+The service records one entry per task run (a `TaskRun`) and exposes
+them via `GET /api/v1/runs` and `GET /api/v1/tasks/{id}/runs`.
+
+Two backends are supported and selected automatically by environment
+variables. Both implement the same `RunStore` protocol so the
+scheduler and HTTP routes are agnostic to which one is active:
+
+| Mode | Activated by | Trade-offs |
+|---|---|---|
+| **In-memory (default)** | Neither `MONGODB_URI` nor `MONGODB_DATABASE` set | Zero infra, instant startup. **Lost on restart**. Bounded by `RUN_HISTORY_MAXLEN` (default 500), oldest evicted FIFO. Suitable for development and demos. |
+| **MongoDB** | **Both** `MONGODB_URI` *and* `MONGODB_DATABASE` set | Persistent across restarts, queryable from external tools, no eviction. Required for production and for the upcoming UI integration (the UI reads run history from this store). |
+
+Partial Mongo configuration (only `MONGODB_URI` or only
+`MONGODB_DATABASE`) is treated as **not configured** and falls back
+to in-memory — silently engaging Mongo on half-config would mask
+typical env-var typos and write history to the wrong place.
+
+The MongoDB schema is one document per run, mirroring the `TaskRun`
+model. Two indexes are created automatically at startup:
+
+- Unique on `run_id` — guards against duplicate inserts on retry.
+- Compound `(task_id ASC, started_at DESC)` — supports the
+  list-by-task and list-all queries without a collection scan.
+
+The startup log line tells you which backend is active:
+
+```
+RunStore: MongoDB (database=autonomous_agents, collection=autonomous_runs)
+RunStore: in-memory (maxlen=500) — set MONGODB_URI and MONGODB_DATABASE to persist run history
+```
 
 ---
 
