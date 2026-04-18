@@ -16,7 +16,7 @@ module and plug in via :func:`get_run_store` once configured.
 """
 
 from collections import deque
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from autonomous_agents.models import TaskRun
 
@@ -105,3 +105,94 @@ class InMemoryRunStore:
                 if len(out) >= limit:
                     break
         return out
+
+
+# Default collection name. Kept module-level so callers and tests share the
+# same value without re-stating it.
+DEFAULT_COLLECTION_NAME = "autonomous_runs"
+
+
+class MongoRunStore:
+    """MongoDB-backed :class:`RunStore` (motor / async).
+
+    Schema (one document per run, ``_id`` mirrors ``run_id``)::
+
+        {
+            "_id":              <run_id>,
+            "run_id":           <run_id>,
+            "task_id":          <task id>,
+            "task_name":        <human-readable task name>,
+            "status":           "running" | "success" | "failed" | ...,
+            "started_at":       <BSON datetime, UTC>,
+            "finished_at":      <BSON datetime, UTC> | null,
+            "response_preview": <str> | null,
+            "error":            <str> | null,
+            ... any future fields added to TaskRun ...
+        }
+
+    Indexes (created by :meth:`ensure_indexes`):
+      - ``run_id`` unique — guards against duplicate inserts on retry.
+      - ``(task_id ASC, started_at DESC)`` — supports both
+        ``list_by_task`` (filter + sort) and ``list_all`` (sort) without
+        a collection scan.
+
+    The constructor takes an already-built motor client so the caller
+    owns its lifecycle (and tests can inject ``AsyncMongoMockClient``
+    from ``mongomock_motor``).
+    """
+
+    def __init__(
+        self,
+        client: Any,
+        database_name: str,
+        collection_name: str = DEFAULT_COLLECTION_NAME,
+    ) -> None:
+        if not database_name:
+            raise ValueError("database_name must be a non-empty string")
+        if not collection_name:
+            raise ValueError("collection_name must be a non-empty string")
+        self._client = client
+        self._collection = client[database_name][collection_name]
+
+    async def ensure_indexes(self) -> None:
+        """Create indexes if they don't already exist. Idempotent.
+
+        Call once at application startup. Mongo's ``create_index`` is a
+        no-op when the index already exists with the same spec.
+        """
+        await self._collection.create_index("run_id", unique=True)
+        await self._collection.create_index([("task_id", 1), ("started_at", -1)])
+
+    async def record(self, run: TaskRun) -> None:
+        # model_dump() (default mode="python") preserves datetime objects
+        # so pymongo encodes them as native BSON datetime — required for
+        # the (task_id, started_at desc) index to be useful.
+        doc = run.model_dump()
+        # Pin _id to run_id so upserts replace in place rather than
+        # creating a new document with a server-generated ObjectId on
+        # each call. Without this, a RUNNING -> SUCCESS update would
+        # leave two rows behind.
+        doc["_id"] = run.run_id
+        await self._collection.replace_one({"_id": run.run_id}, doc, upsert=True)
+
+    async def list_all(self, limit: int = 500) -> list[TaskRun]:
+        if limit <= 0:
+            return []
+        cursor = self._collection.find({}, sort=[("started_at", -1)]).limit(limit)
+        return [self._doc_to_run(doc) async for doc in cursor]
+
+    async def list_by_task(self, task_id: str, limit: int = 100) -> list[TaskRun]:
+        if limit <= 0:
+            return []
+        cursor = self._collection.find(
+            {"task_id": task_id},
+            sort=[("started_at", -1)],
+        ).limit(limit)
+        return [self._doc_to_run(doc) async for doc in cursor]
+
+    @staticmethod
+    def _doc_to_run(doc: dict[str, Any]) -> TaskRun:
+        # Mongo always returns _id; TaskRun has no such field so strip it
+        # before validating to avoid Pydantic raising on extras.
+        doc.pop("_id", None)
+        return TaskRun.model_validate(doc)
