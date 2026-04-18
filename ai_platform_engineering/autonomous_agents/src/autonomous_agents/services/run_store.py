@@ -132,9 +132,14 @@ class MongoRunStore:
 
     Indexes (created by :meth:`ensure_indexes`):
       - ``run_id`` unique — guards against duplicate inserts on retry.
-      - ``(task_id ASC, started_at DESC)`` — supports both
-        ``list_by_task`` (filter + sort) and ``list_all`` (sort) without
-        a collection scan.
+      - ``(task_id ASC, started_at DESC)`` — serves ``list_by_task``
+        (filter + sort) without a collection scan.
+      - ``started_at DESC`` — serves the global ``list_all`` sort.
+        The compound index above can't be used here because Mongo
+        only walks a compound index for a sort if the query also
+        filters (or equality-matches) on the leading prefix
+        (``task_id``); a plain ``find({})`` falls back to a full
+        in-memory sort instead.
 
     The constructor takes an already-built motor client so the caller
     owns its lifecycle (and tests can inject ``AsyncMongoMockClient``
@@ -162,6 +167,10 @@ class MongoRunStore:
         """
         await self._collection.create_index("run_id", unique=True)
         await self._collection.create_index([("task_id", 1), ("started_at", -1)])
+        # Required for /runs (list_all): sorts by started_at across
+        # all tasks. The compound index above leads on task_id, so
+        # Mongo will not use it to back an unfiltered sort.
+        await self._collection.create_index([("started_at", -1)])
 
     async def record(self, run: TaskRun) -> None:
         # model_dump() (default mode="python") preserves datetime objects

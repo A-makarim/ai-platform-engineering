@@ -85,12 +85,16 @@ async def test_ensure_indexes_is_idempotent(store: MongoRunStore):
     await store.ensure_indexes()
     await store.ensure_indexes()
     info = await store._collection.index_information()
-    # _id_ is created automatically by mongo; we add 2 more.
+    # _id_ is created automatically by mongo; we add 3 more.
     assert "_id_" in info
-    # Look for the two indexes we requested by checking their key specs.
+    # Look for the three indexes we requested by checking their key specs.
     keys = {tuple(idx["key"]) for idx in info.values()}
     assert (("run_id", 1),) in keys
     assert (("task_id", 1), ("started_at", -1)) in keys
+    # Required so list_all() can serve a global sort without a
+    # collection scan — the compound index above leads on task_id
+    # and is unusable for an unfiltered sort.
+    assert (("started_at", -1),) in keys
 
 
 async def test_record_and_list_all_returns_newest_first(store: MongoRunStore):
