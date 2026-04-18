@@ -196,3 +196,34 @@ class MongoRunStore:
         # before validating to avoid Pydantic raising on extras.
         doc.pop("_id", None)
         return TaskRun.model_validate(doc)
+
+
+def create_run_store(
+    mongodb_uri: str | None = None,
+    mongodb_database: str | None = None,
+    mongodb_collection: str = DEFAULT_COLLECTION_NAME,
+    in_memory_maxlen: int = 500,
+) -> RunStore:
+    """Build the :class:`RunStore` appropriate for the current configuration.
+
+    Returns a :class:`MongoRunStore` when **both** ``mongodb_uri`` and
+    ``mongodb_database`` are provided; otherwise a fresh
+    :class:`InMemoryRunStore` bounded by ``in_memory_maxlen``.
+
+    Either Mongo setting on its own is treated as missing — partially
+    configured persistence is almost always a misconfiguration, and
+    silently falling back to in-memory rather than crashing on startup
+    would lose data without the operator noticing.
+
+    The motor client is constructed lazily by the time :meth:`record`
+    or any read is awaited; this function does no network I/O.
+    """
+    if mongodb_uri and mongodb_database:
+        # Local import keeps motor optional at import time and lets the
+        # in-memory branch run in environments where motor isn't even
+        # installed (e.g. minimal test rigs).
+        from motor.motor_asyncio import AsyncIOMotorClient
+
+        client = AsyncIOMotorClient(mongodb_uri)
+        return MongoRunStore(client, mongodb_database, mongodb_collection)
+    return InMemoryRunStore(maxlen=in_memory_maxlen)
