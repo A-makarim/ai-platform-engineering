@@ -85,16 +85,39 @@ async def test_ensure_indexes_is_idempotent(store: MongoRunStore):
     await store.ensure_indexes()
     await store.ensure_indexes()
     info = await store._collection.index_information()
-    # _id_ is created automatically by mongo; we add 3 more.
+    # _id_ is created automatically by mongo; we add 2 more.
     assert "_id_" in info
-    # Look for the three indexes we requested by checking their key specs.
     keys = {tuple(idx["key"]) for idx in info.values()}
-    assert (("run_id", 1),) in keys
     assert (("task_id", 1), ("started_at", -1)) in keys
     # Required so list_all() can serve a global sort without a
     # collection scan — the compound index above leads on task_id
     # and is unusable for an unfiltered sort.
     assert (("started_at", -1),) in keys
+
+
+async def test_ensure_indexes_does_not_create_redundant_run_id_index(store: MongoRunStore):
+    """Regression: ``record()`` pins ``_id = run_id``, so Mongo's
+    automatic ``_id_`` index already enforces uniqueness on run_id.
+    Adding a second unique ``run_id`` index would just duplicate
+    that guarantee at the cost of an extra B-tree on every write."""
+    await store.ensure_indexes()
+    info = await store._collection.index_information()
+    keys = {tuple(idx["key"]) for idx in info.values()}
+    assert (("run_id", 1),) not in keys
+
+
+async def test_id_field_enforces_run_id_uniqueness(store: MongoRunStore):
+    """Belt-and-braces: prove the _id-based uniqueness still holds
+    after the dedicated run_id index was removed. Two ``record()``
+    calls with the same run_id must collapse into a single document
+    via upsert, never raise a duplicate-key error."""
+    await store.ensure_indexes()
+    await store.record(_make_run("dup", status=TaskStatus.RUNNING))
+    await store.record(_make_run("dup", status=TaskStatus.SUCCESS))
+
+    runs = await store.list_all()
+    assert len(runs) == 1
+    assert runs[0].status == TaskStatus.SUCCESS
 
 
 async def test_record_and_list_all_returns_newest_first(store: MongoRunStore):

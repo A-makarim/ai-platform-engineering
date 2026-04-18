@@ -132,7 +132,6 @@ class MongoRunStore:
         }
 
     Indexes (created by :meth:`ensure_indexes`):
-      - ``run_id`` unique — guards against duplicate inserts on retry.
       - ``(task_id ASC, started_at DESC)`` — serves ``list_by_task``
         (filter + sort) without a collection scan.
       - ``started_at DESC`` — serves the global ``list_all`` sort.
@@ -141,6 +140,11 @@ class MongoRunStore:
         filters (or equality-matches) on the leading prefix
         (``task_id``); a plain ``find({})`` falls back to a full
         in-memory sort instead.
+
+    Run-id uniqueness is enforced by Mongo's automatic ``_id_``
+    index because :meth:`record` pins ``_id = run_id`` — adding a
+    second unique index on ``run_id`` would just duplicate that
+    guarantee at the cost of an extra B-tree on every write.
 
     The constructor takes an already-built motor client so the caller
     owns its lifecycle (and tests can inject ``AsyncMongoMockClient``
@@ -165,8 +169,12 @@ class MongoRunStore:
 
         Call once at application startup. Mongo's ``create_index`` is a
         no-op when the index already exists with the same spec.
+
+        We deliberately do NOT add a unique index on ``run_id``:
+        :meth:`record` pins ``_id = run_id``, and Mongo's automatic
+        ``_id_`` index already enforces uniqueness on that field. A
+        second unique index would only add write overhead.
         """
-        await self._collection.create_index("run_id", unique=True)
         await self._collection.create_index([("task_id", 1), ("started_at", -1)])
         # Required for /runs (list_all): sorts by started_at across
         # all tasks. The compound index above leads on task_id, so
@@ -229,9 +237,13 @@ def create_run_store(
     or any read is awaited; this function does no network I/O.
     """
     if mongodb_uri and mongodb_database:
-        # Local import keeps motor optional at import time and lets the
-        # in-memory branch run in environments where motor isn't even
-        # installed (e.g. minimal test rigs).
+        # Deferred import keeps the motor dependency out of the call
+        # graph until we actually need a Mongo-backed store. ``motor``
+        # *is* a hard runtime dependency of this package (see
+        # pyproject.toml), but a lazy import means the in-memory
+        # branch — and any code that just imports this module for the
+        # protocol or the in-memory class — never pays motor's import
+        # cost (or fails on incompatibility) when Mongo is unused.
         from motor.motor_asyncio import AsyncIOMotorClient
 
         # ``tz_aware=True`` makes pymongo/motor return UTC-aware

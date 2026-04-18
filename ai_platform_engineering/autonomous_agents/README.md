@@ -164,9 +164,11 @@ to in-memory — silently engaging Mongo on half-config would mask
 typical env-var typos and write history to the wrong place.
 
 The MongoDB schema is one document per run, mirroring the `TaskRun`
-model. Three indexes are created automatically at startup:
+model. Each run is stored with `_id = run_id`, so Mongo's automatic
+`_id_` index already enforces run-id uniqueness — no extra unique
+index is needed. Two additional indexes are created automatically
+at startup:
 
-- Unique on `run_id` — guards against duplicate inserts on retry.
 - Compound `(task_id ASC, started_at DESC)` — backs the
   list-by-task query (`GET /tasks/{id}/runs`) without a collection
   scan.
