@@ -52,6 +52,24 @@ def set_run_store(store: RunStore) -> None:
     _run_store = store
 
 
+async def _record_safely(store: RunStore, run: TaskRun) -> None:
+    """Persist ``run`` and swallow store-side exceptions.
+
+    Run-history persistence is observability, not the source of truth
+    for whether a task ran. A flaky MongoDB or transient network blip
+    must never abort task execution or surface a 500 on the webhook
+    that triggered the run. We log loudly so the failure is still
+    visible to operators, then return so the scheduler keeps marching.
+    """
+    try:
+        await store.record(run)
+    except Exception as exc:
+        logger.error(
+            f"[{run.task_id}] Failed to persist run {run.run_id} "
+            f"(status={run.status}): {exc}"
+        )
+
+
 async def _execute_task(task: TaskDefinition, context: dict[str, Any] | None = None) -> TaskRun:
     """Run a single task, record the result, and return the TaskRun."""
     run_id = str(uuid.uuid4())
@@ -59,8 +77,9 @@ async def _execute_task(task: TaskDefinition, context: dict[str, Any] | None = N
 
     store = get_run_store()
     # Persist the RUNNING state so observers (UI, CLI) can see in-flight
-    # work, not only completed runs.
-    await store.record(run)
+    # work, not only completed runs. Failure here MUST NOT abort the
+    # task — see _record_safely.
+    await _record_safely(store, run)
 
     logger.info(f"[{task.id}] Starting run {run_id}")
     try:
@@ -82,8 +101,9 @@ async def _execute_task(task: TaskDefinition, context: dict[str, Any] | None = N
         run.finished_at = datetime.now(timezone.utc)
         # Persist the terminal state — RunStore.record is upsert by
         # run_id, so this updates the same document/entry rather than
-        # appending a duplicate.
-        await store.record(run)
+        # appending a duplicate. Again wrapped to keep store outages
+        # from masking the real task outcome.
+        await _record_safely(store, run)
 
     return run
 
