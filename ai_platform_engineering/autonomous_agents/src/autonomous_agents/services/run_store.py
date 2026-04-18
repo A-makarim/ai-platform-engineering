@@ -16,6 +16,7 @@ module and plug in via :func:`get_run_store` once configured.
 """
 
 from collections import deque
+from datetime import timezone
 from typing import Any, Protocol, runtime_checkable
 
 from autonomous_agents.models import TaskRun
@@ -233,6 +234,21 @@ def create_run_store(
         # installed (e.g. minimal test rigs).
         from motor.motor_asyncio import AsyncIOMotorClient
 
-        client = AsyncIOMotorClient(mongodb_uri)
+        # ``tz_aware=True`` makes pymongo/motor return UTC-aware
+        # ``datetime`` objects when reading BSON dates. Without it,
+        # the driver yields naive datetimes and ``TaskRun`` ends up
+        # with a mix: ``started_at``/``finished_at`` are tz-aware on
+        # the write path (we set ``datetime.now(timezone.utc)``) but
+        # tz-naive on the read path (after Mongo round-trip). That
+        # breaks downstream comparisons (``a < b`` raises TypeError
+        # across naive/aware) and serialises inconsistently in the
+        # API response. ``tzinfo=timezone.utc`` pins the returned
+        # tzinfo so we never accidentally interpret stored timestamps
+        # in local time.
+        client = AsyncIOMotorClient(
+            mongodb_uri,
+            tz_aware=True,
+            tzinfo=timezone.utc,
+        )
         return MongoRunStore(client, mongodb_database, mongodb_collection)
     return InMemoryRunStore(maxlen=in_memory_maxlen)

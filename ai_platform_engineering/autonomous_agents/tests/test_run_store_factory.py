@@ -3,6 +3,9 @@
 
 """Unit tests for the ``create_run_store`` factory function."""
 
+from datetime import timezone
+from unittest.mock import patch
+
 from autonomous_agents.services.run_store import (
     InMemoryRunStore,
     MongoRunStore,
@@ -67,3 +70,21 @@ def test_each_call_returns_a_fresh_instance():
     s1 = create_run_store()
     s2 = create_run_store()
     assert s1 is not s2
+
+
+def test_mongo_client_is_constructed_with_utc_tzinfo():
+    """Regression: pymongo/motor default to ``tz_aware=False``, which
+    yields naive datetimes on read. Mixing those with the tz-aware
+    ones we write breaks downstream comparisons and serialises
+    inconsistently. The factory must opt the client into UTC-aware
+    timestamps so reads round-trip cleanly."""
+    with patch("motor.motor_asyncio.AsyncIOMotorClient") as mock_client_cls:
+        create_run_store(
+            mongodb_uri="mongodb://example:27017",
+            mongodb_database="db",
+        )
+
+    mock_client_cls.assert_called_once()
+    _, kwargs = mock_client_cls.call_args
+    assert kwargs.get("tz_aware") is True
+    assert kwargs.get("tzinfo") is timezone.utc
