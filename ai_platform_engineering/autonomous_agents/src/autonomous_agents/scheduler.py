@@ -2,7 +2,6 @@
 
 import logging
 import uuid
-from collections import deque
 from datetime import datetime, timezone
 from typing import Any
 
@@ -19,12 +18,12 @@ from autonomous_agents.models import (
     TriggerType,
 )
 from autonomous_agents.services.a2a_client import invoke_agent
+from autonomous_agents.services.run_store import InMemoryRunStore, RunStore
 
 logger = logging.getLogger("autonomous_agents")
 
-# In-memory run history (last 500 runs); deque provides O(1) left-drop
-_run_history: deque[TaskRun] = deque(maxlen=500)
 _scheduler: AsyncIOScheduler | None = None
+_run_store: RunStore | None = None
 
 
 def get_scheduler() -> AsyncIOScheduler:
@@ -34,15 +33,34 @@ def get_scheduler() -> AsyncIOScheduler:
     return _scheduler
 
 
-def get_run_history() -> list[TaskRun]:
-    return list(reversed(_run_history))
+def get_run_store() -> RunStore:
+    """Return the active :class:`RunStore`.
+
+    Lazily falls back to an :class:`InMemoryRunStore` if the lifespan
+    hook hasn't injected one yet (e.g. when scheduler functions are
+    exercised directly from unit tests).
+    """
+    global _run_store
+    if _run_store is None:
+        _run_store = InMemoryRunStore()
+    return _run_store
+
+
+def set_run_store(store: RunStore) -> None:
+    """Inject the active :class:`RunStore` — called from the FastAPI lifespan."""
+    global _run_store
+    _run_store = store
 
 
 async def _execute_task(task: TaskDefinition, context: dict[str, Any] | None = None) -> TaskRun:
     """Run a single task, record the result, and return the TaskRun."""
     run_id = str(uuid.uuid4())
     run = TaskRun(run_id=run_id, task_id=task.id, task_name=task.name, status=TaskStatus.RUNNING)
-    _run_history.append(run)
+
+    store = get_run_store()
+    # Persist the RUNNING state so observers (UI, CLI) can see in-flight
+    # work, not only completed runs.
+    await store.record(run)
 
     logger.info(f"[{task.id}] Starting run {run_id}")
     try:
@@ -62,6 +80,10 @@ async def _execute_task(task: TaskDefinition, context: dict[str, Any] | None = N
         logger.error(f"[{task.id}] Run {run_id} failed: {e}")
     finally:
         run.finished_at = datetime.now(timezone.utc)
+        # Persist the terminal state — RunStore.record is upsert by
+        # run_id, so this updates the same document/entry rather than
+        # appending a duplicate.
+        await store.record(run)
 
     return run
 

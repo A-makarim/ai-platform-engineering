@@ -3,7 +3,7 @@
 from fastapi import APIRouter, HTTPException
 
 from autonomous_agents.models import TaskDefinition, TaskRun
-from autonomous_agents.scheduler import _execute_task, get_run_history, get_scheduler
+from autonomous_agents.scheduler import _execute_task, get_run_store, get_scheduler
 
 router = APIRouter(tags=["tasks"])
 
@@ -39,7 +39,11 @@ async def list_tasks() -> list[dict]:
 @router.get("/tasks/{task_id}/runs", response_model=list[TaskRun])
 async def get_task_runs(task_id: str) -> list[TaskRun]:
     """Return run history for a specific task."""
-    history = [r for r in get_run_history() if r.task_id == task_id]
+    history = await get_run_store().list_by_task(task_id)
+    # Preserve previous behaviour: only 404 if the task is BOTH unknown
+    # to the scheduler AND has no historical runs in the store. This
+    # keeps the endpoint useful for inspecting runs of tasks whose
+    # definition was removed from config.yaml.
     if not history and not any(t.id == task_id for t in _registered_tasks):
         raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
     return history
@@ -60,4 +64,4 @@ async def trigger_task_manually(task_id: str) -> dict:
 @router.get("/runs", response_model=list[TaskRun])
 async def list_all_runs() -> list[TaskRun]:
     """Return the full run history across all tasks."""
-    return get_run_history()
+    return await get_run_store().list_all()
