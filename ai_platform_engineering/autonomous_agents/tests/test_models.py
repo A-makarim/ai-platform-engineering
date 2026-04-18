@@ -3,7 +3,6 @@
 
 """Unit tests for autonomous_agents models and task loader."""
 
-import pytest
 from autonomous_agents.models import (
     CronTrigger,
     IntervalTrigger,
