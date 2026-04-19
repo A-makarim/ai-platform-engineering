@@ -155,3 +155,24 @@ def test_task_definition_rejects_negative_max_retries():
             trigger=CronTrigger(schedule="* * * * *"),
             max_retries=-1,
         )
+
+
+def test_task_definition_rejects_inf_and_nan_timeout():
+    """``timeout_seconds`` must reject ``inf`` / ``-inf`` / ``nan``.
+
+    PyYAML parses ``.inf`` and ``.nan`` straight into float values, and
+    Pydantic's ``gt=0`` constraint considers ``inf`` to satisfy ``> 0``.
+    Without an explicit guard, ``timeout_seconds: .inf`` in config.yaml
+    would propagate to httpx and silently break the per-attempt timeout
+    at runtime.
+    """
+    for bad in (float("inf"), float("-inf"), float("nan")):
+        with pytest.raises(pydantic.ValidationError):
+            TaskDefinition(
+                id="test",
+                name="Test",
+                agent="github",
+                prompt="x",
+                trigger=CronTrigger(schedule="* * * * *"),
+                timeout_seconds=bad,
+            )

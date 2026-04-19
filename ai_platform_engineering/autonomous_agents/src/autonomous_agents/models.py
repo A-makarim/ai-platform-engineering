@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class TriggerType(str, Enum):
@@ -84,6 +84,20 @@ class TaskDefinition(BaseModel):
         ge=0,
         description="Override A2A_MAX_RETRIES for this task (>= 0; 0 disables retries).",
     )
+
+    @field_validator("timeout_seconds")
+    @classmethod
+    def _timeout_must_be_finite(cls, v: float | None) -> float | None:
+        # Pydantic's ``gt=0`` constraint accepts ``float('inf')`` and ``nan``,
+        # and PyYAML happily parses ``.inf`` / ``.nan`` from config.yaml.
+        # Either would silently break the httpx timeout at runtime, so reject
+        # both at load time. ``Settings`` has the same guard for the global
+        # default — keep them in lockstep.
+        if v is None:
+            return v
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("timeout_seconds must be a finite number")
+        return v
 
 
 # =============================================================================
