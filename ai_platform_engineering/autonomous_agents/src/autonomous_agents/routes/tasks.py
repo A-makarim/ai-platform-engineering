@@ -22,6 +22,7 @@ from autonomous_agents.routes.webhooks import (
 )
 from autonomous_agents.scheduler import (
     execute_task,
+    get_chat_history_publisher,
     get_run_store,
     get_scheduler,
     register_task,
@@ -216,6 +217,10 @@ async def _run_preflight_and_persist(task_id: str) -> None:
         task_id, ack.ack_status, ack.routed_to,
     )
 
+    # Mirror the ack into the per-task chat thread so the operator sees
+    # the supervisor's confirmation alongside the creation_intent message.
+    await _safe_publish_preflight_ack(refreshed_with_ack, ack)
+
 
 def _schedule_preflight(task_id: str) -> None:
     """Fire-and-forget the background preflight coroutine.
@@ -225,6 +230,31 @@ def _schedule_preflight(task_id: str) -> None:
     background work and assert the synchronous CRUD path independently.
     """
     asyncio.create_task(_run_preflight_and_persist(task_id))
+
+
+# ---------------------------------------------------------------------------
+# Chat-history publishing helpers (spec #099 FR-007 — creation_intent +
+# preflight_ack messages on the per-task chat thread)
+# ---------------------------------------------------------------------------
+
+async def _safe_publish_creation_intent(task: TaskDefinition) -> None:
+    """Best-effort publish of the creation_intent message. Never raises."""
+    try:
+        await get_chat_history_publisher().publish_creation_intent(task)
+    except Exception:
+        # Chat-history publishing is observability, not source of truth.
+        # Same contract as the scheduler's _publish_safely.
+        logger.exception("[%s] publish_creation_intent failed", task.id)
+
+
+async def _safe_publish_preflight_ack(task: TaskDefinition, ack: Acknowledgement) -> None:
+    """Best-effort publish of the preflight_ack message. Never raises."""
+    try:
+        await get_chat_history_publisher().publish_preflight_ack(
+            task, ack.model_dump(mode="json")
+        )
+    except Exception:
+        logger.exception("[%s] publish_preflight_ack failed", task.id)
 
 
 def _next_run_iso_for(task_id: str) -> str | None:
@@ -304,9 +334,15 @@ async def create_task(task: TaskDefinition) -> dict:
             detail=f"Task definition could not be scheduled: {exc}",
         ) from exc
 
+    # Publish the creation_intent message to the per-task chat thread
+    # so operators see "this is what I asked for" as the first message
+    # in the sidebar conversation. Best-effort; never blocks the response.
+    asyncio.create_task(_safe_publish_creation_intent(created))
+
     # Fire the supervisor preflight in the background so the form gets
     # a fast 2xx and the badge updates as soon as the supervisor responds.
-    # The coroutine handles its own error reporting.
+    # The coroutine handles its own error reporting AND publishes the
+    # ack into the per-task chat thread on completion.
     _schedule_preflight(created.id)
 
     logger.info(f"[{created.id}] Created via API")

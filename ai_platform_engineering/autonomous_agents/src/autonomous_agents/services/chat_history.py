@@ -44,42 +44,80 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
-from autonomous_agents.models import TaskRun, TaskStatus
+from autonomous_agents.models import TaskDefinition, TaskRun, TaskStatus
 
 logger = logging.getLogger("autonomous_agents")
 
-# Module-level UUID5 namespace for deriving conversation ids from run ids.
+# Module-level UUID5 namespace for deriving conversation ids.
+#
 # Random-but-fixed bytes generated once: the value is opaque -- what matters
 # is that it never changes, otherwise an old run record's conversation_id
 # would no longer match the document we'd write today.
 _AUTONOMOUS_NS = uuid.UUID("4b2c0d6e-5b71-4f4a-9b4d-7c1e9f0a2b8e")
 
 
-def _conversation_id_for_run(run_id: str) -> str:
-    """Derive a stable UUIDv4-shaped conversation id from ``run_id``.
+# Spec #099 FR-007 — enumerated message kinds. Each chat message we write
+# carries one of these in ``metadata.kind`` so the UI can render a typed
+# affordance (status icon, contextual menu) without re-parsing the body.
+# Kept open ("str") so future kinds can land without a co-deploy of the UI.
+MessageKind = Literal[
+    "creation_intent",   # initial human-authored intent + form values
+    "preflight_ack",     # supervisor's pre-flight acknowledgement payload
+    "next_run_marker",   # informational: "next run at HH:MM" — Phase 2
+    "run_request",       # the prompt actually sent to the supervisor
+    "run_response",      # successful supervisor response
+    "run_error",         # failed supervisor response (with error detail)
+    "task_updated",      # task fields changed (post-Phase-1)
+    "task_disabled",     # operator disabled the task (post-Phase-1)
+    "task_deleted",      # operator deleted the task (post-Phase-1)
+    "task_reauthored",   # task author bot rewrote the task (Phase 3)
+]
+
+
+def _conversation_id_for_task(task_id: str) -> str:
+    """Derive a stable UUIDv4-shaped conversation id from ``task_id``.
+
+    Spec #099 FR-006 / AD-002. Every autonomous task owns exactly one chat
+    conversation. The deterministic UUIDv5 derivation matches the contextId
+    derivation used by ``services/a2a_client.py`` so the chat conversation,
+    the LangGraph checkpointer thread, and the supervisor's run history
+    all key off the same identifier.
 
     The UI's chat routes ``validateUUID`` the path segment, so the id
     must match the canonical 8-4-4-4-12 hex pattern. ``uuid5`` returns
-    a UUID with version bits set to 5 -- the regex doesn't care about
+    a UUID with version bits set to 5 — the regex doesn't care about
     version bits, only shape, so this is safe.
     """
+    return str(uuid.uuid5(_AUTONOMOUS_NS, f"task:{task_id}"))
+
+
+# Backwards-compatible alias for callers that still pass run_id (e.g.
+# integration tests built against the per-run scheme). Per spec #099 the
+# canonical derivation is per-task; this alias deliberately maps to the
+# same NEW per-task namespace when possible by stripping the run_id and
+# extracting the embedded task — but since run_ids are pure UUIDs with
+# no embedded task hint, the safest fallback is to derive a per-run id
+# under the OLD scheme so any test harness still in use stays green.
+def _conversation_id_for_run(run_id: str) -> str:
+    """Deprecated: per-run conversation id. Prefer ``_conversation_id_for_task``."""
     return str(uuid.uuid5(_AUTONOMOUS_NS, run_id))
 
 
 @runtime_checkable
 class ChatHistoryPublisher(Protocol):
-    """Async publisher contract -- one method, no return value.
+    """Async publisher contract — one conversation per task, many messages.
 
-    Implementations MUST be safe to call concurrently from the
-    scheduler event loop. They MAY raise on transient store failures
-    (e.g. ``MongoChatHistoryPublisher`` lets the underlying motor
-    exception propagate so operators see the real cause); the
-    scheduler always wraps the call in
-    ``scheduler._publish_safely`` which catches and logs, so a
-    raising implementation never aborts task execution. Implementing
-    swallow-and-log inside the publisher is allowed but not required.
+    Spec #099 FR-006..009: a task owns a single conversation (deterministic
+    UUIDv5 from the task id) and every lifecycle event for that task
+    appends a typed message (``metadata.kind``) to the same thread.
+
+    Implementations MUST be safe to call concurrently from the scheduler
+    and from the FastAPI request handlers. They MAY raise on transient
+    store failures; callers wrap every call in ``scheduler._publish_safely``
+    or ``routes.tasks._publish_safely`` (forthcoming) so a raising
+    implementation never aborts task execution or 500s a CRUD route.
     """
 
     async def publish_run(
@@ -90,9 +128,25 @@ class ChatHistoryPublisher(Protocol):
         response: str | None,
         error: str | None,
         agent: str | None,
+        task_id: str | None = None,
         conversation_id: str | None = None,
     ) -> None:
-        """Upsert one conversation + its two messages for ``run``."""
+        """Append a (run_request, run_response|run_error) message pair."""
+        ...
+
+    async def publish_creation_intent(
+        self,
+        task: TaskDefinition,
+    ) -> None:
+        """Append a creation_intent message describing the operator's request."""
+        ...
+
+    async def publish_preflight_ack(
+        self,
+        task: TaskDefinition,
+        ack_payload: dict[str, Any],
+    ) -> None:
+        """Append a preflight_ack message with the supervisor's ack payload."""
         ...
 
 
@@ -102,8 +156,8 @@ class NoopChatHistoryPublisher:
     Returned by :func:`create_chat_history_publisher` when
     ``CHAT_HISTORY_PUBLISH_ENABLED`` is False or the Mongo settings
     needed to reach the UI's chat database are missing. Keeping the
-    happy-path / disabled-path interfaces identical means the
-    scheduler doesn't need any "is publishing on?" branches.
+    happy-path / disabled-path interfaces identical means the callers
+    don't need any "is publishing on?" branches.
     """
 
     async def publish_run(
@@ -114,7 +168,21 @@ class NoopChatHistoryPublisher:
         response: str | None,
         error: str | None,
         agent: str | None,
+        task_id: str | None = None,
         conversation_id: str | None = None,
+    ) -> None:
+        return None
+
+    async def publish_creation_intent(
+        self,
+        task: TaskDefinition,
+    ) -> None:
+        return None
+
+    async def publish_preflight_ack(
+        self,
+        task: TaskDefinition,
+        ack_payload: dict[str, Any],
     ) -> None:
         return None
 
@@ -196,6 +264,93 @@ class MongoChatHistoryPublisher:
             [("conversation_id", 1), ("message_id", 1)],
         )
 
+    # ------------------------------------------------------------------
+    # Spec #099 — per-task conversation publishers
+    # ------------------------------------------------------------------
+
+    async def publish_creation_intent(
+        self,
+        task: TaskDefinition,
+    ) -> None:
+        """Append (or upsert if first time) a ``creation_intent`` message.
+
+        Idempotent on (conversation_id, message_id) so a re-create of an
+        already-existing task (rare but possible during operator
+        re-import flows) doesn't duplicate the intent line.
+        """
+        conv_id = _conversation_id_for_task(task.id)
+        now = datetime.now(timezone.utc)
+        await self._upsert_conversation(conv_id, task=task, now=now)
+
+        body_lines = [
+            f"Created task '{task.name}' (id: {task.id}).",
+            f"Target sub-agent: {task.agent}",
+            f"Trigger: {task.trigger.type}",
+        ]
+        if getattr(task.trigger, "schedule", None):
+            body_lines.append(f"Schedule (cron): {task.trigger.schedule}")
+        if task.llm_provider:
+            body_lines.append(f"LLM provider override: {task.llm_provider}")
+        body_lines.extend(["", "Prompt:", task.prompt])
+
+        await self._upsert_kind_message(
+            conversation_id=conv_id,
+            message_id=f"task:{task.id}:creation_intent",
+            role="user",
+            kind="creation_intent",
+            content="\n".join(body_lines),
+            created_at=now,
+            task=task,
+            extra_meta={"created_via": "form"},  # Phase 3 may set "chat"
+        )
+
+    async def publish_preflight_ack(
+        self,
+        task: TaskDefinition,
+        ack_payload: dict[str, Any],
+    ) -> None:
+        """Append a ``preflight_ack`` assistant message with the structured ack.
+
+        Idempotent on a stable id derived from (task_id, ack_at) so
+        successive re-acks (e.g. user edited the prompt) accumulate as
+        separate messages while accidental retries collapse.
+        """
+        conv_id = _conversation_id_for_task(task.id)
+        now = datetime.now(timezone.utc)
+        await self._upsert_conversation(conv_id, task=task, now=now)
+
+        ack_at = ack_payload.get("ack_at") or now.isoformat()
+        msg_id = f"task:{task.id}:preflight_ack:{ack_at}"
+
+        status = ack_payload.get("ack_status", "unknown")
+        detail = ack_payload.get("ack_detail", "")
+        summary = ack_payload.get("dry_run_summary", "")
+
+        # Render a human-readable body alongside the structured payload.
+        # The UI picks rendering by ``metadata.kind`` (Phase 2); the
+        # ``content`` text is the fallback for any client that doesn't
+        # know about the kind discriminator yet.
+        body_lines = [
+            f"Pre-flight: {status.upper()}.",
+        ]
+        if detail:
+            body_lines.append(detail)
+        if summary:
+            body_lines.append("")
+            body_lines.append(summary)
+
+        await self._upsert_kind_message(
+            conversation_id=conv_id,
+            message_id=msg_id,
+            role="assistant",
+            kind="preflight_ack",
+            content="\n".join(body_lines),
+            created_at=now,
+            task=task,
+            extra_meta={"ack_payload": ack_payload},
+            is_final=True,
+        )
+
     async def publish_run(
         self,
         run: TaskRun,
@@ -204,40 +359,123 @@ class MongoChatHistoryPublisher:
         response: str | None,
         error: str | None,
         agent: str | None,
+        task_id: str | None = None,
         conversation_id: str | None = None,
     ) -> None:
-        # Allow callers to pre-compute the deterministic id (the
-        # scheduler does this so it can stash conversation_id on the
-        # TaskRun before we even open the Mongo connection). Fall
-        # back to deriving it here so the publisher is also usable
-        # standalone in tests.
-        conv_id = conversation_id or _conversation_id_for_run(run.run_id)
+        """Append (run_request, run_response|run_error) for one run.
+
+        Spec #099 FR-007: each run accumulates as TWO new messages on the
+        same per-task thread rather than overwriting the same two slots.
+        Multiple runs of the same task therefore form a chronological
+        history visible in the sidebar.
+        """
+        # The scheduler stamps TaskRun.task_id from the task definition,
+        # so the ``task_id`` kwarg is just an explicit override slot for
+        # callers (and tests) that want to pin it themselves.
+        effective_task_id = task_id or run.task_id
+        conv_id = conversation_id or _conversation_id_for_task(effective_task_id)
         now = datetime.now(timezone.utc)
 
-        # ----- Conversation document -----
-        # ``$set`` keeps the published title/agent fresh on retries
-        # (e.g. operator renamed the task between RUNNING and SUCCESS)
-        # while ``$setOnInsert`` pins the immutable bits so re-running
-        # publish on the same run never spawns a duplicate.
+        await self._upsert_conversation(
+            conv_id, task_id=effective_task_id, agent=agent,
+            title=f"[Autonomous] {run.task_name}", now=now,
+        )
+
+        # ----- run_request: the prompt actually sent to the supervisor -----
+        await self._upsert_kind_message(
+            conversation_id=conv_id,
+            message_id=f"run:{run.run_id}:request",
+            role="user",
+            kind="run_request",
+            content=prompt,
+            created_at=now,
+            run=run,
+            extra_meta={"run_id": run.run_id, "task_id": effective_task_id},
+            is_final=True,
+        )
+
+        # ----- run_response | run_error: the supervisor's reply -----
+        if run.status == TaskStatus.FAILED:
+            kind: MessageKind = "run_error"
+            content = f"Run failed: {error or 'unknown error'}"
+            is_final = True
+        elif run.status == TaskStatus.SUCCESS and response is not None:
+            kind = "run_response"
+            content = response
+            is_final = True
+        else:
+            kind = "run_response"
+            content = "Autonomous task running..."
+            is_final = False
+
+        # +1 microsecond keeps assistant after user when both writes
+        # land on the same wall-clock millisecond. Same trick the old
+        # publisher used; preserved here for stable sort order.
+        assistant_at = (
+            now.replace(microsecond=now.microsecond + 1)
+            if now.microsecond < 999_999 else now
+        )
+        await self._upsert_kind_message(
+            conversation_id=conv_id,
+            message_id=f"run:{run.run_id}:response",
+            role="assistant",
+            kind=kind,
+            content=content,
+            created_at=assistant_at,
+            run=run,
+            extra_meta={
+                "run_id": run.run_id,
+                "task_id": effective_task_id,
+                "run_status": run.status.value,
+            },
+            is_final=is_final,
+        )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    async def _upsert_conversation(
+        self,
+        conv_id: str,
+        *,
+        task: TaskDefinition | None = None,
+        task_id: str | None = None,
+        agent: str | None = None,
+        title: str | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """Upsert the per-task conversation document.
+
+        Accepts EITHER a full ``TaskDefinition`` (creation_intent /
+        preflight_ack paths) OR explicit ``task_id`` + ``agent`` (run
+        publishing path, which doesn't require us to load the full
+        task object). Title falls back to the task name when ``task``
+        is provided, or is taken verbatim from ``title``.
+        """
+        now = now or datetime.now(timezone.utc)
+        effective_task_id = task.id if task else task_id
+        effective_agent = task.agent if task else agent
+        if effective_task_id is None:
+            raise ValueError("task or task_id must be provided")
+
+        effective_title = title or (
+            f"[Autonomous] {task.name}" if task else f"[Autonomous] {effective_task_id}"
+        )
+
         await self._conversations.update_one(
             {"_id": conv_id},
             {
                 "$set": {
-                    "title": self._title_for(run),
-                    "agent_id": agent,
+                    "title": effective_title,
+                    "agent_id": effective_agent,
                     "updated_at": now,
                     "metadata": {
-                        # Mirror the UI's POST shape so the GET handler
-                        # doesn't choke on a missing key. ``model_used``
-                        # is a UI-only display field; ``autonomous`` is a
-                        # truthful default for autonomous runs.
                         "agent_version": "autonomous-agents",
                         "model_used": "autonomous",
-                        # Each run produces exactly two messages (user
-                        # prompt + assistant response/error). Keeping
-                        # this accurate matters for the UI's "X messages"
-                        # subtitle.
-                        "total_messages": 2,
+                        # Total message count is recomputed in the UI
+                        # via $count when needed; we no longer pin it
+                        # here because per-task threads grow over time.
                     },
                 },
                 "$setOnInsert": {
@@ -250,98 +488,62 @@ class MongoChatHistoryPublisher:
                         "shared_with_teams": [],
                         "share_link_enabled": False,
                     },
-                    # ``tags`` doubles as a coarse search affordance --
-                    # users can already filter by tag in the UI search.
-                    "tags": ["autonomous", run.task_id],
+                    "tags": ["autonomous", effective_task_id],
                     "is_archived": False,
                     "is_pinned": False,
-                    # Fields the UI's GET handler keys off but that
-                    # aren't in the TypeScript Conversation interface
-                    # *yet*; companion PR adds them. Existing UI builds
-                    # ignore unknown fields.
                     "source": "autonomous",
-                    "task_id": run.task_id,
-                    "run_id": run.run_id,
+                    "task_id": effective_task_id,
                 },
             },
             upsert=True,
         )
 
-        # ----- Two messages: user prompt + assistant response/error -----
-        # Order matters only for the on-screen rendering, which sorts
-        # by ``created_at`` -- offset the assistant message by a few
-        # microseconds so it always renders second even if the same
-        # wall-clock millisecond is sampled twice.
-        await self._upsert_message(
-            conversation_id=conv_id,
-            role="user",
-            content=prompt,
-            created_at=now,
-            run=run,
-            is_final=True,
-        )
-
-        assistant_text, is_final = self._assistant_payload(run, response, error)
-        await self._upsert_message(
-            conversation_id=conv_id,
-            role="assistant",
-            content=assistant_text,
-            # +1 microsecond -- enough to disambiguate sort order
-            # without being visible in the UI's HH:MM:SS rendering.
-            created_at=now.replace(microsecond=now.microsecond + 1)
-            if now.microsecond < 999_999
-            else now,
-            run=run,
-            is_final=is_final,
-        )
-
-    async def _upsert_message(
+    async def _upsert_kind_message(
         self,
         *,
         conversation_id: str,
+        message_id: str,
         role: str,
+        kind: MessageKind,
         content: str,
         created_at: datetime,
-        run: TaskRun,
-        is_final: bool,
+        task: TaskDefinition | None = None,
+        run: TaskRun | None = None,
+        extra_meta: dict[str, Any] | None = None,
+        is_final: bool = True,
     ) -> None:
-        message_id = f"{run.run_id}-{role}"
-        # turn_id mirrors the UI convention -- one turn per (user,
-        # assistant) pair. Using ``run_id`` makes both messages share
-        # a turn so the UI's debug panel groups them correctly.
-        turn_id = f"autonomous-{run.run_id}"
-        # Filter by ``(conversation_id, message_id)`` to mirror the
-        # UI's POST upsert shape. Filtering on ``message_id`` alone
-        # would risk hitting a row from a different conversation if
-        # the run-id collision space ever changes.
+        """Upsert a single message with a typed ``metadata.kind``.
+
+        Filter by ``(conversation_id, message_id)`` to mirror the UI's POST
+        upsert shape. ``$setOnInsert`` pins ``created_at`` so a retry never
+        re-orders the thread. ``$set`` keeps content/kind fresh in case of
+        legitimate amendments (e.g. response text becoming available
+        after an initial RUNNING placeholder write).
+        """
+        meta: dict[str, Any] = {
+            "kind": kind,
+            "source": "autonomous",
+            "is_final": is_final,
+        }
+        if task is not None:
+            meta["task_id"] = task.id
+            meta["task_name"] = task.name
+        if run is not None:
+            meta["task_id"] = run.task_id
+            meta["task_name"] = run.task_name
+        if extra_meta:
+            meta.update(extra_meta)
+
         await self._messages.update_one(
             {"conversation_id": conversation_id, "message_id": message_id},
             {
                 "$set": {
-                    # ``content`` and ``is_final`` flip across the
-                    # RUNNING -> SUCCESS|FAILED transition (e.g. the
-                    # placeholder turns into the final response). We
-                    # also bump ``updated_at`` so operators can spot
-                    # the last publish attempt.
                     "role": role,
                     "content": content,
                     "updated_at": created_at,
-                    "metadata": {
-                        "turn_id": turn_id,
-                        # Marks the row as autonomous-origin so analytics
-                        # queries can pivot on metadata.source the same
-                        # way the existing /api/chat/messages POST does.
-                        "source": "autonomous",
-                        "agent_name": run.task_name,
-                        "is_final": is_final,
-                        "task_id": run.task_id,
-                    },
+                    "metadata": meta,
                 },
                 "$setOnInsert": {
-                    # Pin immutables on first insert so a re-publish
-                    # never overwrites the original ``created_at`` --
-                    # the UI sorts the thread by ``created_at`` and
-                    # would otherwise reorder rows on every retry.
                     "conversation_id": conversation_id,
                     "message_id": message_id,
                     "owner_id": self._owner_email,
@@ -350,39 +552,6 @@ class MongoChatHistoryPublisher:
             },
             upsert=True,
         )
-
-    @staticmethod
-    def _title_for(run: TaskRun) -> str:
-        # Short, recognisable prefix lets operators visually pick out
-        # autonomous rows in the sidebar even before the filter chip
-        # is applied. Including the task name (not id) matches the
-        # rest of the autonomous UI.
-        return f"[Autonomous] {run.task_name}"
-
-    @staticmethod
-    def _assistant_payload(
-        run: TaskRun,
-        response: str | None,
-        error: str | None,
-    ) -> tuple[str, bool]:
-        """Pick what the assistant message should say.
-
-        Three cases:
-        * SUCCESS with response text -- show the response.
-        * FAILED with error -- show the error so operators don't have
-          to cross-reference the run history page.
-        * RUNNING (intermediate publish) -- show a placeholder and
-          mark ``is_final=False`` so the UI can render a spinner.
-        """
-        if run.status == TaskStatus.SUCCESS and response is not None:
-            return response, True
-        if run.status == TaskStatus.FAILED:
-            return f"Run failed: {error or 'unknown error'}", True
-        # RUNNING / SKIPPED / PENDING -- transient state. The
-        # scheduler currently only calls publish_run on the terminal
-        # transition, but supporting intermediate publish keeps the
-        # contract honest if that ever changes.
-        return "Autonomous task running...", False
 
 
 def create_chat_history_publisher(

@@ -27,7 +27,7 @@ from autonomous_agents.services.a2a_client import invoke_agent
 from autonomous_agents.services.chat_history import (
     ChatHistoryPublisher,
     NoopChatHistoryPublisher,
-    _conversation_id_for_run,
+    _conversation_id_for_task,
 )
 from autonomous_agents.services.run_store import InMemoryRunStore, RunStore
 
@@ -152,11 +152,12 @@ async def execute_task(task: TaskDefinition, context: dict[str, Any] | None = No
     that drive ad-hoc execution. Don't add a leading underscore back.
     """
     run_id = str(uuid.uuid4())
-    # Pre-compute the deterministic conversation id so it lands in
-    # ``autonomous_runs`` from the very first RUNNING write -- the
+    # Pre-compute the deterministic per-task conversation id so it lands
+    # in ``autonomous_runs`` from the very first RUNNING write -- the
     # UI can then deep-link from a run row to ``/chat/<id>`` as soon
     # as the run appears, even before the terminal state is recorded.
-    conversation_id = _conversation_id_for_run(run_id)
+    # Spec #099 FR-006 / AD-002: one chat thread per task, not per run.
+    conversation_id = _conversation_id_for_task(task.id)
     run = TaskRun(
         run_id=run_id,
         task_id=task.id,
