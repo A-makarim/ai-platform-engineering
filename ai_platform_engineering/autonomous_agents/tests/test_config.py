@@ -51,3 +51,42 @@ def test_a2a_settings_reject_inf_and_nan():
             Settings(a2a_timeout_seconds=bad)
         with pytest.raises(pydantic.ValidationError):
             Settings(a2a_retry_backoff_max_seconds=bad)
+
+
+# --- IMP-05: CORS safety -------------------------------------------------
+
+
+def test_cors_origins_default_is_empty():
+    """No origins by default. The dev launcher script supplies localhost
+    explicitly via env -- production must opt in by listing origins."""
+    assert Settings().cors_origins == []
+
+
+def test_cors_origins_accepts_explicit_list():
+    s = Settings(cors_origins=["http://localhost:3000", "https://app.example.com"])
+    assert s.cors_origins == ["http://localhost:3000", "https://app.example.com"]
+
+
+def test_cors_origins_parses_comma_separated_string():
+    """Operators commonly paste a comma-list into ``.env`` rather than
+    JSON. The pre-validator splits on commas so the obvious
+    ``CORS_ORIGINS=http://a,http://b`` form Just Works instead of
+    crashing with a JSON parse error."""
+    s = Settings(cors_origins="http://localhost:3000, https://app.example.com")
+    assert s.cors_origins == ["http://localhost:3000", "https://app.example.com"]
+
+
+def test_cors_origins_rejects_wildcard_alone():
+    """``*`` plus ``allow_credentials=True`` (the FastAPI default) is a
+    spec violation -- modern browsers refuse the response. Failing
+    fast at startup beats discovering the misconfig from a debug
+    session months later."""
+    with pytest.raises(pydantic.ValidationError):
+        Settings(cors_origins=["*"])
+
+
+def test_cors_origins_rejects_wildcard_in_mixed_list():
+    """Even one ``*`` in an otherwise-explicit list is unsafe -- the
+    whole list short-circuits to "any origin"."""
+    with pytest.raises(pydantic.ValidationError):
+        Settings(cors_origins=["http://localhost:3000", "*"])

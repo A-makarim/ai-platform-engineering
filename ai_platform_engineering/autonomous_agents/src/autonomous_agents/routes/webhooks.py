@@ -16,12 +16,41 @@ router = APIRouter(tags=["webhooks"])
 _webhook_tasks: dict[str, TaskDefinition] = {}
 
 
+def register_webhook_task(task: TaskDefinition) -> None:
+    """Index a single webhook task for fast lookup at request time.
+
+    Idempotent: re-registering the same id replaces the prior entry.
+    Non-webhook (and disabled) tasks are silently skipped so the CRUD
+    endpoints can call this unconditionally without first checking the
+    trigger type.
+    """
+    if task.trigger.type != TriggerType.WEBHOOK:
+        return
+    if not task.enabled:
+        # Disabled webhook tasks must not respond to incoming POSTs --
+        # otherwise flipping ``enabled=false`` from the UI would leave a
+        # zombie endpoint accepting (and triggering) external traffic.
+        # Mirror the un-register path to be safe across re-saves.
+        _webhook_tasks.pop(task.id, None)
+        return
+    _webhook_tasks[task.id] = task
+    logger.info(f"Webhook task '{task.id}' registered at POST /hooks/{task.id}")
+
+
+def unregister_webhook_task(task_id: str) -> bool:
+    """Remove ``task_id`` from the webhook registry if present.
+
+    Returns ``True`` if an entry was removed, ``False`` otherwise. Same
+    no-raise contract as :func:`scheduler.unregister_task` so the CRUD
+    layer can call both unconditionally.
+    """
+    return _webhook_tasks.pop(task_id, None) is not None
+
+
 def register_webhook_tasks(tasks: list[TaskDefinition]) -> None:
-    """Index webhook tasks by their task id for fast lookup at request time."""
+    """Bulk-register webhook tasks (used by the FastAPI lifespan)."""
     for task in tasks:
-        if task.trigger.type == TriggerType.WEBHOOK:
-            _webhook_tasks[task.id] = task
-            logger.info(f"Webhook task '{task.id}' registered at POST /hooks/{task.id}")
+        register_webhook_task(task)
 
 
 @router.post("/hooks/{task_id}")

@@ -60,15 +60,7 @@ the UI on top of. None of them change the public API shape.
 
 ---
 
-### IMP-05 — CORS safety check in `Settings`
-- **Status**: TODO
-- **Why**: Today `allow_credentials=True` + `allow_methods=["*"]` + `allow_headers=["*"]`.
-  Fine because `cors_origins=[]` by default. But if anyone later sets
-  `CORS_ORIGINS=*` it silently violates the browser CORS spec and creates a
-  CSRF surface.
-- **Approach**: Pydantic `model_validator` on `Settings` that raises if
-  `"*"` is in `cors_origins` while `allow_credentials=True`.
-- **Touches**: `config.py`, `tests/test_models.py`.
+_(IMP-05 — completed; see Done section.)_
 
 ---
 
@@ -115,14 +107,7 @@ the UI on top of. None of them change the public API shape.
 
 ---
 
-### IMP-09 — Rename private import `_execute_task`
-- **Status**: TODO
-- **Why**: `routes/tasks.py` imports `_execute_task` from `scheduler.py`.
-  The leading underscore signals "private to module"; importing across module
-  boundaries breaks the contract.
-- **Approach**: rename to `execute_task` (or expose a public alias
-  `execute_task = _execute_task`). Update import.
-- **Touches**: `scheduler.py`, `routes/tasks.py`.
+_(IMP-09 — completed; see Done section.)_
 
 ---
 
@@ -173,21 +158,25 @@ don't persist).
 ---
 
 ### IMP-12 — UI: create / edit / disable autonomous tasks
-- **Status**: TODO
-- **Why**: Second step of the END GOAL. Today tasks are defined in
-  `config.yaml` only — no end-user can add one without filesystem access.
-- **Approach**:
-  1. Move task definitions out of `config.yaml` into Mongo
-     (`autonomous_tasks` collection). Keep `config.yaml` as a seed/import.
-  2. New endpoints: `POST/PUT/DELETE /api/v1/tasks/{id}` with proper auth
-     (IMP-10 must be done first).
-  3. UI form covering: trigger type (cron/interval/webhook), cron picker,
-     prompt textarea, agent dropdown, llm_provider dropdown, enabled toggle.
-  4. On task create/update, scheduler hot-reloads via an internal
-     `register_task(task)` + `unregister_task(task_id)` API on the scheduler.
-- **Touches**: `models.py`, `services/task_store.py` (new),
-  `services/task_loader.py`, `scheduler.py`, `routes/tasks.py`, UI.
-- **Depends on**: IMP-01, IMP-10.
+- **Status**: BACKEND DONE; UI pending in PR B
+- **Backend shipped on**: branch `prebuild/feat/autonomous-agents-task-crud`
+  - `services/task_store.py` (Protocol + InMemory + Mongo + factory)
+  - `routes/tasks.py` full CRUD: `POST /tasks`, `GET /tasks/{id}`,
+    `PUT /tasks/{id}`, `DELETE /tasks/{id}`.
+  - Scheduler hot-reload via `scheduler.register_task` /
+    `unregister_task`; webhook hot-reload via
+    `webhooks.register_webhook_task` / `unregister_webhook_task`.
+  - `main.py` lifespan seeds the TaskStore from `config.yaml` on
+    startup but treats existing rows as authoritative -- live edits
+    survive restarts when MongoDB is configured.
+  - 51 new tests across `test_task_store.py`, `test_mongo_task_store.py`,
+    `test_task_store_factory.py`, `test_scheduler_hot_reload.py`,
+    `test_tasks_crud_route.py`.
+  - Auth (IMP-10) is **deliberately** not bundled here -- the UI
+    proxy enforces session auth in PR B; the autonomous-agents
+    service itself is still localhost-only.
+- **Remaining (PR B)**: Next.js page, API proxy, form dialog. See
+  `prebuild/feat/autonomous-agents-ui-tab`.
 
 ---
 
@@ -272,6 +261,56 @@ Don't do these until you have a real reason. Premature.
 ## Done
 
 _Short audit trail of completed items. Newest first._
+
+### IMP-09 — Rename private import `_execute_task`
+- **Shipped on**: branch `prebuild/feat/autonomous-agents-task-crud`
+- **What landed**: `scheduler._execute_task` promoted to public
+  `execute_task`. `routes/tasks.py` and `tests/test_scheduler_run_store.py`
+  updated to import the new name. Documented in the function
+  docstring why the public name must stay.
+
+---
+
+### IMP-05 — CORS safety check in `Settings`
+- **Shipped on**: branch `prebuild/feat/autonomous-agents-task-crud`
+- **What landed**: Two pydantic validators on `Settings.cors_origins`:
+  - A `mode="before"` pre-validator that accepts the comma-separated
+    string form (`CORS_ORIGINS=http://a,http://b`) operators
+    routinely paste into `.env`, in addition to JSON lists.
+  - A post-validator that rejects any list containing `"*"` -- that
+    combination plus the FastAPI default `allow_credentials=True`
+    is a CORS spec violation that browsers refuse and misconfigured
+    gateways may dangerously allow.
+  - 5 new unit tests in `test_config.py` covering both behaviours.
+
+---
+
+### IMP-11/12 (backend) — TaskStore + CRUD endpoints + scheduler hot-reload
+- **Shipped on**: branch `prebuild/feat/autonomous-agents-task-crud`
+- **What landed**:
+  - `services/task_store.py` -- `TaskStore` Protocol with
+    `InMemoryTaskStore` and `MongoTaskStore` implementations and a
+    `create_task_store(...)` factory selecting the backend from
+    settings. `TaskAlreadyExistsError` / `TaskNotFoundError`
+    custom exceptions translate cleanly to HTTP 409 / 404.
+  - `scheduler.register_task` / `unregister_task` helpers so CRUD
+    operations hot-reload APScheduler without a restart.
+    `register_tasks` now guards `start()` behind a `running` check.
+  - `webhooks.register_webhook_task` / `unregister_webhook_task`
+    helpers for the same hot-reload contract on the webhook side.
+  - `routes/tasks.py` -- full CRUD: `GET /tasks`, `GET /tasks/{id}`,
+    `POST /tasks` (201), `PUT /tasks/{id}`, `DELETE /tasks/{id}`
+    (204). The path id wins over body id on PUT to prevent
+    accidental renames.
+  - `Settings.mongodb_tasks_collection` (default
+    `autonomous_tasks`) and `main.py` lifespan that seeds the store
+    from `config.yaml` while preserving previously-persisted rows.
+  - 51 new tests across 5 files (`test_task_store.py`,
+    `test_mongo_task_store.py`, `test_task_store_factory.py`,
+    `test_scheduler_hot_reload.py`, `test_tasks_crud_route.py`).
+    All 152 tests pass; ruff clean.
+
+---
 
 ### IMP-02 — Retries + configurable timeout in `a2a_client.py`
 - **Shipped on**: branch `prebuild/feat/autonomous-agents-a2a-retries`

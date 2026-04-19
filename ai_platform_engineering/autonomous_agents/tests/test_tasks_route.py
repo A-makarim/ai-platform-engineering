@@ -4,10 +4,11 @@
 """Unit tests for the /tasks router run-history endpoints.
 
 These tests focus on the contract between the router and the
-``RunStore`` abstraction — specifically, the ``limit`` arguments
-the router passes through. We don't need a FastAPI ``TestClient``
-here: the router functions are plain ``async def`` callables, so
-we can ``await`` them directly with a stub store.
+``RunStore`` abstraction -- specifically, the ``limit`` arguments the
+router passes through. We don't need a FastAPI ``TestClient`` here:
+the router functions are plain ``async def`` callables, so we can
+``await`` them directly with a stub store and a fresh
+``InMemoryTaskStore``.
 """
 
 from datetime import datetime, timezone
@@ -20,8 +21,9 @@ from autonomous_agents.routes.tasks import (
     _MAX_TASK_RUNS,
     get_task_runs,
     list_all_runs,
-    set_registered_tasks,
+    set_task_store,
 )
+from autonomous_agents.services.task_store import InMemoryTaskStore
 
 
 class _RecordingStore:
@@ -36,7 +38,7 @@ class _RecordingStore:
         self.list_by_task_calls: list[tuple[str, int]] = []
         self.list_all_calls: list[int] = []
 
-    async def record(self, run: TaskRun) -> None:  # pragma: no cover — unused
+    async def record(self, run: TaskRun) -> None:  # pragma: no cover -- unused
         self._runs.append(run)
 
     async def list_by_task(self, task_id: str, limit: int = 100) -> list[TaskRun]:
@@ -60,12 +62,22 @@ def _make_run(run_id: str, task_id: str = "t1") -> TaskRun:
     )
 
 
+def _make_task(task_id: str = "t1") -> TaskDefinition:
+    return TaskDefinition(
+        id=task_id,
+        name=f"task {task_id}",
+        agent="github",
+        prompt="x",
+        trigger=CronTrigger(schedule="0 9 * * *"),
+    )
+
+
 @pytest.fixture(autouse=True)
-def _reset_router_state(monkeypatch):
-    """Restore module-level state the router caches."""
-    original_tasks = list(tasks_route._registered_tasks)
+def _reset_router_state():
+    """Reset module-level singletons between tests so state doesn't bleed."""
     yield
-    set_registered_tasks(original_tasks)
+    tasks_route._task_store = None
+    tasks_route._run_store = None if hasattr(tasks_route, "_run_store") else None
 
 
 @pytest.fixture
@@ -80,20 +92,22 @@ def _swap_run_store(monkeypatch):
     return _apply
 
 
+async def _seed_tasks(tasks: list[TaskDefinition]) -> None:
+    """Replace the router's TaskStore with a fresh in-memory one
+    pre-populated with ``tasks``. Each test calls this with the exact
+    set it expects so ordering / leakage between tests is impossible."""
+    store = InMemoryTaskStore()
+    for t in tasks:
+        await store.create(t)
+    set_task_store(store)
+
+
 async def test_get_task_runs_passes_max_task_runs_limit(_swap_run_store):
     """Regression: the router must pass an explicit limit, not rely on
     RunStore.list_by_task's protocol default of 100. Pre-fix this
     truncated history for any task with more than 100 past runs."""
     store = _swap_run_store(_RecordingStore([_make_run(f"r{i}") for i in range(120)]))
-    set_registered_tasks([
-        TaskDefinition(
-            id="t1",
-            name="t1",
-            agent="github",
-            prompt="x",
-            trigger=CronTrigger(schedule="0 9 * * *"),
-        )
-    ])
+    await _seed_tasks([_make_task("t1")])
 
     runs = await get_task_runs("t1")
 
@@ -108,7 +122,7 @@ async def test_get_task_runs_404_when_unknown_task_and_no_history(_swap_run_stor
     from fastapi import HTTPException
 
     _swap_run_store(_RecordingStore())
-    set_registered_tasks([])
+    await _seed_tasks([])
 
     with pytest.raises(HTTPException) as exc:
         await get_task_runs("ghost")
@@ -116,12 +130,12 @@ async def test_get_task_runs_404_when_unknown_task_and_no_history(_swap_run_stor
 
 
 async def test_get_task_runs_returns_history_for_removed_tasks(_swap_run_store):
-    """Existing behaviour: if a task is no longer in config.yaml but
-    its runs are still in the store, the endpoint must still return
+    """Existing behaviour: if a task is no longer in the store but its
+    runs are still in the run store, the endpoint must still return
     them rather than 404. Codifies the intent behind the existing
     check, so a future refactor can't silently regress it."""
     store = _swap_run_store(_RecordingStore([_make_run("old", task_id="removed")]))
-    set_registered_tasks([])
+    await _seed_tasks([])
 
     runs = await get_task_runs("removed")
 
@@ -133,7 +147,7 @@ async def test_list_all_runs_uses_default_limit(_swap_run_store):
     """``/runs`` accepts no params today, so it should hit the store
     with no override and rely on the protocol default (500)."""
     store = _swap_run_store(_RecordingStore([_make_run("r1")]))
-    set_registered_tasks([])
+    await _seed_tasks([])
 
     runs = await list_all_runs()
 
