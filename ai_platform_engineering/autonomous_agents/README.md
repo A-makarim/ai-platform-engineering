@@ -124,6 +124,8 @@ tasks:
       schedule: "0 9 * * *"
     llm_provider: "aws-bedrock"      # optional: overrides global LLM_PROVIDER
     enabled: true
+    timeout_seconds: 600             # optional: override A2A_TIMEOUT_SECONDS for this task
+    max_retries: 5                   # optional: override A2A_MAX_RETRIES for this task (0 disables retries)
 ```
 
 ### Environment Variables
@@ -137,6 +139,10 @@ tasks:
 | `PORT` | `8002` | Server port |
 | `WEBHOOK_SECRET` | `None` | Global HMAC secret for webhook validation |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `A2A_TIMEOUT_SECONDS` | `300` | Per-attempt timeout for the supervisor call. Overridable per task via `timeout_seconds`. See *Supervisor call reliability*. |
+| `A2A_MAX_RETRIES` | `3` | Max **additional** retries on transient failures (5xx + transport). 0 disables retries. Overridable per task via `max_retries`. |
+| `A2A_RETRY_BACKOFF_INITIAL_SECONDS` | `1.0` | Initial backoff between retries. Mostly a knob for tests; leave at 1.0 in prod. |
+| `A2A_RETRY_BACKOFF_MAX_SECONDS` | `30.0` | Upper cap on the exponential backoff. |
 | `MONGODB_URI` | `None` | Optional. Enables MongoDB-backed run history. See *Run History Persistence*. |
 | `MONGODB_DATABASE` | `None` | Optional. MongoDB database name. Required together with `MONGODB_URI`. |
 | `MONGODB_COLLECTION` | `autonomous_runs` | MongoDB collection name for run history. |
@@ -182,6 +188,35 @@ The startup log line tells you which backend is active:
 RunStore: MongoDB (database=autonomous_agents, collection=autonomous_runs)
 RunStore: in-memory (maxlen=500) — set MONGODB_URI and MONGODB_DATABASE to persist run history
 ```
+
+---
+
+## Supervisor call reliability
+
+Each task run makes a single A2A call to the supervisor. That call is
+treated as a normal HTTP dependency: it can be slow, restart, or briefly
+fall over behind a load balancer. The client therefore applies a
+**per-attempt timeout** and a **bounded retry policy** with exponential
+backoff:
+
+| Failure mode | Retried? | Why |
+|---|---|---|
+| `httpx.TransportError` (connect refused, DNS, read timeout) | Yes | Supervisor never produced a response — likely transient. |
+| HTTP 5xx | Yes | Supervisor responded but is unhealthy. |
+| HTTP 4xx | **No** | Caller-fault (auth, validation, unknown route). Replaying it is wasted work and wasted LLM quota. |
+| Anything else (e.g. `ValueError`) | No | Real bugs surface immediately rather than being masked by retry. |
+
+Total attempts per run = `1 + max_retries`. With the defaults
+(`A2A_MAX_RETRIES=3`) a single supervisor restart that takes < ~7 seconds
+is invisible to the task; a longer outage fails the run with the final
+exception preserved. Each retry is logged at `WARNING` so retries are
+observable in operator logs.
+
+Per-task overrides on `TaskDefinition` win over the global settings:
+
+- `timeout_seconds`: raise it for known long-running synthesis prompts.
+- `max_retries`: set to `0` for "best-effort, do not burn quota" tasks
+  where a single attempt is the whole point.
 
 ---
 
