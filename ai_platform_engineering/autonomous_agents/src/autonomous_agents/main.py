@@ -14,7 +14,8 @@ from autonomous_agents.config import get_settings
 from autonomous_agents.routes import health, tasks, webhooks
 from autonomous_agents.routes.tasks import set_registered_tasks
 from autonomous_agents.routes.webhooks import register_webhook_tasks
-from autonomous_agents.scheduler import get_scheduler, register_tasks
+from autonomous_agents.scheduler import get_scheduler, register_tasks, set_run_store
+from autonomous_agents.services.run_store import MongoRunStore, create_run_store
 from autonomous_agents.services.task_loader import load_tasks
 
 
@@ -22,6 +23,29 @@ from autonomous_agents.services.task_loader import load_tasks
 async def lifespan(app: FastAPI):
     settings = get_settings()
     logger.info("Starting Autonomous Agents service...")
+
+    # Build the run history persistence layer. The factory returns a
+    # MongoRunStore when both MONGODB_URI and MONGODB_DATABASE are set;
+    # otherwise an InMemoryRunStore so dev environments need no infra.
+    run_store = create_run_store(
+        mongodb_uri=settings.mongodb_uri,
+        mongodb_database=settings.mongodb_database,
+        mongodb_collection=settings.mongodb_collection,
+        in_memory_maxlen=settings.run_history_maxlen,
+    )
+    if isinstance(run_store, MongoRunStore):
+        await run_store.ensure_indexes()
+        logger.info(
+            "RunStore: MongoDB (database=%s, collection=%s)",
+            settings.mongodb_database,
+            settings.mongodb_collection,
+        )
+    else:
+        logger.info(
+            "RunStore: in-memory (maxlen=%d) — set MONGODB_URI and MONGODB_DATABASE to persist run history",
+            settings.run_history_maxlen,
+        )
+    set_run_store(run_store)
 
     # Load task definitions from YAML
     loaded_tasks = load_tasks(settings.task_config_path)

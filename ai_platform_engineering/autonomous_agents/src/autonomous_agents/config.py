@@ -33,6 +33,18 @@ class Settings(BaseSettings):
     # CORS — keep empty by default; open only in explicit dev/test configs
     cors_origins: list[str] = []
 
+    # MongoDB persistence for run history (optional).
+    # Both must be set to enable MongoRunStore; otherwise the service
+    # falls back to a bounded in-memory store (legacy behaviour) so
+    # development environments need no external infrastructure.
+    mongodb_uri: str | None = None
+    mongodb_database: str | None = None
+    mongodb_collection: str = "autonomous_runs"
+
+    # Maximum runs retained by the in-memory store when Mongo is not
+    # configured. Ignored when MongoRunStore is in use.
+    run_history_maxlen: int = 500
+
 
 @lru_cache
 def get_settings() -> Settings:

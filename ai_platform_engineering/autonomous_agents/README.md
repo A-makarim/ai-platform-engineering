@@ -137,6 +137,51 @@ tasks:
 | `PORT` | `8002` | Server port |
 | `WEBHOOK_SECRET` | `None` | Global HMAC secret for webhook validation |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `MONGODB_URI` | `None` | Optional. Enables MongoDB-backed run history. See *Run History Persistence*. |
+| `MONGODB_DATABASE` | `None` | Optional. MongoDB database name. Required together with `MONGODB_URI`. |
+| `MONGODB_COLLECTION` | `autonomous_runs` | MongoDB collection name for run history. |
+| `RUN_HISTORY_MAXLEN` | `500` | Max runs retained by the in-memory store when MongoDB is not configured. |
+
+---
+
+## Run History Persistence
+
+The service records one entry per task run (a `TaskRun`) and exposes
+them via `GET /api/v1/runs` and `GET /api/v1/tasks/{id}/runs`.
+
+Two backends are supported and selected automatically by environment
+variables. Both implement the same `RunStore` protocol so the
+scheduler and HTTP routes are agnostic to which one is active:
+
+| Mode | Activated by | Trade-offs |
+|---|---|---|
+| **In-memory (default)** | Neither `MONGODB_URI` nor `MONGODB_DATABASE` set | Zero infra, instant startup. **Lost on restart**. Bounded by `RUN_HISTORY_MAXLEN` (default 500), oldest evicted FIFO. Suitable for development and demos. |
+| **MongoDB** | **Both** `MONGODB_URI` *and* `MONGODB_DATABASE` set | Persistent across restarts, queryable from external tools, no eviction. Required for production and for the upcoming UI integration (the UI reads run history from this store). |
+
+Partial Mongo configuration (only `MONGODB_URI` or only
+`MONGODB_DATABASE`) is treated as **not configured** and falls back
+to in-memory — silently engaging Mongo on half-config would mask
+typical env-var typos and write history to the wrong place.
+
+The MongoDB schema is one document per run, mirroring the `TaskRun`
+model. Each run is stored with `_id = run_id`, so Mongo's automatic
+`_id_` index already enforces run-id uniqueness — no extra unique
+index is needed. Two additional indexes are created automatically
+at startup:
+
+- Compound `(task_id ASC, started_at DESC)` — backs the
+  list-by-task query (`GET /tasks/{id}/runs`) without a collection
+  scan.
+- `started_at DESC` — backs the global list-all query
+  (`GET /runs`). The compound index above leads on `task_id`, so
+  Mongo will not use it for an unfiltered sort across tasks.
+
+The startup log line tells you which backend is active:
+
+```
+RunStore: MongoDB (database=autonomous_agents, collection=autonomous_runs)
+RunStore: in-memory (maxlen=500) — set MONGODB_URI and MONGODB_DATABASE to persist run history
+```
 
 ---
 
