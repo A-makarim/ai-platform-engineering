@@ -470,5 +470,15 @@ export async function requireConversationAccess(
     return { conversation, access_level: 'admin_audit' };
   }
 
+  // Autonomous-agent conversations are produced by the autonomous_agents
+  // service under a synthetic owner (e.g., 'autonomous@system'). They
+  // represent unattended task runs (no per-user PII / secrets), so any
+  // authenticated user is granted read-only access for operator/audit
+  // visibility. Writes are still blocked because shared_readonly is
+  // checked on POST paths.
+  if (conversation.source === 'autonomous') {
+    return { conversation, access_level: 'shared_readonly' };
+  }
+
   throw new ApiError('Forbidden: You do not have access to this conversation', 403, 'FORBIDDEN');
 }

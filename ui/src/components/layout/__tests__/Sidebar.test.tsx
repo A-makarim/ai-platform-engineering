@@ -101,6 +101,8 @@ jest.mock('lucide-react', () => ({
   Users: (props: any) => <span data-testid="icon-users" {...props} />,
   TrendingUp: (props: any) => <span data-testid="icon-trending-up" {...props} />,
   RefreshCw: (props: any) => <span data-testid="icon-refresh" {...props} />,
+  Globe: (props: any) => <span data-testid="icon-globe" {...props} />,
+  Bot: (props: any) => <span data-testid="icon-bot" {...props} />,
 }))
 
 jest.mock('@/components/ui/button', () => ({

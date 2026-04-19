@@ -24,12 +24,18 @@ from autonomous_agents.models import (
     TriggerType,
 )
 from autonomous_agents.services.a2a_client import invoke_agent
+from autonomous_agents.services.chat_history import (
+    ChatHistoryPublisher,
+    NoopChatHistoryPublisher,
+    _conversation_id_for_run,
+)
 from autonomous_agents.services.run_store import InMemoryRunStore, RunStore
 
 logger = logging.getLogger("autonomous_agents")
 
 _scheduler: AsyncIOScheduler | None = None
 _run_store: RunStore | None = None
+_chat_history_publisher: ChatHistoryPublisher | None = None
 
 
 def get_scheduler() -> AsyncIOScheduler:
@@ -58,6 +64,26 @@ def set_run_store(store: RunStore) -> None:
     _run_store = store
 
 
+def get_chat_history_publisher() -> ChatHistoryPublisher:
+    """Return the active :class:`ChatHistoryPublisher`.
+
+    Defaults to a no-op publisher so unit tests that don't care
+    about IMP-13 can keep exercising :func:`execute_task` without
+    setting anything up. The lifespan hook injects the real one
+    when ``CHAT_HISTORY_PUBLISH_ENABLED`` is on.
+    """
+    global _chat_history_publisher
+    if _chat_history_publisher is None:
+        _chat_history_publisher = NoopChatHistoryPublisher()
+    return _chat_history_publisher
+
+
+def set_chat_history_publisher(publisher: ChatHistoryPublisher) -> None:
+    """Inject the active :class:`ChatHistoryPublisher` — called from the FastAPI lifespan."""
+    global _chat_history_publisher
+    _chat_history_publisher = publisher
+
+
 async def _record_safely(store: RunStore, run: TaskRun) -> None:
     """Persist ``run`` and swallow store-side exceptions.
 
@@ -76,6 +102,39 @@ async def _record_safely(store: RunStore, run: TaskRun) -> None:
         )
 
 
+async def _publish_safely(
+    publisher: ChatHistoryPublisher,
+    run: TaskRun,
+    *,
+    prompt: str,
+    response: str | None,
+    error: str | None,
+    agent: str | None,
+) -> None:
+    """Surface the run in the UI chat history -- best effort.
+
+    Same contract as :func:`_record_safely`: chat-history publishing
+    is an observability feature, not part of the source of truth.
+    A misconfigured or unavailable chat database must never propagate
+    out and either abort the task or 500 the webhook that fired it.
+    Log loudly, swallow the exception, return.
+    """
+    try:
+        await publisher.publish_run(
+            run,
+            prompt=prompt,
+            response=response,
+            error=error,
+            agent=agent,
+            conversation_id=run.conversation_id,
+        )
+    except Exception as exc:
+        logger.error(
+            f"[{run.task_id}] Failed to publish run {run.run_id} to chat history "
+            f"(status={run.status}): {exc}"
+        )
+
+
 async def execute_task(task: TaskDefinition, context: dict[str, Any] | None = None) -> TaskRun:
     """Run a single task, record the result, and return the TaskRun.
 
@@ -85,7 +144,18 @@ async def execute_task(task: TaskDefinition, context: dict[str, Any] | None = No
     that drive ad-hoc execution. Don't add a leading underscore back.
     """
     run_id = str(uuid.uuid4())
-    run = TaskRun(run_id=run_id, task_id=task.id, task_name=task.name, status=TaskStatus.RUNNING)
+    # Pre-compute the deterministic conversation id so it lands in
+    # ``autonomous_runs`` from the very first RUNNING write -- the
+    # UI can then deep-link from a run row to ``/chat/<id>`` as soon
+    # as the run appears, even before the terminal state is recorded.
+    conversation_id = _conversation_id_for_run(run_id)
+    run = TaskRun(
+        run_id=run_id,
+        task_id=task.id,
+        task_name=task.name,
+        status=TaskStatus.RUNNING,
+        conversation_id=conversation_id,
+    )
 
     store = get_run_store()
     # Persist the RUNNING state so observers (UI, CLI) can see in-flight
@@ -94,6 +164,8 @@ async def execute_task(task: TaskDefinition, context: dict[str, Any] | None = No
     await _record_safely(store, run)
 
     logger.info(f"[{task.id}] Starting run {run_id}")
+    response_text: str | None = None
+    error_text: str | None = None
     try:
         response = await invoke_agent(
             prompt=task.prompt,
@@ -104,12 +176,14 @@ async def execute_task(task: TaskDefinition, context: dict[str, Any] | None = No
             timeout_seconds=task.timeout_seconds,
             max_retries=task.max_retries,
         )
+        response_text = response
         run.status = TaskStatus.SUCCESS
         run.response_preview = response[:500]
         logger.info(f"[{task.id}] Run {run_id} succeeded. Preview: {response[:120]}...")
     except Exception as e:
+        error_text = str(e)
         run.status = TaskStatus.FAILED
-        run.error = str(e)
+        run.error = error_text
         logger.error(f"[{task.id}] Run {run_id} failed: {e}")
     finally:
         run.finished_at = datetime.now(timezone.utc)
@@ -118,8 +192,42 @@ async def execute_task(task: TaskDefinition, context: dict[str, Any] | None = No
         # appending a duplicate. Again wrapped to keep store outages
         # from masking the real task outcome.
         await _record_safely(store, run)
+        # IMP-13: surface the run in the UI chat sidebar. Done after
+        # the RunStore write so a slow/flaky chat database can never
+        # delay the authoritative run-history record. The publisher
+        # is a no-op when ``CHAT_HISTORY_PUBLISH_ENABLED`` is off so
+        # this is essentially free in the default config.
+        await _publish_safely(
+            get_chat_history_publisher(),
+            run,
+            prompt=_prompt_for_publish(task, context),
+            response=response_text,
+            error=error_text,
+            agent=task.agent,
+        )
 
     return run
+
+
+def _prompt_for_publish(
+    task: TaskDefinition,
+    context: dict[str, Any] | None,
+) -> str:
+    """Reconstruct the user-visible prompt for chat-history publishing.
+
+    Mirrors the augmentation that ``services.a2a_client.invoke_agent``
+    applies before sending to the supervisor: when a webhook supplies
+    a context payload, the actual prompt the agent saw is
+    ``f"{prompt}\n\nContext:\n{json}"``. Showing the same string in
+    chat keeps the conversation honest -- otherwise a webhook-triggered
+    run would look like the bare prompt fired with no context, and
+    debugging "why did the agent do X?" becomes much harder.
+    """
+    if not context:
+        return task.prompt
+    import json as _json
+
+    return f"{task.prompt}\n\nContext:\n{_json.dumps(context, indent=2)}"
 
 
 def register_task(task: TaskDefinition) -> None:

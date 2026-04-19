@@ -113,6 +113,12 @@ class TaskRun(BaseModel):
     finished_at: datetime | None = None
     response_preview: str | None = None
     error: str | None = None
+    # IMP-13: id of the chat-history conversation that mirrors this
+    # run, when publishing is enabled. Lets the UI deep-link from a
+    # run row to ``/chat/<conversation_id>``. Optional and stable per
+    # ``run_id`` (UUID5-derived) so the field is safe to leave unset
+    # for runs from before publishing was turned on.
+    conversation_id: str | None = None
 
 
 # =============================================================================

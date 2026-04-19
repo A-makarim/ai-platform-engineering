@@ -150,6 +150,11 @@ tasks:
 | `MONGODB_DATABASE` | `None` | Optional. MongoDB database name. Required together with `MONGODB_URI`. |
 | `MONGODB_COLLECTION` | `autonomous_runs` | MongoDB collection name for run history. |
 | `RUN_HISTORY_MAXLEN` | `500` | Max runs retained by the in-memory store when MongoDB is not configured. |
+| `CHAT_HISTORY_PUBLISH_ENABLED` | `false` | Master switch for publishing autonomous runs into the UI's `conversations` / `messages` collections. Requires `MONGODB_URI`. See *Chat History Integration*. |
+| `CHAT_HISTORY_OWNER_EMAIL` | `autonomous@system` | Synthetic owner stamped on every autonomous conversation. Used as a sentinel — UI access is granted to authenticated users via the `source: 'autonomous'` flag, not by matching this email. |
+| `CHAT_HISTORY_DATABASE` | `None` | Optional override of the chat database name when the UI's chat data lives in a different database than `MONGODB_DATABASE`. |
+| `CHAT_HISTORY_CONVERSATIONS_COLLECTION` | `conversations` | Collection that the UI sidebar reads. |
+| `CHAT_HISTORY_MESSAGES_COLLECTION` | `messages` | Collection that the UI message panel reads. |
 
 ---
 
@@ -191,6 +196,55 @@ The startup log line tells you which backend is active:
 RunStore: MongoDB (database=autonomous_agents, collection=autonomous_runs)
 RunStore: in-memory (maxlen=500) — set MONGODB_URI and MONGODB_DATABASE to persist run history
 ```
+
+---
+
+## Chat History Integration
+
+Operations folks live in the CAIPE chat sidebar. By default, autonomous
+runs are invisible there: they never go through the UI's `/api/chat/*`
+routes, so they never land in the `conversations` / `messages`
+collections that the sidebar reads.
+
+When `CHAT_HISTORY_PUBLISH_ENABLED=true` (and `MONGODB_URI` is
+configured), every autonomous run is **mirrored** into those collections
+as it completes. The sidebar then has a chip to flip between *human*
+chats and *autonomous* runs without a separate page.
+
+| Document | Collection | `_id` strategy | Notes |
+|---|---|---|---|
+| Conversation (1 per run) | `CHAT_HISTORY_CONVERSATIONS_COLLECTION` (default `conversations`) | `uuid5(run_id)` — deterministic UUID, satisfies the UI route validator | `source: "autonomous"`, `task_id`, `run_id` set; `owner_id = CHAT_HISTORY_OWNER_EMAIL` |
+| User message | `CHAT_HISTORY_MESSAGES_COLLECTION` (default `messages`) | `f"autorun-{run_id}-user"` | Reconstructed prompt actually sent to the supervisor (includes any context block / webhook payload) |
+| Assistant message | same | `f"autorun-{run_id}-assistant"` | Final response on success, the error message on failure, a placeholder while the run is still `RUNNING` |
+
+All three writes are upserts keyed on the deterministic IDs, so the
+publisher is **idempotent** across status transitions (e.g. when a run
+moves from `RUNNING` to `SUCCESS` the same documents are updated in
+place — no duplicates).
+
+The publisher is wired into `_publish_safely`, which mirrors
+`_record_safely`: any exception inside the publisher is logged at
+`ERROR` and swallowed. Chat-history outages can never abort a task or
+prevent a run from being recorded in the canonical `RunStore`.
+
+### UI access model
+
+`/api/chat/conversations?source=autonomous` is an allow-listed query
+parameter. The route always pins `source: 'autonomous'` server-side
+when the parameter is present, so the parameter cannot be abused to
+bypass per-user ownership on human conversations. Any authenticated UI
+user can list autonomous conversations (operator/audit visibility); the
+read-only path is enforced by `requireConversationAccess`, which grants
+`shared_readonly` for `source: 'autonomous'` rows so messages are
+visible but writes are blocked.
+
+### Disabling
+
+Either of the following disables the publisher and silently swaps in a
+no-op implementation, so the rest of the service is unaffected:
+
+- `CHAT_HISTORY_PUBLISH_ENABLED=false` (the default)
+- `MONGODB_URI` not set
 
 ---
 

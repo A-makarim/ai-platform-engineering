@@ -170,6 +170,41 @@ class Settings(BaseSettings):
             raise ValueError("must be a finite number")
         return v
 
+    # IMP-13 — chat history publishing.
+    #
+    # When enabled, the scheduler writes each completed run as a
+    # tagged conversation (``source: "autonomous"``) into the UI's
+    # ``conversations`` + ``messages`` collections so operators can
+    # see autonomous activity in the existing chat sidebar.
+    #
+    # Off by default: the UI's chat schema is owned by another
+    # package, and writing into it is a cross-package contract that
+    # an operator should opt into deliberately. When off, no Mongo
+    # connection is opened against the chat database at all.
+    chat_history_publish_enabled: bool = False
+
+    # Owner email stamped on every autonomous-origin conversation /
+    # message. The UI's chat list query filters by ``owner_id``,
+    # ``sharing.shared_with``, etc.; the autonomous-only filter chip
+    # bypasses that filter, so this address is mainly an audit-trail
+    # marker rather than a real ACL anchor. Pick something clearly
+    # synthetic so humans don't mistake it for a colleague.
+    chat_history_owner_email: str = "autonomous@system"
+
+    # Optional override for the database that holds the UI chat
+    # collections. Defaults to ``mongodb_database`` so single-DB
+    # deployments need no extra config; operators with a separate
+    # logical DB for UI chat data can point this elsewhere without
+    # affecting run-history persistence.
+    chat_history_database: str | None = None
+
+    # Collection names mirror the UI defaults from
+    # ``ui/src/lib/mongodb.ts``. Exposed as settings so a CAIPE
+    # deployment that has renamed them (rare) doesn't have to fork
+    # this code to keep publishing working.
+    chat_history_conversations_collection: str = "conversations"
+    chat_history_messages_collection: str = "messages"
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -34,33 +34,55 @@ export const GET = withErrorHandler(async (request: NextRequest) => {
     const url = new URL(request.url);
     const archived = url.searchParams.get('archived') === 'true';
     const pinned = url.searchParams.get('pinned') === 'true';
+    // Allow-list of source filters. We deliberately do NOT honor 'slack'
+    // here so that the existing default exclusion of slack-originated
+    // conversations remains the only way slack rows appear (in their
+    // own dedicated view).
+    const sourceParam = url.searchParams.get('source');
+    const sourceFilter =
+      sourceParam === 'autonomous' || sourceParam === 'web' ? sourceParam : null;
 
     const conversations = await getCollection<Conversation>('conversations');
 
-    // Resolve user's team memberships for team-shared conversations
-    const userTeamIds = await getUserTeamIds(user.email);
-
-    // Build query — include conversations owned, shared directly, via teams, or public
-    const ownershipConditions: any[] = [
-      { owner_id: user.email },
-      { 'sharing.shared_with': user.email },
-      { 'sharing.is_public': true },
-    ];
-
-    if (userTeamIds.length > 0) {
-      ownershipConditions.push({
-        'sharing.shared_with_teams': { $in: userTeamIds },
-      });
-    }
-
-    // Exclude soft-deleted and Slack conversations from normal listing
+    // Build query — exclude soft-deleted and (by default) Slack conversations.
+    // Autonomous conversations are written by the autonomous_agents service
+    // under a synthetic owner (e.g., 'autonomous@system'), so applying the
+    // normal per-user ownership/sharing filter would hide them from every
+    // human user. When the caller explicitly opts in via `?source=autonomous`
+    // we treat the listing as an operator/audit view: any authenticated user
+    // can read autonomous run conversations. We still hard-pin
+    // `source: 'autonomous'` server-side to prevent the query parameter from
+    // being abused to bypass per-user authorization on human conversations.
     const query: any = {
-      source: { $ne: 'slack' },
-      $or: ownershipConditions,
       $and: [
         { $or: [{ deleted_at: null }, { deleted_at: { $exists: false } }] },
       ],
     };
+
+    if (sourceFilter === 'autonomous') {
+      query.source = 'autonomous';
+    } else {
+      // Default human/web view: keep the existing ownership/sharing filter
+      // and continue excluding slack-sourced rows.
+      const userTeamIds = await getUserTeamIds(user.email);
+      const ownershipConditions: any[] = [
+        { owner_id: user.email },
+        { 'sharing.shared_with': user.email },
+        { 'sharing.is_public': true },
+      ];
+      if (userTeamIds.length > 0) {
+        ownershipConditions.push({
+          'sharing.shared_with_teams': { $in: userTeamIds },
+        });
+      }
+      query.$or = ownershipConditions;
+      query.source = { $nin: ['slack', 'autonomous'] };
+
+      if (sourceFilter === 'web') {
+        // Tighten further when the caller wants pure web-only.
+        query.source = 'web';
+      }
+    }
 
     if (archived !== null) {
       query.is_archived = archived;
