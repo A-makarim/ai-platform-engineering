@@ -58,17 +58,23 @@ def _is_retryable_exception(exc: BaseException) -> bool:
 
 async def _post_once(
     *,
+    client: httpx.AsyncClient,
     url: str,
     payload: dict[str, Any],
-    timeout_seconds: float,
 ) -> httpx.Response:
-    """Single HTTP attempt — separated so tenacity can retry it cleanly."""
-    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-        response = await client.post(url, json=payload)
-        # raise_for_status inside the retry boundary so 5xx triggers a retry
-        # via the HTTPStatusError branch in _is_retryable_exception.
-        response.raise_for_status()
-        return response
+    """Single HTTP attempt — separated so tenacity can retry it cleanly.
+
+    The ``client`` is owned by the caller (``invoke_agent``) so that the
+    same HTTP connection pool is reused across retry attempts within a
+    single ``invoke_agent`` call. Otherwise every retry would pay TCP
+    handshake + TLS setup for a brand-new socket, defeating httpx's
+    keep-alive entirely.
+    """
+    response = await client.post(url, json=payload)
+    # raise_for_status inside the retry boundary so 5xx triggers a retry
+    # via the HTTPStatusError branch in _is_retryable_exception.
+    response.raise_for_status()
+    return response
 
 
 async def invoke_agent(
@@ -156,14 +162,18 @@ async def invoke_agent(
         reraise=True,
     )
 
+    # One client per invoke_agent call, reused across retries. The
+    # per-attempt timeout lives on the client (so each retry honours it)
+    # and the pool is torn down once the call completes.
     try:
-        async for attempt in retrying:
-            with attempt:
-                response = await _post_once(
-                    url=settings.supervisor_url,
-                    payload=payload,
-                    timeout_seconds=effective_timeout,
-                )
+        async with httpx.AsyncClient(timeout=effective_timeout) as client:
+            async for attempt in retrying:
+                with attempt:
+                    response = await _post_once(
+                        client=client,
+                        url=settings.supervisor_url,
+                        payload=payload,
+                    )
     except RetryError as exc:
         # reraise=True normally surfaces the underlying exception, but keep
         # this branch defensively for older tenacity behaviour.

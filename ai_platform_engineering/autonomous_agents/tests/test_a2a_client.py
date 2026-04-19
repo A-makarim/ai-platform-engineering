@@ -208,34 +208,93 @@ async def test_per_call_max_retries_beats_settings(_fast_retries):
     assert mock_post.await_count == 2
 
 
-async def test_per_call_timeout_passed_to_post_once(_fast_retries):
-    """timeout_seconds=42 is forwarded to ``_post_once``."""
+def _spy_async_client_ctor():
+    """Patch ``httpx.AsyncClient`` and capture the timeout it was built with.
+
+    The mock client supports ``async with`` and exposes a ``post`` AsyncMock
+    so callers can override its behaviour per test. We deliberately mock at
+    the class boundary (not at ``_post_once``) because the IMP-02 review
+    asked us to verify the client is built with the right timeout *and*
+    reused across retries — both of those facts live above ``_post_once``.
+    """
+    from unittest.mock import MagicMock
+
+    instances: list[MagicMock] = []
+    constructor_kwargs: list[dict[str, Any]] = []
+
+    def factory(*args, **kwargs):
+        constructor_kwargs.append(kwargs)
+        instance = MagicMock(name="AsyncClient")
+        instance.post = AsyncMock()
+        instance.__aenter__ = AsyncMock(return_value=instance)
+        instance.__aexit__ = AsyncMock(return_value=False)
+        instances.append(instance)
+        return instance
+
+    return factory, instances, constructor_kwargs
+
+
+async def test_per_call_timeout_passed_to_async_client(_fast_retries):
+    """timeout_seconds=42 reaches the underlying httpx.AsyncClient."""
     assert _fast_retries.a2a_timeout_seconds == 10.0  # sanity check
+    factory, _instances, ctor_kwargs = _spy_async_client_ctor()
 
-    captured: dict[str, Any] = {}
+    def factory_with_response(*a, **kw):
+        inst = factory(*a, **kw)
+        inst.post = AsyncMock(return_value=_make_response(_success_body("ok")))
+        return inst
 
-    async def fake_post(**kwargs):
-        captured.update(kwargs)
-        return _make_response(_success_body("ok"))
-
-    with patch.object(a2a_client, "_post_once", new=fake_post):
+    with patch.object(a2a_client.httpx, "AsyncClient", new=factory_with_response):
         await a2a_client.invoke_agent(prompt="hi", task_id="t1", timeout_seconds=42.0)
 
-    assert captured["timeout_seconds"] == 42.0
+    assert ctor_kwargs[-1]["timeout"] == 42.0
 
 
 async def test_settings_timeout_used_when_no_override(_fast_retries):
     """When no per-call timeout is given, the Settings default is used."""
-    captured: dict[str, Any] = {}
+    factory, instances, ctor_kwargs = _spy_async_client_ctor()
 
-    async def fake_post(**kwargs):
-        captured.update(kwargs)
-        return _make_response(_success_body("ok"))
+    def factory_with_response(*a, **kw):
+        inst = factory(*a, **kw)
+        inst.post = AsyncMock(return_value=_make_response(_success_body("ok")))
+        return inst
 
-    with patch.object(a2a_client, "_post_once", new=fake_post):
+    with patch.object(a2a_client.httpx, "AsyncClient", new=factory_with_response):
         await a2a_client.invoke_agent(prompt="hi", task_id="t1")
 
-    assert captured["timeout_seconds"] == _fast_retries.a2a_timeout_seconds
+    assert ctor_kwargs[-1]["timeout"] == _fast_retries.a2a_timeout_seconds
+
+
+async def test_single_async_client_reused_across_retries(_fast_retries):
+    """Across multiple retry attempts in one ``invoke_agent`` call, exactly
+    one ``httpx.AsyncClient`` is constructed.
+
+    Locks in the connection-pool reuse fix from the Copilot review: an
+    earlier draft created a fresh client per attempt, paying TCP+TLS
+    handshake on every retry and defeating httpx keep-alive.
+    """
+    factory, instances, ctor_kwargs = _spy_async_client_ctor()
+
+    def factory_with_responses(*a, **kw):
+        inst = factory(*a, **kw)
+        # 502 → 502 → 200 forces 3 attempts on a single client.
+        inst.post = AsyncMock(
+            side_effect=[
+                _make_response({}, status_code=502),
+                _make_response({}, status_code=502),
+                _make_response(_success_body("ok")),
+            ]
+        )
+        return inst
+
+    with patch.object(a2a_client.httpx, "AsyncClient", new=factory_with_responses):
+        result = await a2a_client.invoke_agent(prompt="hi", task_id="t1", max_retries=3)
+
+    assert result == "ok"
+    # Exactly one client across the 3 attempts.
+    assert len(ctor_kwargs) == 1, f"expected 1 AsyncClient construction, got {len(ctor_kwargs)}"
+    # And that one client absorbed all three .post() calls.
+    assert instances[0].post.await_count == 3
 
 
 # ---------------------------------------------------------------------------
