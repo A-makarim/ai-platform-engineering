@@ -140,6 +140,70 @@ async def test_half_open_success_closes_breaker():
     assert await breaker.state_for("u") is CircuitState.CLOSED
 
 
+async def test_half_open_blocks_concurrent_callers_until_trial_resolves():
+    """Single-flight invariant: only one caller is allowed through HALF_OPEN.
+
+    Otherwise the instant the cooldown expires we'd fan an outage's
+    worth of concurrent traffic at the recovering supervisor, which is
+    exactly what the breaker exists to prevent. Caught by Copilot
+    review on PR #9.
+    """
+    clock = _FakeClock()
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=10, clock=clock)
+    await breaker.record_failure("u")  # OPEN
+    clock.advance(15)
+    # First caller acquires the trial -- must not raise.
+    await breaker.before_call("u")
+    assert await breaker.state_for("u") is CircuitState.HALF_OPEN
+    # Concurrent caller hits the trial-in-flight gate and is blocked.
+    with pytest.raises(CircuitBreakerOpenError) as exc_info:
+        await breaker.before_call("u")
+    # retry_after is 0 because the gate is the trial, not a cooldown.
+    assert exc_info.value.retry_after_seconds == 0.0
+    # Trial succeeds -> breaker closes -> next caller is unblocked.
+    await breaker.record_success("u")
+    await breaker.before_call("u")  # CLOSED, must not raise
+
+
+async def test_release_trial_unblocks_half_open_without_changing_state():
+    """`release_trial` clears the trial flag without flipping state.
+
+    Used by ``invoke_agent`` on terminal exceptions that aren't
+    supervisor-sick (4xx). Without it the breaker would wedge in
+    HALF_OPEN with a phantom trial blocking the next real caller.
+    """
+    clock = _FakeClock()
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=10, clock=clock)
+    await breaker.record_failure("u")
+    clock.advance(15)
+    await breaker.before_call("u")  # acquire trial
+    # Concurrent caller blocked.
+    with pytest.raises(CircuitBreakerOpenError):
+        await breaker.before_call("u")
+    # Trial caller releases without recording outcome (e.g. 4xx).
+    await breaker.release_trial("u")
+    # State stays HALF_OPEN -- we still don't know if the supervisor is
+    # healthy -- but the next caller can now acquire a fresh trial.
+    assert await breaker.state_for("u") is CircuitState.HALF_OPEN
+    await breaker.before_call("u")
+
+
+async def test_half_open_stale_trial_is_reclaimed():
+    """Leak guard: if the trial caller never reports back, the next
+    caller after ``2 * cooldown_seconds`` reclaims the slot rather
+    than wedging the breaker forever.
+    """
+    clock = _FakeClock()
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=10, clock=clock)
+    await breaker.record_failure("u")
+    clock.advance(15)
+    await breaker.before_call("u")  # acquire trial
+    # Original trial caller dies without reporting.
+    clock.advance(25)  # > 2 * cooldown
+    # Next caller succeeds despite trial flag still being set.
+    await breaker.before_call("u")
+
+
 async def test_per_url_isolation():
     """A bad URL must not poison the breaker for a healthy one."""
     breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=10)
@@ -223,7 +287,7 @@ def _strict_breaker_settings():
     """Tight-threshold settings so we can trip the breaker in 2 failures.
 
     Patches both ``a2a_client.get_settings`` (used to compute timeouts /
-    retries / supervisor URL) AND ``cb_mod.get_circuit_breaker`` (used
+    retries / supervisor URL) AND ``a2a_client.get_circuit_breaker`` (used
     to gate the call) so the singleton honours the same tight thresholds
     instead of whatever defaults a previous test left on the cache.
     """

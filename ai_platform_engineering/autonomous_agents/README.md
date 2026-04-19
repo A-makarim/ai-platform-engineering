@@ -145,7 +145,7 @@ tasks:
 | `A2A_RETRY_BACKOFF_MAX_SECONDS` | `30.0` | Upper cap on the exponential backoff. |
 | `CIRCUIT_BREAKER_ENABLED` | `True` | Master kill-switch for the supervisor circuit breaker. See *Supervisor circuit breaker*. |
 | `CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `5` | Consecutive **post-retry** failures that trip the breaker per supervisor URL. |
-| `CIRCUIT_BREAKER_COOLDOWN_SECONDS` | `30` | Seconds the breaker stays OPEN before a single trial request is allowed (HALF_OPEN). |
+| `CIRCUIT_BREAKER_COOLDOWN_SECONDS` | `30` | Seconds the breaker stays OPEN before transitioning to HALF_OPEN; only one trial caller is allowed through at a time. |
 | `MONGODB_URI` | `None` | Optional. Enables MongoDB-backed run history. See *Run History Persistence*. |
 | `MONGODB_DATABASE` | `None` | Optional. MongoDB database name. Required together with `MONGODB_URI`. |
 | `MONGODB_COLLECTION` | `autonomous_runs` | MongoDB collection name for run history. |
@@ -254,10 +254,19 @@ Key contracts:
   `CircuitBreakerOpenError` immediately, carries the URL and the
   remaining cooldown, and is recorded as a normal failed run with a
   diagnostic message -- much more actionable than a generic timeout.
-- **Disabled-by-default safety.** Set `CIRCUIT_BREAKER_ENABLED=0` to
-  bypass the feature entirely (every method becomes a no-op). Use
-  this if the breaker ever misbehaves in production while you
-  diagnose.
+- **Single-flight HALF_OPEN trial.** When the cooldown expires the
+  *first* caller flips OPEN -> HALF_OPEN and is the trial; concurrent
+  callers see HALF_OPEN-with-trial-in-flight and are blocked until
+  that trial resolves. Without this, the instant cooldown expires we
+  would fan a real outage's worth of concurrent traffic at the
+  recovering supervisor -- exactly what the breaker is meant to
+  prevent. (A leak guard reclaims the trial slot if the original
+  caller never reports back, so a crashed worker can't wedge the
+  breaker.)
+- **Emergency bypass / kill-switch.** The breaker is enabled by
+  default. Set `CIRCUIT_BREAKER_ENABLED=0` to bypass the feature
+  entirely (every method becomes a no-op) only as a temporary
+  measure if it ever misbehaves in production while you diagnose.
 
 Tune `CIRCUIT_BREAKER_FAILURE_THRESHOLD` and
 `CIRCUIT_BREAKER_COOLDOWN_SECONDS` together: lower thresholds /

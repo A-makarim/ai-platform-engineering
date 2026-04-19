@@ -34,10 +34,17 @@ Design notes
   breaker untouched, because the supervisor is plainly working.
 * **Thread-safe via ``asyncio.Lock``.** All mutating operations take
   the lock so concurrent tasks can't race the state machine.
-* **Disabled-by-default safety.** When ``enabled=False`` the breaker
-  is a no-op pass-through; it never raises and never records state.
-  Operators can flip the kill-switch via ``CIRCUIT_BREAKER_ENABLED=0``
-  if the feature ever misbehaves in prod.
+* **Single-flight HALF_OPEN.** Once one caller flips OPEN -> HALF_OPEN,
+  every other concurrent caller is blocked until that trial resolves
+  (success closes, failure re-opens). Otherwise we'd fan a real
+  outage's worth of traffic at the recovering supervisor the instant
+  cooldown expires, which is exactly what the breaker is meant to
+  prevent.
+* **Kill-switch safety.** When ``enabled=False`` the breaker is a
+  no-op pass-through; it never raises and never records state.
+  The feature is enabled by default; operators set
+  ``CIRCUIT_BREAKER_ENABLED=0`` only as an emergency bypass if it
+  ever misbehaves in production.
 """
 
 from __future__ import annotations
@@ -47,6 +54,13 @@ import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+
+# ``config`` doesn't import from ``services``, so this is a one-way edge
+# and can safely live at module scope. We bind ``get_settings`` here
+# (rather than only inside the singleton factory) so tests can patch
+# ``cb_mod.get_settings`` to feed the breaker test-only thresholds. See
+# the ``_fast_retries`` fixture in ``tests/test_a2a_client.py``.
+from autonomous_agents.config import get_settings
 
 logger = logging.getLogger("autonomous_agents")
 
@@ -83,6 +97,14 @@ class _BreakerStats:
     state: CircuitState = CircuitState.CLOSED
     consecutive_failures: int = 0
     opened_at: float | None = None
+    # Set when a HALF_OPEN trial is in flight so we don't let a second
+    # concurrent caller race the trial. Cleared by record_success /
+    # record_failure / release_trial.
+    trial_in_flight: bool = False
+    # Wall-clock timestamp of when the trial started; used as a
+    # leak-detector fallback so a caller that never reports back (e.g.
+    # killed mid-call) doesn't wedge the breaker in HALF_OPEN forever.
+    trial_started_at: float | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -153,7 +175,9 @@ class CircuitBreaker:
 
         Side effects:
         * If we're OPEN and the cooldown has elapsed, transitions to
-          HALF_OPEN so the very next call is the trial request.
+          HALF_OPEN, marks a trial as in-flight, and lets *this single
+          caller* through. Concurrent callers see HALF_OPEN +
+          trial-in-flight and are blocked until the trial resolves.
         * No state change on the CLOSED happy path -- this is the hot
           path and must stay cheap.
         """
@@ -170,20 +194,51 @@ class CircuitBreaker:
                 remaining = self._cooldown - elapsed
                 if remaining > 0:
                     raise CircuitBreakerOpenError(url, retry_after_seconds=remaining)
-                # Cooldown elapsed -- move to HALF_OPEN and let this caller
-                # be the trial request. Do not raise.
+                # Cooldown elapsed -- move to HALF_OPEN and let this
+                # caller be the trial request. Subsequent callers must
+                # be blocked while the trial is in flight, otherwise
+                # the instant cooldown expires we'd fan an outage's
+                # worth of concurrent traffic at a recovering
+                # supervisor (P1 review feedback on PR #9).
                 logger.info(
-                    "Circuit breaker for %s: OPEN -> HALF_OPEN after %.1fs cooldown",
+                    "Circuit breaker for %s: OPEN -> HALF_OPEN after %.1fs cooldown "
+                    "(single trial in flight)",
                     url,
                     elapsed,
                 )
                 stats.state = CircuitState.HALF_OPEN
                 stats.opened_at = None
-            # HALF_OPEN: let this single caller through; no concurrent
-            # trial protection because invoke_agent calls are independent
-            # and a second concurrent caller will simply also count as
-            # part of the trial window. The first to record_failure
-            # re-opens the breaker.
+                stats.trial_in_flight = True
+                stats.trial_started_at = self._clock()
+                return
+
+            # state is HALF_OPEN
+            if stats.trial_in_flight:
+                # Leak guard: if the trial has been "in flight" for
+                # absurdly long the original caller almost certainly
+                # died without reporting back. Reclaim the trial
+                # rather than wedging the breaker forever. The bound
+                # of 2x cooldown is generous enough to cover even
+                # very long-running A2A calls but short enough to
+                # self-heal within minutes.
+                started = stats.trial_started_at
+                if started is not None and self._clock() - started > self._cooldown * 2:
+                    logger.warning(
+                        "Circuit breaker for %s: stale HALF_OPEN trial "
+                        "(>%0.1fs) -- reclaiming for new caller",
+                        url,
+                        self._cooldown * 2,
+                    )
+                    stats.trial_started_at = self._clock()
+                    return
+                # Block: there's a live trial; cooldown_remaining=0
+                # because the *trial* is what gates us, not a cooldown.
+                raise CircuitBreakerOpenError(url, retry_after_seconds=0.0)
+            # HALF_OPEN with no trial in flight (e.g. previous trial
+            # released without success/failure). Treat this caller as
+            # the new trial.
+            stats.trial_in_flight = True
+            stats.trial_started_at = self._clock()
 
     async def record_success(self, url: str) -> None:
         """Reset the failure counter and close the breaker if it was tripped."""
@@ -201,6 +256,8 @@ class CircuitBreaker:
             stats.consecutive_failures = 0
             stats.state = CircuitState.CLOSED
             stats.opened_at = None
+            stats.trial_in_flight = False
+            stats.trial_started_at = None
 
     async def record_failure(self, url: str) -> CircuitState:
         """Note one *post-retry* failure. May trip the breaker.
@@ -221,6 +278,8 @@ class CircuitBreaker:
             if stats.state is CircuitState.HALF_OPEN:
                 stats.state = CircuitState.OPEN
                 stats.opened_at = self._clock()
+                stats.trial_in_flight = False
+                stats.trial_started_at = None
                 logger.warning(
                     "Circuit breaker for %s: HALF_OPEN trial failed -> OPEN "
                     "(cooldown %.1fs)",
@@ -236,6 +295,8 @@ class CircuitBreaker:
             ):
                 stats.state = CircuitState.OPEN
                 stats.opened_at = self._clock()
+                stats.trial_in_flight = False
+                stats.trial_started_at = None
                 logger.warning(
                     "Circuit breaker for %s: tripped after %d consecutive "
                     "failures -> OPEN (cooldown %.1fs)",
@@ -245,6 +306,22 @@ class CircuitBreaker:
                 )
             return stats.state
 
+    async def release_trial(self, url: str) -> None:
+        """Clear the in-flight trial flag without changing breaker state.
+
+        Used by callers (``invoke_agent``) on terminal exceptions that
+        are *not* supervisor-sick signals (e.g. 4xx caller-fault). The
+        trial happened, it didn't tell us anything about supervisor
+        health, and we don't want to leave the breaker wedged in
+        HALF_OPEN with a phantom trial blocking real callers.
+        """
+        if not self._enabled:
+            return
+        stats = await self._get_stats(url)
+        async with stats.lock:
+            stats.trial_in_flight = False
+            stats.trial_started_at = None
+
     async def state_for(self, url: str) -> CircuitState:
         """Read-only snapshot of the current state. Useful for tests / metrics."""
         if not self._enabled:
@@ -252,7 +329,9 @@ class CircuitBreaker:
         stats = await self._get_stats(url)
         async with stats.lock:
             # Auto-transition to HALF_OPEN on read so dashboards reflect
-            # reality without waiting for the next call.
+            # reality without waiting for the next call. We do NOT mark
+            # a trial as in-flight here -- only an actual ``before_call``
+            # acquires the trial slot.
             if stats.state is CircuitState.OPEN and stats.opened_at is not None:
                 if self._clock() - stats.opened_at >= self._cooldown:
                     stats.state = CircuitState.HALF_OPEN
@@ -270,6 +349,8 @@ class CircuitBreaker:
             stats.consecutive_failures = 0
             stats.state = CircuitState.CLOSED
             stats.opened_at = None
+            stats.trial_in_flight = False
+            stats.trial_started_at = None
 
 
 _breaker_singleton: CircuitBreaker | None = None
@@ -289,9 +370,6 @@ async def get_circuit_breaker() -> CircuitBreaker:
         return _breaker_singleton
     async with _singleton_lock:
         if _breaker_singleton is None:
-            # Imported here to avoid a circular import at module load.
-            from autonomous_agents.config import get_settings
-
             settings = get_settings()
             _breaker_singleton = CircuitBreaker(
                 failure_threshold=settings.circuit_breaker_failure_threshold,

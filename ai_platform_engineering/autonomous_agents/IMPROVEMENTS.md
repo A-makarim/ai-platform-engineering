@@ -262,11 +262,23 @@ _Short audit trail of completed items. Newest first._
     Module-level singleton built lazily from `Settings` so test
     overrides are honoured; `reset_circuit_breaker()` is a
     pytest-friendly helper to drop the cache.
-  - 17 new tests in `test_circuit_breaker.py` covering the state
+  - **Single-flight HALF_OPEN trial** (added in response to PR #9
+    Copilot P1 review): once one caller flips OPEN → HALF_OPEN it
+    is the trial; concurrent callers see HALF_OPEN-with-trial-in-
+    flight and are blocked until the trial resolves. Without this
+    we'd fan an outage's worth of concurrent traffic at the
+    recovering supervisor the instant cooldown expires. A leak
+    guard (`2 × cooldown_seconds`) reclaims a stale trial slot if
+    the original caller never reports back, so a crashed worker
+    can't wedge the breaker. `release_trial()` lets `invoke_agent`
+    clear the trial slot on terminal-but-not-supervisor-sick
+    errors (e.g. 4xx) without flipping state.
+  - 20 tests in `test_circuit_breaker.py` covering the state
     machine (with a fake clock), per-URL isolation, the
     disabled-mode kill-switch, recovery via a successful
-    HALF_OPEN trial, the "success on retry doesn't trip"
-    contract, and the 4xx-is-not-an-outage contract. Existing
+    HALF_OPEN trial, single-flight HALF_OPEN gating, stale-trial
+    reclamation, the "success on retry doesn't trip" contract,
+    and the 4xx-is-not-an-outage contract. Existing
     32-test `test_a2a_client.py` suite updated to reset and
     relax the breaker so the retry tests still pass.
 

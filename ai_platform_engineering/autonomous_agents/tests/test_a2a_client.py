@@ -82,9 +82,16 @@ def _fast_retries():
         circuit_breaker_failure_threshold=1000,
     )
     # Drop the cached singleton so the breaker is rebuilt with these
-    # (test-only) settings instead of whatever a previous test left behind.
+    # (test-only) settings on the next ``get_circuit_breaker()`` call.
+    # We must patch ``cb_mod.get_settings`` too, not just
+    # ``a2a_client.get_settings``: the breaker singleton reads its
+    # config from the binding inside ``circuit_breaker``, which is a
+    # separate import. (Caught by Copilot review on PR #9.)
     cb_mod.reset_circuit_breaker()
-    with patch.object(a2a_client, "get_settings", return_value=fast):
+    with (
+        patch.object(a2a_client, "get_settings", return_value=fast),
+        patch.object(cb_mod, "get_settings", return_value=fast),
+    ):
         yield fast
     get_settings.cache_clear()
     cb_mod.reset_circuit_breaker()

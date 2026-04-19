@@ -195,6 +195,12 @@ async def invoke_agent(
         underlying = exc.last_attempt.exception()
         if _is_retryable_exception(underlying):
             await breaker.record_failure(settings.supervisor_url)
+        else:
+            # Non-retryable underlying error (e.g. wrapped 4xx). Don't
+            # count it as supervisor-sick, but DO release the HALF_OPEN
+            # trial slot so the next legitimate caller isn't blocked
+            # behind a phantom trial.
+            await breaker.release_trial(settings.supervisor_url)
         raise underlying from exc  # pragma: no cover
     except (httpx.TransportError, httpx.HTTPStatusError) as exc:
         # Retries exhausted (or first attempt with retries=0). Count one
@@ -206,6 +212,10 @@ async def invoke_agent(
         # classification used above so the two policies stay in sync.
         if _is_retryable_exception(exc):
             await breaker.record_failure(settings.supervisor_url)
+        else:
+            # 4xx -- release the HALF_OPEN trial slot (if any) without
+            # tripping the breaker. See the RetryError branch above.
+            await breaker.release_trial(settings.supervisor_url)
         raise exc
 
     # Transport call succeeded -- close the breaker if it was tripped.
