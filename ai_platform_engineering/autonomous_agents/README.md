@@ -143,6 +143,9 @@ tasks:
 | `A2A_MAX_RETRIES` | `3` | Max **additional** retries on transient failures (5xx + transport). 0 disables retries. Overridable per task via `max_retries`. |
 | `A2A_RETRY_BACKOFF_INITIAL_SECONDS` | `1.0` | Initial backoff between retries. Mostly a knob for tests; leave at 1.0 in prod. |
 | `A2A_RETRY_BACKOFF_MAX_SECONDS` | `30.0` | Upper cap on the exponential backoff. |
+| `CIRCUIT_BREAKER_ENABLED` | `True` | Master kill-switch for the supervisor circuit breaker. See *Supervisor circuit breaker*. |
+| `CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `5` | Consecutive **post-retry** failures that trip the breaker per supervisor URL. |
+| `CIRCUIT_BREAKER_COOLDOWN_SECONDS` | `30` | Seconds the breaker stays OPEN before a single trial request is allowed (HALF_OPEN). |
 | `MONGODB_URI` | `None` | Optional. Enables MongoDB-backed run history. See *Run History Persistence*. |
 | `MONGODB_DATABASE` | `None` | Optional. MongoDB database name. Required together with `MONGODB_URI`. |
 | `MONGODB_COLLECTION` | `autonomous_runs` | MongoDB collection name for run history. |
@@ -217,6 +220,50 @@ Per-task overrides on `TaskDefinition` win over the global settings:
 - `timeout_seconds`: raise it for known long-running synthesis prompts.
 - `max_retries`: set to `0` for "best-effort, do not burn quota" tasks
   where a single attempt is the whole point.
+
+### Supervisor circuit breaker
+
+Retries handle a single flaky request. They are the wrong tool for a
+*broken* supervisor: every scheduled task spends its full retry budget
+hammering a downstream that can't recover, multiplying load and turning
+a localised outage into a self-DoS.
+
+A small per-URL circuit breaker sits between `invoke_agent` and the
+network for exactly this case. The state machine is the canonical one:
+
+```
+CLOSED ── N consecutive failures ──► OPEN
+   ▲                                    │
+   │                                    │ cooldown elapses
+   │                                    ▼
+   └─── success on trial ─────── HALF_OPEN ── failure ─► OPEN
+```
+
+Key contracts:
+
+- **Counted only after retries are exhausted.** A request that 5xx's
+  once and then succeeds on retry leaves the breaker untouched. The
+  breaker tracks `invoke_agent`-level outcomes, not individual HTTP
+  attempts.
+- **4xx never trips the breaker.** Caller-fault responses (bad payload,
+  bad auth, unknown route) are not a sign that the supervisor is
+  unhealthy, so a misconfigured task can't self-DoS its own URL.
+- **Per-URL.** Tracked separately for each `SUPERVISOR_URL`, so one
+  bad URL never poisons the breaker entry for another.
+- **OPEN short-circuits without a connection.** A blocked call raises
+  `CircuitBreakerOpenError` immediately, carries the URL and the
+  remaining cooldown, and is recorded as a normal failed run with a
+  diagnostic message -- much more actionable than a generic timeout.
+- **Disabled-by-default safety.** Set `CIRCUIT_BREAKER_ENABLED=0` to
+  bypass the feature entirely (every method becomes a no-op). Use
+  this if the breaker ever misbehaves in production while you
+  diagnose.
+
+Tune `CIRCUIT_BREAKER_FAILURE_THRESHOLD` and
+`CIRCUIT_BREAKER_COOLDOWN_SECONDS` together: lower thresholds /
+shorter cooldowns trip more aggressively (good when the supervisor
+is fast to recover); higher thresholds / longer cooldowns avoid
+false positives on brief restarts.
 
 ---
 

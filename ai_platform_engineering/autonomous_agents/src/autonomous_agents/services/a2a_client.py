@@ -30,8 +30,14 @@ from tenacity import (
 )
 
 from autonomous_agents.config import get_settings
+from autonomous_agents.services.circuit_breaker import (
+    CircuitBreakerOpenError,
+    get_circuit_breaker,
+)
 
 logger = logging.getLogger("autonomous_agents")
+
+__all__ = ["invoke_agent", "CircuitBreakerOpenError"]
 
 
 def _is_retryable_exception(exc: BaseException) -> bool:
@@ -162,6 +168,15 @@ async def invoke_agent(
         reraise=True,
     )
 
+    # IMP-16: gate the call through the circuit breaker. If the breaker
+    # is OPEN we short-circuit *before* opening a connection, which is
+    # the whole point -- a broken supervisor must not see traffic from
+    # every scheduled run multiplied by the retry budget. CircuitBreakerOpenError
+    # propagates to the scheduler and is recorded as the run failure
+    # reason, which is much more actionable than a generic timeout.
+    breaker = await get_circuit_breaker()
+    await breaker.before_call(settings.supervisor_url)
+
     # One client per invoke_agent call, reused across retries. The
     # per-attempt timeout lives on the client (so each retry honours it)
     # and the pool is torn down once the call completes.
@@ -177,7 +192,27 @@ async def invoke_agent(
     except RetryError as exc:
         # reraise=True normally surfaces the underlying exception, but keep
         # this branch defensively for older tenacity behaviour.
-        raise exc.last_attempt.exception() from exc  # pragma: no cover
+        underlying = exc.last_attempt.exception()
+        if _is_retryable_exception(underlying):
+            await breaker.record_failure(settings.supervisor_url)
+        raise underlying from exc  # pragma: no cover
+    except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+        # Retries exhausted (or first attempt with retries=0). Count one
+        # failure against the breaker -- *not* one per attempt -- so a
+        # request that succeeds on retry leaves the breaker at zero.
+        # Only "supervisor-is-sick" failures count: 4xx is caller-fault
+        # (auth/validation/missing route) and would self-DoS the breaker
+        # on a misconfigured task. We piggy-back on the same retryable-
+        # classification used above so the two policies stay in sync.
+        if _is_retryable_exception(exc):
+            await breaker.record_failure(settings.supervisor_url)
+        raise exc
+
+    # Transport call succeeded -- close the breaker if it was tripped.
+    # We treat HTTP success as supervisor-is-healthy even if the JSON-RPC
+    # ``error`` branch fires below, because that's an application-level
+    # error, not a connectivity / availability problem.
+    await breaker.record_success(settings.supervisor_url)
 
     result = response.json()
 

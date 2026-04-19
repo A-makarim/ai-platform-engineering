@@ -138,6 +138,38 @@ class Settings(BaseSettings):
     # configured. Ignored when MongoRunStore is in use.
     run_history_maxlen: int = 500
 
+    # IMP-16 — circuit breaker around the supervisor A2A call.
+    #
+    # Enabled by default because the failure mode it prevents
+    # (every scheduled task burning its full retry budget against a
+    # broken supervisor) is exactly the cascading-failure pattern
+    # autonomous workloads cause. Operators can flip this off via
+    # ``CIRCUIT_BREAKER_ENABLED=0`` if they ever need to.
+    circuit_breaker_enabled: bool = True
+
+    # How many *consecutive* post-retry failures trip the breaker.
+    # Counted only after ``a2a_max_retries`` is exhausted, so a flaky
+    # request that succeeds on retry leaves the breaker untouched.
+    # Default of 5 trades a little extra failure-tolerance for fewer
+    # false-positive trips on brief supervisor restarts.
+    circuit_breaker_failure_threshold: int = Field(default=5, ge=1)
+
+    # How long the breaker stays OPEN before letting a single trial
+    # request through (HALF_OPEN). 30s is long enough that a crashed
+    # supervisor has a real chance to come back, short enough that a
+    # transient outage doesn't wedge scheduled runs for minutes.
+    circuit_breaker_cooldown_seconds: float = Field(default=30.0, gt=0)
+
+    @field_validator("circuit_breaker_cooldown_seconds")
+    @classmethod
+    def _reject_nonfinite_cb_cooldown(cls, v: float) -> float:
+        # Same hardening as ``a2a_*`` knobs: ``inf`` would wedge the
+        # breaker permanently OPEN, ``nan`` would compare false against
+        # everything and silently disable the cooldown gate.
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("must be a finite number")
+        return v
+
 
 @lru_cache
 def get_settings() -> Settings:

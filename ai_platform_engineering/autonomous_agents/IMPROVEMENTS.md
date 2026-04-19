@@ -213,14 +213,7 @@ Don't do these until you have a real reason. Premature.
 
 ---
 
-### IMP-16 — Circuit breaker around the supervisor call
-- **Status**: TODO
-- **Why**: If the supervisor is broken, fire-and-forget tasks just keep
-  hammering it. A circuit breaker fails fast and gives the supervisor room
-  to recover.
-- **Approach**: lightweight `purgatory` or roll your own state machine in
-  `a2a_client.py` keyed by supervisor URL.
-- **Touches**: `services/a2a_client.py`.
+_(IMP-16 — completed; see Done section.)_
 
 ---
 
@@ -239,6 +232,45 @@ Don't do these until you have a real reason. Premature.
 ## Done
 
 _Short audit trail of completed items. Newest first._
+
+### IMP-16 — Circuit breaker around the supervisor A2A call
+- **Shipped on**: branch `prebuild/feat/autonomous-agents-circuit-breaker`
+- **What landed**:
+  - New `services/circuit_breaker.py` -- self-contained
+    `CircuitBreaker` class with the canonical CLOSED → OPEN →
+    HALF_OPEN state machine, keyed per supervisor URL so a single
+    bad URL can't poison healthy ones. `CircuitBreakerOpenError`
+    surfaces both the URL and remaining cooldown so failed-run
+    rows show an actionable message instead of a generic timeout.
+  - Integration with `services/a2a_client.invoke_agent`:
+    `before_call` gates the connection (no socket opened when
+    OPEN), `record_success` closes the breaker on a 2xx response,
+    `record_failure` is called *only after* the tenacity retry
+    budget is exhausted -- a flaky request that succeeds on retry
+    leaves the breaker untouched. 4xx responses are caller-fault
+    (matching `_is_retryable_exception`) and never count toward the
+    trip threshold so a misconfigured task can't self-DoS.
+  - Three new `Settings`:
+    `CIRCUIT_BREAKER_ENABLED` (default `True`, kill-switch),
+    `CIRCUIT_BREAKER_FAILURE_THRESHOLD` (default `5`, consecutive
+    post-retry failures that trip the breaker),
+    `CIRCUIT_BREAKER_COOLDOWN_SECONDS` (default `30`, duration in
+    OPEN before a HALF_OPEN trial). The cooldown carries the same
+    finite-number guard as the `a2a_*` settings.
+  - Async-safe: per-URL `asyncio.Lock` guards the state machine
+    so concurrent runs can't race the trip / reset transitions.
+    Module-level singleton built lazily from `Settings` so test
+    overrides are honoured; `reset_circuit_breaker()` is a
+    pytest-friendly helper to drop the cache.
+  - 17 new tests in `test_circuit_breaker.py` covering the state
+    machine (with a fake clock), per-URL isolation, the
+    disabled-mode kill-switch, recovery via a successful
+    HALF_OPEN trial, the "success on retry doesn't trip"
+    contract, and the 4xx-is-not-an-outage contract. Existing
+    32-test `test_a2a_client.py` suite updated to reset and
+    relax the breaker so the retry tests still pass.
+
+---
 
 ### IMP-04 — Container hardening (Dockerfile)
 - **Shipped on**: branch `prebuild/feat/autonomous-agents-dockerfile-hardening`
