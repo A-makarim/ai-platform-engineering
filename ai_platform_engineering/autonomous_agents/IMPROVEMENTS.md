@@ -37,14 +37,7 @@ the UI on top of. None of them change the public API shape.
 
 ---
 
-### IMP-03 — Wire `WEBHOOK_SECRET` env var as a global fallback
-- **Status**: TODO
-- **Why**: Env var is documented in `README.md` but `routes/webhooks.py`
-  never reads it — only honours per-task `secret`. Pick one: implement or remove.
-- **Approach**: in `validate_signature`, fall back to `settings.webhook_secret`
-  when the task has no per-task secret. Log clearly which one was used (don't log
-  the secret itself).
-- **Touches**: `routes/webhooks.py`, `tests/test_webhooks.py` (new).
+_(IMP-03 — completed; see Done section.)_
 
 ---
 
@@ -81,14 +74,7 @@ _(IMP-05 — completed; see Done section.)_
 
 ---
 
-### IMP-07 — Webhook replay protection
-- **Status**: TODO
-- **Why**: HMAC verifies authenticity but a captured payload can be replayed
-  forever. GitHub-style.
-- **Approach**: require a `timestamp` claim in the payload (or require an
-  `X-Hub-Timestamp` header), reject if `now - timestamp > 5 min`.
-  Optional nonce table for hard guarantees later.
-- **Touches**: `routes/webhooks.py`, `tests/test_webhooks.py`.
+_(IMP-07 — completed; see Done section.)_
 
 ---
 
@@ -261,6 +247,36 @@ Don't do these until you have a real reason. Premature.
 ## Done
 
 _Short audit trail of completed items. Newest first._
+
+### IMP-03 / IMP-07 — Webhook hardening (global secret fallback + replay protection)
+- **Shipped on**: branch `prebuild/feat/autonomous-agents-webhook-hardening`
+- **What landed**:
+  - `routes/webhooks.py` — extracted `_resolve_secret`,
+    `_validate_timestamp`, `_expected_signature` helpers.
+    Per-task `trigger.secret` still wins; in its absence the
+    service falls back to `settings.webhook_secret` (IMP-03).
+    Log line on signature failure includes a `secret_source`
+    tag (`"task" | "global"`) but never the secret itself.
+  - `Settings.webhook_replay_window_seconds` (default `0` = disabled
+    so existing GitHub-style senders keep working). When `> 0`,
+    signed webhooks must include `X-Webhook-Timestamp` and the
+    HMAC is computed over `f"{ts}.{body}"` so the timestamp is
+    bound into the MAC (Slack-style). Requests outside `±N`
+    seconds (past *or* future) are rejected.
+  - Failed signature responses return only the generic message
+    `"Invalid webhook signature"` — no expected-signature echo
+    (would be a forgery oracle).
+  - 15 new tests in `tests/test_webhooks.py` covering: per-task
+    vs global secret precedence, no-secret-anywhere flow,
+    replay-window disabled keeps body-only signing,
+    replay-window enabled requires + signs `ts.body`, too-old
+    and too-future timestamps rejected, non-numeric timestamp
+    returns 400, signature error doesn't leak the expected
+    value, helper round-trip with the endpoint.
+  - README documents both signature contracts and the migration
+    path for replay protection.
+
+---
 
 ### IMP-09 — Rename private import `_execute_task`
 - **Shipped on**: branch `prebuild/feat/autonomous-agents-task-crud`

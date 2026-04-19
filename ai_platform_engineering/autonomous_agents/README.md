@@ -137,7 +137,8 @@ tasks:
 | `LLM_PROVIDER` | `anthropic-claude` | Default LLM provider |
 | `HOST` | `0.0.0.0` | Server bind host |
 | `PORT` | `8002` | Server port |
-| `WEBHOOK_SECRET` | `None` | Global HMAC secret for webhook validation |
+| `WEBHOOK_SECRET` | `None` | Global fallback HMAC secret for incoming webhooks. Used when a webhook task has no per-task `secret`. See *Webhook signature & replay protection*. |
+| `WEBHOOK_REPLAY_WINDOW_SECONDS` | `0` | When > 0, signed webhooks must include `X-Webhook-Timestamp` and the HMAC is computed over `f"{ts}.{body}"`. Requests outside `±N` seconds are rejected. `0` disables replay protection (legacy GitHub-style body-only signing). See *Webhook signature & replay protection*. |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `A2A_TIMEOUT_SECONDS` | `300` | Per-attempt timeout for the supervisor call. Overridable per task via `timeout_seconds`. See *Supervisor call reliability*. |
 | `A2A_MAX_RETRIES` | `3` | Max **additional** retries on transient failures (5xx + transport). 0 disables retries. Overridable per task via `max_retries`. |
@@ -147,6 +148,51 @@ tasks:
 | `MONGODB_DATABASE` | `None` | Optional. MongoDB database name. Required together with `MONGODB_URI`. |
 | `MONGODB_COLLECTION` | `autonomous_runs` | MongoDB collection name for run history. |
 | `RUN_HISTORY_MAXLEN` | `500` | Max runs retained by the in-memory store when MongoDB is not configured. |
+
+---
+
+## Webhook signature & replay protection
+
+Incoming webhooks (`POST /api/v1/hooks/{task_id}`) are HMAC-validated
+when **either** of the following is configured:
+
+1. The task carries a per-task `trigger.secret` in `config.yaml`, **or**
+2. The service-wide `WEBHOOK_SECRET` env var is set (used as a global
+   fallback for any task without its own secret).
+
+Per-task secrets always win when both are set. If neither is configured
+the endpoint accepts unsigned requests — fine for local dev, **never
+acceptable in production**.
+
+### Default mode (GitHub-compatible)
+
+With `WEBHOOK_REPLAY_WINDOW_SECONDS=0` (the default) the signature
+contract is the standard GitHub-style body-only HMAC:
+
+```text
+X-Hub-Signature-256: sha256=HEX( HMAC-SHA256(secret, body) )
+```
+
+### Replay-protected mode (recommended for production)
+
+Set `WEBHOOK_REPLAY_WINDOW_SECONDS` to a positive number of seconds
+(e.g. `300` for ±5 minutes) to opt into replay protection. The sender
+must then add an `X-Webhook-Timestamp` header (Unix epoch seconds) and
+the HMAC is computed over `f"{timestamp}.{body}"` so the timestamp is
+bound into the MAC and cannot be tampered with:
+
+```text
+X-Hub-Signature-256: sha256=HEX( HMAC-SHA256(secret, f"{ts}.{body}") )
+X-Webhook-Timestamp: 1735689600
+```
+
+Requests whose timestamp is outside `±WEBHOOK_REPLAY_WINDOW_SECONDS` of
+server time are rejected with `401`, including modest clock-skew
+allowance on both sides. A non-numeric timestamp returns `400`.
+
+Migration tip: keep `WEBHOOK_REPLAY_WINDOW_SECONDS=0` until every
+sender is updated to emit the timestamp header, then flip the value
+in one config change.
 
 ---
 
