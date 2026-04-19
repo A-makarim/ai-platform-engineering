@@ -159,18 +159,50 @@ don't persist).
 ---
 
 ### IMP-13 — Surface autonomous runs in UI conversations (`source: "autonomous"`)
-- **Status**: TODO
+- **Status**: DONE (PR — branch `prebuild/feat/autonomous-agents-chat-history`)
 - **Why**: Operations folks live in the chat history. Autonomous runs that
   never appear there are invisible. Tagging them lets a single filter show
   "what did the autonomous agent do today?" without a separate UI.
-- **Approach**:
-  1. Run records (Mongo, IMP-01) include `conversation_id` + the same fields
-     used by the existing chat history.
-  2. Optionally write the prompt + response into the existing `conversations`
-     collection with metadata `{ source: "autonomous", task_id }`.
-  3. UI filter chip "Autonomous only" on the chat history view.
-- **Touches**: `services/run_store.py`, `ui/src/app/(app)/chat/*`.
-- **Depends on**: IMP-01.
+- **What shipped**:
+  1. New `services/chat_history.py`: `ChatHistoryPublisher` protocol with a
+     `MongoChatHistoryPublisher` that upserts one conversation + two messages
+     (user prompt, assistant response/error) per run. Uses a deterministic
+     UUIDv5 derived from `run_id` for the conversation `_id` so the existing
+     UI routes (which require UUID conversation IDs) work without changes.
+  2. `TaskRun.conversation_id` (Pydantic): exposed on the run-history API so
+     the UI can deep-link a run row to its conversation.
+  3. Scheduler wires the publisher in `_publish_safely` so chat-publish
+     failures never abort a task or a run record (parallel to
+     `_record_safely` for the `RunStore`). The reconstructed prompt
+     includes any context block / webhook payload used at agent invocation
+     time so the chat thread reflects what the agent actually saw.
+  4. Lifespan in `main.py` instantiates the publisher (or a Noop when
+     disabled / Mongo not configured), calls `ensure_indexes()`, and injects
+     it into the scheduler.
+  5. UI: `Conversation` types gain optional `source`, `task_id`, `run_id`.
+     `GET /api/chat/conversations` accepts `?source=autonomous` and bypasses
+     the per-user owner filter for that allow-listed value (still rejects
+     unknown sources). `requireConversationAccess` grants read-only access
+     to any authenticated user when the conversation is `source: 'autonomous'`
+     so messages of autonomous runs are viewable. `Sidebar` adds an
+     "Autonomous" filter chip with a `Bot` icon and purple tile/badge for
+     autonomous rows; the empty state explains how to schedule a run.
+- **Opt-in env vars (autonomous_agents)**:
+  - `CHAT_HISTORY_PUBLISH_ENABLED` (default `false`) — kill switch.
+  - `CHAT_HISTORY_OWNER_EMAIL` (default `autonomous@system`) — synthetic
+    owner stamped on every published conversation.
+  - `CHAT_HISTORY_DATABASE` — optional override of the chat database name
+    when it differs from the autonomous_agents database.
+  - `CHAT_HISTORY_CONVERSATIONS_COLLECTION` (default `conversations`).
+  - `CHAT_HISTORY_MESSAGES_COLLECTION` (default `messages`).
+- **Touches**: `services/chat_history.py`, `scheduler.py`, `main.py`,
+  `models.py`, `config.py`, `tests/test_chat_history.py`,
+  `tests/test_scheduler_chat_history.py`, `ui/src/types/{mongodb,a2a}.ts`,
+  `ui/src/lib/{api-client,api-middleware}.ts`,
+  `ui/src/store/chat-store.ts`,
+  `ui/src/app/api/chat/conversations/route.ts`,
+  `ui/src/components/layout/Sidebar.tsx`.
+- **Depends on**: IMP-01 (RunStore).
 
 ---
 

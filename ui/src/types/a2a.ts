@@ -189,7 +189,17 @@ export interface Conversation {
     shared_with_teams?: string[];
     share_link_enabled?: boolean;
   };
-
+  /**
+   * Origin of the conversation. 'autonomous' is set by the autonomous_agents
+   * service when it surfaces a task run as a chat conversation; the sidebar
+   * uses this to render a distinct badge and to enable an "Autonomous only"
+   * filter view. Undefined = legacy / human-typed conversation.
+   */
+  source?: 'web' | 'slack' | 'autonomous';
+  /** Autonomous task identifier (only when source === 'autonomous') */
+  task_id?: string;
+  /** Autonomous run identifier (only when source === 'autonomous') */
+  run_id?: string;
 }
 
 // Feedback types - matching agent-forge

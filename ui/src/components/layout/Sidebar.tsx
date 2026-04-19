@@ -22,7 +22,8 @@ import {
   Users,
   TrendingUp,
   RefreshCw,
-  Globe
+  Globe,
+  Bot
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -68,6 +69,12 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
   const [isResizing, setIsResizing] = useState(false);
   const [isReloading, setIsReloading] = useState(false);
   const [recycleBinOpen, setRecycleBinOpen] = useState(false);
+  // Sidebar filter view. 'all' = default human/web conversations,
+  // 'autonomous' = surface only autonomous_agents runs (source === 'autonomous').
+  // The autonomous list is fetched server-side via ?source=autonomous so the
+  // operator can pivot between "my chats" and "what did the autonomous agent
+  // do today?" without leaving the sidebar.
+  const [conversationView, setConversationView] = useState<'all' | 'autonomous'>('all');
   const { toast } = useToast();
 
   // Agent name lookup for dynamic agent conversations
@@ -78,8 +85,13 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
   useEffect(() => {
     if (activeTab === "chat" && storageMode === 'mongodb') {
       // Always load from server - the loadConversationsFromServer function
-      // will merge server data with local cache intelligently
-      loadConversationsFromServer().catch((error) => {
+      // will merge server data with local cache intelligently. When the user
+      // has flipped the chip to "Autonomous only", request the server-side
+      // source filter so we get autonomous-agent runs that the user does not
+      // own (those would be hidden by the default per-user ownership filter).
+      loadConversationsFromServer(
+        conversationView === 'autonomous' ? { source: 'autonomous' } : undefined
+      ).catch((error) => {
         console.error('[Sidebar] Failed to load conversations:', error);
       });
     }
@@ -88,7 +100,9 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible' && activeTab === "chat" && storageMode === 'mongodb') {
         console.log('[Sidebar] Tab became visible, re-syncing conversations');
-        loadConversationsFromServer().catch((error) => {
+        loadConversationsFromServer(
+          conversationView === 'autonomous' ? { source: 'autonomous' } : undefined
+        ).catch((error) => {
           console.error('[Sidebar] Failed to re-sync conversations:', error);
         });
       }
@@ -97,7 +111,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, storageMode]); // Intentionally exclude loadConversationsFromServer to prevent re-runs
+  }, [activeTab, storageMode, conversationView]); // Intentionally exclude loadConversationsFromServer to prevent re-runs
 
   // Fetch dynamic agents for name lookup in conversation list
   useEffect(() => {
@@ -147,7 +161,9 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
     setIsReloading(true);
     try {
       console.log('[Sidebar] Manual reload triggered');
-      await loadConversationsFromServer();
+      await loadConversationsFromServer(
+        conversationView === 'autonomous' ? { source: 'autonomous' } : undefined
+      );
       // Also force-reload the active conversation's messages to pick up
       // follow-up messages from other devices and refresh A2A events
       if (activeConversationId) {
@@ -340,10 +356,62 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
             </div>
           )}
 
+          {/*
+            Autonomous-runs filter chip. Only meaningful in MongoDB mode
+            because autonomous conversations are produced server-side by
+            the autonomous_agents service and persisted to MongoDB. In
+            localStorage mode there is nothing to filter so we hide the
+            control entirely.
+          */}
+          {!collapsed && storageMode === 'mongodb' && (
+            <div className="px-3 pb-2 flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => setConversationView('all')}
+                className={cn(
+                  "px-2 py-0.5 rounded-full text-[10px] font-medium uppercase tracking-wider border transition-colors",
+                  conversationView === 'all'
+                    ? "bg-primary/15 border-primary/40 text-primary"
+                    : "bg-muted/40 border-border/50 text-muted-foreground hover:bg-muted"
+                )}
+                aria-pressed={conversationView === 'all'}
+              >
+                All
+              </button>
+              <button
+                type="button"
+                onClick={() => setConversationView('autonomous')}
+                className={cn(
+                  "px-2 py-0.5 rounded-full text-[10px] font-medium uppercase tracking-wider border transition-colors flex items-center gap-1",
+                  conversationView === 'autonomous'
+                    ? "bg-purple-500/15 border-purple-500/40 text-purple-600 dark:text-purple-400"
+                    : "bg-muted/40 border-border/50 text-muted-foreground hover:bg-muted"
+                )}
+                aria-pressed={conversationView === 'autonomous'}
+                title="Show autonomous-agent runs"
+              >
+                <Bot className="h-2.5 w-2.5" />
+                Autonomous
+              </button>
+            </div>
+          )}
+
           <ScrollArea className="flex-1 min-w-0">
             <div className="px-2 space-y-1 pb-4">
               <AnimatePresence mode="popLayout">
-                {conversations.map((conv, index) => {
+                {conversations
+                  // Client-side mirror of the server filter. The server
+                  // returns the right slice when ?source=autonomous is set,
+                  // but the store preserves locally-streaming / active
+                  // conversations across reloads, so we filter again here
+                  // to keep the chip's intent visually consistent.
+                  .filter((conv) => {
+                    if (conversationView === 'autonomous') {
+                      return conv.source === 'autonomous';
+                    }
+                    return conv.source !== 'autonomous';
+                  })
+                  .map((conv, index) => {
                   // Check if conversation is shared
                   const isShared = conv.sharing && (
                     conv.sharing.is_public ||
@@ -352,6 +420,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
                     conv.sharing.share_link_enabled
                   );
 
+                  const isAutonomous = conv.source === 'autonomous';
                   const isLive = isConversationStreaming(conv.id);
                   const isInputRequired = !isLive && isConversationInputRequired(conv.id);
                   const isUnviewed = !isLive && !isInputRequired && hasUnviewedMessages(conv.id);
@@ -395,9 +464,11 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
                           ? "bg-amber-500/20"
                           : isUnviewed
                             ? "bg-blue-500/15"
-                            : activeConversationId === conv.id
-                              ? "bg-primary/20"
-                              : "bg-muted"
+                            : isAutonomous
+                              ? "bg-purple-500/15"
+                              : activeConversationId === conv.id
+                                ? "bg-primary/20"
+                                : "bg-muted"
                     )}>
                       {isLive ? (
                         <>
@@ -415,6 +486,13 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
                             <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-amber-500" />
                           </span>
                         </>
+                      ) : isAutonomous ? (
+                        <Bot className={cn(
+                          "h-4 w-4",
+                          activeConversationId === conv.id
+                            ? "text-purple-600 dark:text-purple-400"
+                            : "text-purple-500/80 dark:text-purple-400/80"
+                        )} />
                       ) : (
                         <>
                           <MessageSquare className={cn(
@@ -560,16 +638,31 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
                 })}
               </AnimatePresence>
 
-              {conversations.length === 0 && !collapsed && (
+              {conversations.filter((c) =>
+                conversationView === 'autonomous'
+                  ? c.source === 'autonomous'
+                  : c.source !== 'autonomous'
+              ).length === 0 && !collapsed && (
                 <div className="text-center py-8 px-4">
-                  <div className="w-12 h-12 mx-auto mb-3 rounded-xl bg-muted flex items-center justify-center">
-                    <Sparkles className="h-5 w-5 text-muted-foreground" />
+                  <div className={cn(
+                    "w-12 h-12 mx-auto mb-3 rounded-xl flex items-center justify-center",
+                    conversationView === 'autonomous' ? "bg-purple-500/10" : "bg-muted"
+                  )}>
+                    {conversationView === 'autonomous' ? (
+                      <Bot className="h-5 w-5 text-purple-500" />
+                    ) : (
+                      <Sparkles className="h-5 w-5 text-muted-foreground" />
+                    )}
                   </div>
                   <p className="text-sm font-medium text-muted-foreground">
-                    No conversations yet
+                    {conversationView === 'autonomous'
+                      ? 'No autonomous runs yet'
+                      : 'No conversations yet'}
                   </p>
                   <p className="text-xs text-muted-foreground/70 mt-1">
-                    Start a new chat to begin
+                    {conversationView === 'autonomous'
+                      ? 'Schedule an autonomous task to see runs here'
+                      : 'Start a new chat to begin'}
                   </p>
                 </div>
               )}

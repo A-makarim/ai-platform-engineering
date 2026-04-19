@@ -131,12 +131,20 @@ class APIClient {
     page_size?: number;
     archived?: boolean;
     pinned?: boolean;
+    /**
+     * Filter by conversation origin. The API only honors an allow-list of
+     * values ('autonomous' | 'web'); any other value is ignored server-side
+     * and the default human view is returned. Used by the sidebar's
+     * "Autonomous only" filter chip to surface autonomous_agents runs.
+     */
+    source?: 'autonomous' | 'web';
   }): Promise<PaginatedResponse<Conversation>> {
     const searchParams = new URLSearchParams();
     if (params?.page) searchParams.set('page', params.page.toString());
     if (params?.page_size) searchParams.set('page_size', params.page_size.toString());
     if (params?.archived !== undefined) searchParams.set('archived', params.archived.toString());
     if (params?.pinned !== undefined) searchParams.set('pinned', params.pinned.toString());
+    if (params?.source) searchParams.set('source', params.source);
 
     return this.request(`/api/chat/conversations?${searchParams}`);
   }

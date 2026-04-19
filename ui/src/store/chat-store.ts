@@ -60,7 +60,7 @@ interface ChatState {
   updateConversationTitle: (conversationId: string, title: string) => Promise<void>;
   setPendingMessage: (message: string | null) => void;
   consumePendingMessage: () => string | null;
-  loadConversationsFromServer: () => Promise<void>; // Load conversations from server (MongoDB mode only)
+  loadConversationsFromServer: (options?: { source?: 'autonomous' | 'web' }) => Promise<void>; // Load conversations from server (MongoDB mode only)
   saveMessagesToServer: (conversationId: string) => Promise<void>; // Save messages to MongoDB after streaming
   recoverInterruptedTask: (conversationId: string, messageId: string, endpoint: string, accessToken?: string) => Promise<boolean>; // Level 2: Poll tasks/get for interrupted messages
   loadMessagesFromServer: (conversationId: string, options?: { force?: boolean }) => Promise<void>; // Load messages from MongoDB when opening conversation
@@ -745,7 +745,7 @@ const storeImplementation = (set: any, get: any) => ({
         return message;
       },
 
-      loadConversationsFromServer: async () => {
+      loadConversationsFromServer: async (options?: { source?: 'autonomous' | 'web' }) => {
         const storageMode = getStorageMode();
 
         // Only load from server in MongoDB mode
@@ -763,10 +763,10 @@ const storeImplementation = (set: any, get: any) => ({
         isLoadingConversations = true;
 
         try {
-          console.log('[ChatStore] Loading conversations from MongoDB...');
+          console.log('[ChatStore] Loading conversations from MongoDB...', options);
           let response;
           try {
-            response = await apiClient.getConversations({ page_size: 100 });
+            response = await apiClient.getConversations({ page_size: 100, source: options?.source });
           } catch (apiError) {
             // Check if it's an auth error (expected when not logged in)
             const errorMessage = apiError instanceof Error ? apiError.message : String(apiError);
@@ -858,6 +858,9 @@ const storeImplementation = (set: any, get: any) => ({
               agent_id: conv.agent_id, // Dynamic agent ID; undefined = Platform Engineer
               owner_id: conv.owner_id,
               sharing: conv.sharing,
+              source: (conv as { source?: 'web' | 'slack' | 'autonomous' }).source,
+              task_id: (conv as { task_id?: string }).task_id,
+              run_id: (conv as { run_id?: string }).run_id,
             };
           });
 

@@ -14,7 +14,16 @@ from autonomous_agents.config import get_settings
 from autonomous_agents.routes import health, tasks, webhooks
 from autonomous_agents.routes.tasks import set_task_store
 from autonomous_agents.routes.webhooks import register_webhook_tasks
-from autonomous_agents.scheduler import get_scheduler, register_tasks, set_run_store
+from autonomous_agents.scheduler import (
+    get_scheduler,
+    register_tasks,
+    set_chat_history_publisher,
+    set_run_store,
+)
+from autonomous_agents.services.chat_history import (
+    MongoChatHistoryPublisher,
+    create_chat_history_publisher,
+)
 from autonomous_agents.services.run_store import MongoRunStore, create_run_store
 from autonomous_agents.services.task_loader import load_tasks
 from autonomous_agents.services.task_store import (
@@ -74,6 +83,47 @@ async def lifespan(app: FastAPI):
             "set MONGODB_URI and MONGODB_DATABASE to persist task definitions"
         )
     set_task_store(task_store)
+
+    # IMP-13: build the chat-history publisher. No-op when the feature
+    # is disabled (the default) so the chat database stays untouched.
+    # When enabled it shares the run-store's MONGODB_URI but can target
+    # a different logical database via CHAT_HISTORY_DATABASE.
+    chat_publisher = create_chat_history_publisher(
+        enabled=settings.chat_history_publish_enabled,
+        mongodb_uri=settings.mongodb_uri,
+        chat_database=settings.chat_history_database,
+        fallback_database=settings.mongodb_database,
+        owner_email=settings.chat_history_owner_email,
+        conversations_collection=settings.chat_history_conversations_collection,
+        messages_collection=settings.chat_history_messages_collection,
+    )
+    if isinstance(chat_publisher, MongoChatHistoryPublisher):
+        # Best-effort index creation: a transient chat-DB outage or a
+        # missing ``createIndex`` permission must NOT take down the
+        # autonomous service (chat-history publishing is observability,
+        # not source-of-truth -- same contract as ``_publish_safely``
+        # in the scheduler). PR #10 Codex P1 review.
+        try:
+            await chat_publisher.ensure_indexes()
+        except Exception as exc:
+            logger.error(
+                "ChatHistoryPublisher: ensure_indexes() failed (%s) -- "
+                "continuing without dedicated chat-history indexes; "
+                "queries will still work but may be slower until the "
+                "operator creates the indexes manually.",
+                exc,
+            )
+        logger.info(
+            "ChatHistoryPublisher: MongoDB (database=%s, owner=%s)",
+            settings.chat_history_database or settings.mongodb_database,
+            settings.chat_history_owner_email,
+        )
+    else:
+        logger.info(
+            "ChatHistoryPublisher: disabled (set CHAT_HISTORY_PUBLISH_ENABLED=true "
+            "with MONGODB_URI/MONGODB_DATABASE to surface autonomous runs in the chat sidebar)"
+        )
+    set_chat_history_publisher(chat_publisher)
 
     # Load task definitions from YAML and seed the store.
     # ``create()`` raises TaskAlreadyExistsError for ids already present
