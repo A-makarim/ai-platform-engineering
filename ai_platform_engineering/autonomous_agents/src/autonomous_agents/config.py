@@ -66,8 +66,27 @@ class Settings(BaseSettings):
     # Path to the YAML file that defines scheduled tasks
     task_config_path: str = "config.yaml"
 
-    # Webhook secret for validating incoming webhook payloads (optional)
+    # Global fallback HMAC secret for incoming webhooks. When a webhook
+    # task has no per-task ``secret`` configured the router falls back
+    # to this value so operators can rotate or supply secrets via a
+    # single env var (``WEBHOOK_SECRET``) without editing every task.
+    # Per-task secrets always win when both are configured.
     webhook_secret: str | None = None
+
+    # IMP-07 — webhook replay protection.
+    #
+    # When > 0, signed webhooks must additionally carry an
+    # ``X-Webhook-Timestamp`` header (Unix seconds, integer or float)
+    # and the HMAC signature is computed over ``f"{timestamp}.{body}"``
+    # rather than just ``body``. Requests whose timestamp is older
+    # than ``webhook_replay_window_seconds`` (or in the future by more
+    # than the same window, to allow modest clock skew) are rejected.
+    #
+    # Disabled by default (= 0) so existing GitHub-style senders that
+    # only sign the body keep working. Operators flip this to e.g.
+    # ``300`` (5 min) once their senders are updated to include the
+    # timestamp header. See README.md for the signing contract.
+    webhook_replay_window_seconds: int = Field(default=0, ge=0)
 
     # CORS — keep empty by default; open only in explicit dev/test configs
     cors_origins: list[str] = []
