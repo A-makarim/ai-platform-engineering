@@ -12,11 +12,16 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from autonomous_agents.config import get_settings
 from autonomous_agents.routes import health, tasks, webhooks
-from autonomous_agents.routes.tasks import set_registered_tasks
+from autonomous_agents.routes.tasks import set_task_store
 from autonomous_agents.routes.webhooks import register_webhook_tasks
 from autonomous_agents.scheduler import get_scheduler, register_tasks, set_run_store
 from autonomous_agents.services.run_store import MongoRunStore, create_run_store
 from autonomous_agents.services.task_loader import load_tasks
+from autonomous_agents.services.task_store import (
+    MongoTaskStore,
+    TaskAlreadyExistsError,
+    create_task_store,
+)
 
 
 @asynccontextmanager
@@ -47,15 +52,55 @@ async def lifespan(app: FastAPI):
         )
     set_run_store(run_store)
 
-    # Load task definitions from YAML
-    loaded_tasks = load_tasks(settings.task_config_path)
+    # Build the task definition persistence layer. Same factory
+    # contract as the run store: Mongo when fully configured, in-memory
+    # otherwise. The MongoTaskStore variant survives restarts so
+    # UI-driven CRUD changes are not lost.
+    task_store = create_task_store(
+        mongodb_uri=settings.mongodb_uri,
+        mongodb_database=settings.mongodb_database,
+        mongodb_collection=settings.mongodb_tasks_collection,
+    )
+    if isinstance(task_store, MongoTaskStore):
+        await task_store.ensure_indexes()
+        logger.info(
+            "TaskStore: MongoDB (database=%s, collection=%s)",
+            settings.mongodb_database,
+            settings.mongodb_tasks_collection,
+        )
+    else:
+        logger.info(
+            "TaskStore: in-memory — UI-created tasks will be lost on restart; "
+            "set MONGODB_URI and MONGODB_DATABASE to persist task definitions"
+        )
+    set_task_store(task_store)
 
-    # Share task list with route handlers
-    set_registered_tasks(loaded_tasks)
-    register_webhook_tasks(loaded_tasks)
+    # Load task definitions from YAML and seed the store.
+    # ``create()`` raises TaskAlreadyExistsError for ids already present
+    # in the store -- we treat that as "operator has already taken
+    # ownership of this id via the UI" and skip silently. This makes
+    # the YAML file act as a *default* set of tasks for fresh installs
+    # while leaving live MongoDB-backed deployments alone.
+    yaml_tasks = load_tasks(settings.task_config_path)
+    seeded = 0
+    for task in yaml_tasks:
+        try:
+            await task_store.create(task)
+            seeded += 1
+        except TaskAlreadyExistsError:
+            continue
+    logger.info(
+        "Seeded %d task(s) from %s (skipped %d already-present)",
+        seeded,
+        settings.task_config_path,
+        len(yaml_tasks) - seeded,
+    )
 
-    # Start the scheduler (registers cron + interval tasks)
-    register_tasks(loaded_tasks)
+    # Read the canonical task list back from the store (which now
+    # includes both YAML defaults and any persisted CRUD edits).
+    runtime_tasks = await task_store.list_all()
+    register_webhook_tasks(runtime_tasks)
+    register_tasks(runtime_tasks)
 
     yield
 
