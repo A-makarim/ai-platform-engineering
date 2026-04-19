@@ -130,18 +130,28 @@ def register_task(task: TaskDefinition) -> None:
     the prior job and any in-flight run completes against the new
     definition only on its *next* trigger fire.
 
-    Webhook-only and disabled tasks are no-ops here — webhooks have
-    their own router-side registry, and disabled tasks must be silently
-    skipped so the operator can flip ``enabled=false`` from the UI
-    without restarting the service.
+    Webhook-only tasks are no-ops here — webhooks have their own
+    router-side registry. Disabled tasks are *actively unscheduled*
+    here so flipping ``enabled=false`` from the UI on an existing
+    cron/interval task immediately stops it firing instead of leaving
+    a zombie job until the next service restart (PR #5 review,
+    Copilot+Codex P1).
     """
     if not task.enabled:
-        logger.info(f"[{task.id}] Disabled — not scheduling")
+        # ``unregister_task`` is a no-op when no job exists, so this
+        # is safe for tasks that were never scheduled in the first
+        # place (newly-created disabled tasks, webhook tasks, etc.).
+        unregister_task(task.id)
+        logger.info(f"[{task.id}] Disabled — not scheduling (any prior job removed)")
         return
 
     trigger = task.trigger
 
     if trigger.type == TriggerType.WEBHOOK:
+        # Trigger-type swap from cron/interval -> webhook: detach the
+        # old APScheduler job. Same idempotent contract as the
+        # disabled-task branch above.
+        unregister_task(task.id)
         logger.info(f"[{task.id}] Webhook task — handled by /hooks router, not APScheduler")
         return
 

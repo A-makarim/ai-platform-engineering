@@ -187,6 +187,38 @@ async def test_register_tasks_bulk_keeps_scheduler_running():
 
 
 @pytest.mark.asyncio
+async def test_register_task_detaches_existing_job_when_disabled():
+    """Re-registering an existing cron task with ``enabled=False`` must
+    actively pull the prior APScheduler job, not just early-return.
+
+    Pre-fix behaviour: the early ``if not task.enabled: return`` left
+    the job in place, so flipping enabled=false from the UI was a
+    no-op until service restart. Codex+Copilot P1 on PR #5.
+    """
+    register_task(_task("t1", trigger=CronTrigger(schedule="0 9 * * *")))
+    assert get_scheduler().get_job("t1") is not None
+
+    register_task(_task("t1", enabled=False, trigger=CronTrigger(schedule="0 9 * * *")))
+
+    assert get_scheduler().get_job("t1") is None
+
+
+@pytest.mark.asyncio
+async def test_register_task_swap_to_webhook_detaches_prior_cron_job():
+    """Trigger-type swap from cron -> webhook on the *same* task id
+    must clear the APScheduler entry. The webhook router has its own
+    registry, so leaving the cron job behind would mean the task
+    fires both on schedule AND on incoming POSTs.
+    """
+    register_task(_task("t1", trigger=CronTrigger(schedule="0 9 * * *")))
+    assert get_scheduler().get_job("t1") is not None
+
+    register_task(_task("t1", trigger=WebhookTrigger()))
+
+    assert get_scheduler().get_job("t1") is None
+
+
+@pytest.mark.asyncio
 async def test_register_tasks_does_not_double_start_running_scheduler():
     """A second bulk-register call (e.g. from a future "reload from
     YAML" admin button) must not crash -- APScheduler's ``start()``

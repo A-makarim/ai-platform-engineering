@@ -15,7 +15,7 @@ import logging
 
 from fastapi import APIRouter, HTTPException, status
 
-from autonomous_agents.models import TaskDefinition, TaskRun
+from autonomous_agents.models import TaskDefinition, TaskRun, WebhookTrigger
 from autonomous_agents.routes.webhooks import (
     register_webhook_task,
     unregister_webhook_task,
@@ -96,6 +96,24 @@ def _detach_task_from_runtime(task_id: str) -> None:
     unregister_webhook_task(task_id)
 
 
+def _serialize_trigger(task: TaskDefinition) -> dict:
+    """Render a trigger to wire JSON, redacting any HMAC secret.
+
+    The webhook ``secret`` is the symmetric key used to verify
+    ``X-Hub-Signature-256`` on incoming POSTs. Echoing it back in
+    list/get/create/update responses would leak it into browser
+    devtools, network captures, and any audit log that records the
+    full response body. The UI only needs to know whether a secret
+    is configured (``has_secret``) to render the "secret already
+    configured -- type to replace" hint in the form dialog.
+    """
+    payload = task.trigger.model_dump()
+    if isinstance(task.trigger, WebhookTrigger):
+        secret = payload.pop("secret", None)
+        payload["has_secret"] = bool(secret)
+    return payload
+
+
 def _serialize_task(task: TaskDefinition, next_run_iso: str | None) -> dict:
     """Render a task into the wire shape the UI expects.
 
@@ -110,7 +128,7 @@ def _serialize_task(task: TaskDefinition, next_run_iso: str | None) -> dict:
         "agent": task.agent,
         "prompt": task.prompt,
         "llm_provider": task.llm_provider,
-        "trigger": task.trigger.model_dump(),
+        "trigger": _serialize_trigger(task),
         "enabled": task.enabled,
         "timeout_seconds": task.timeout_seconds,
         "max_retries": task.max_retries,
@@ -153,13 +171,42 @@ async def create_task(task: TaskDefinition) -> dict:
     On success the task is immediately wired into the scheduler /
     webhook registry. A 409 is returned for duplicate ids rather than
     silently overwriting -- update goes through PUT.
+
+    Runtime-sync errors (e.g. malformed cron expression that gets
+    past pydantic but blows up inside ``APSCronTrigger.from_crontab``)
+    trigger a *compensating delete* on the store so the persisted
+    state stays consistent with the live scheduler. Without this the
+    task would sit in MongoDB unschedulable while every retry POST
+    bounced with 409 (PR #5 review, Codex P2).
     """
+    store = get_task_store()
     try:
-        created = await get_task_store().create(task)
+        created = await store.create(task)
     except TaskAlreadyExistsError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    await _sync_task_to_runtime(created)
+    try:
+        await _sync_task_to_runtime(created)
+    except Exception as exc:
+        # Compensating action: roll back the persisted row so the
+        # caller can retry with a corrected definition without
+        # tripping the duplicate-id check above. Best-effort -- a
+        # failed rollback is logged but does NOT mask the original
+        # 4xx; otherwise we'd surface a confusing 500 for what is
+        # plainly a client validation problem.
+        try:
+            await store.delete(created.id)
+        except Exception:
+            logger.exception(
+                "[%s] Compensating delete failed after sync error -- "
+                "task is persisted but not scheduled", created.id,
+            )
+        logger.warning("[%s] Rejected create: %s", created.id, exc)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Task definition could not be scheduled: {exc}",
+        ) from exc
+
     logger.info(f"[{created.id}] Created via API")
     return _serialize_task(created, _next_run_iso_for(created.id))
 
@@ -186,6 +233,26 @@ async def update_task(task_id: str, task: TaskDefinition) -> dict:
     # ``None`` for unknown ids -- the store update call below will
     # then raise TaskNotFoundError and we 404 cleanly.
     existing = await store.get(task_id)
+
+    # Webhook secret preservation: GET responses redact the secret to
+    # ``has_secret: bool``, so when the UI submits an unchanged form
+    # the incoming payload has ``secret=None``. Treat that as "keep
+    # what we have" rather than silently wiping the configured HMAC
+    # key -- the latter would break every signed webhook for the task
+    # without warning. Callers that genuinely want to clear a secret
+    # POST a new one (or the explicit string ``""`` -> we leave that
+    # to model validation, but a real rotation always has a value).
+    if (
+        existing is not None
+        and isinstance(existing.trigger, WebhookTrigger)
+        and isinstance(task.trigger, WebhookTrigger)
+        and task.trigger.secret is None
+        and existing.trigger.secret is not None
+    ):
+        preserved_trigger = task.trigger.model_copy(
+            update={"secret": existing.trigger.secret}
+        )
+        task = task.model_copy(update={"trigger": preserved_trigger})
 
     try:
         updated = await store.update(task_id, task)

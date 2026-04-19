@@ -260,7 +260,7 @@ def test_update_task_coerces_id_to_path(client: TestClient):
 def test_update_task_disable_removes_scheduler_job(client: TestClient):
     """Toggling enabled=true -> false on an existing cron task must
     pull the APScheduler entry, even though the task definition
-    itself stays in the store."""
+    itself stays in the store. PR #5 review (Copilot+Codex P1)."""
     client.post("/api/v1/tasks", json=_cron_task("t1"))
     assert [j.id for j in get_scheduler().get_jobs()] == ["t1"]
 
@@ -268,17 +268,135 @@ def test_update_task_disable_removes_scheduler_job(client: TestClient):
     response = client.put("/api/v1/tasks/t1", json=disabled)
     assert response.status_code == 200
 
-    # ``register_task`` returns early for disabled tasks, leaving the
-    # scheduler job from the prior register stale. Today the route
-    # only forces detach on *trigger-type swaps* -- if this test ever
-    # starts failing we've lost the enabled-toggle invariant.
-    # NOTE: current implementation does NOT detach on enable-flip
-    # alone; the scheduler job persists with its old trigger. That's
-    # an open gap (filed in IMPROVEMENTS.md) but verify the
-    # documented current behaviour so future fixes have a clear
-    # before/after baseline.
-    job = get_scheduler().get_job("t1")
-    assert job is not None  # known limitation: remove when fixed
+    # The fix in scheduler.register_task explicitly calls
+    # unregister_task(task.id) for disabled tasks, so the prior job
+    # must be gone. The store still keeps the disabled definition --
+    # only the *runtime* schedule disappears.
+    assert get_scheduler().get_job("t1") is None
+    listed = client.get("/api/v1/tasks").json()
+    assert [t["id"] for t in listed] == ["t1"]
+    assert listed[0]["enabled"] is False
+
+
+def test_update_task_re_enable_re_attaches_scheduler_job(client: TestClient):
+    """Symmetric to the disable test: flipping enabled back to true
+    must re-create the APScheduler job. Without this, a UI operator
+    who toggled 'off' then 'on' would silently end up with a task
+    that never fires until the next service restart."""
+    client.post("/api/v1/tasks", json=_cron_task("t1"))
+    client.put("/api/v1/tasks/t1", json=_cron_task("t1", enabled=False))
+    assert get_scheduler().get_job("t1") is None
+
+    response = client.put("/api/v1/tasks/t1", json=_cron_task("t1", enabled=True))
+    assert response.status_code == 200
+    assert [j.id for j in get_scheduler().get_jobs()] == ["t1"]
+
+
+# --- create rollback (PR #5 review, Codex P2) --------------------------
+
+
+def test_create_task_rolls_back_when_scheduler_sync_fails(client: TestClient):
+    """A malformed cron expression passes pydantic validation (it's
+    just a string) but blows up inside ``APSCronTrigger.from_crontab``.
+    The route must roll back the persisted row so a subsequent retry
+    with a corrected definition doesn't bounce off a 409.
+
+    PR #5 review (Codex P2): without rollback the task sits in the
+    store unschedulable while every retry POST returns 409.
+    """
+    bad = _cron_task("bad-cron")
+    bad["trigger"]["schedule"] = "this is not a cron expression"
+
+    response = client.post("/api/v1/tasks", json=bad)
+    assert response.status_code == 400
+    assert "could not be scheduled" in response.json()["detail"]
+
+    # Store must be empty -- the compensating delete reverted the
+    # earlier ``store.create`` so the operator's retry succeeds.
+    listed = client.get("/api/v1/tasks").json()
+    assert listed == []
+    assert get_scheduler().get_jobs() == []
+
+    fixed = _cron_task("bad-cron")  # default schedule "0 9 * * *"
+    retry = client.post("/api/v1/tasks", json=fixed)
+    assert retry.status_code == 201, "rollback must clear the way for retry"
+
+
+# --- webhook secret redaction (PR #6 review, Copilot P1) ---------------
+
+
+def test_create_webhook_task_redacts_secret_in_response(client: TestClient):
+    """The HMAC ``secret`` is the symmetric key used to verify
+    incoming POSTs -- echoing it back in API responses leaks it into
+    devtools, traces, and audit logs. Replace it with ``has_secret``.
+    """
+    response = client.post(
+        "/api/v1/tasks", json=_webhook_task("hook1", secret="super-secret")
+    )
+    assert response.status_code == 201
+    trigger = response.json()["trigger"]
+    assert "secret" not in trigger
+    assert trigger["has_secret"] is True
+
+
+def test_list_and_get_webhook_task_never_echo_secret(client: TestClient):
+    client.post("/api/v1/tasks", json=_webhook_task("hook1", secret="s"))
+
+    listed = client.get("/api/v1/tasks").json()
+    assert "secret" not in listed[0]["trigger"]
+    assert listed[0]["trigger"]["has_secret"] is True
+
+    fetched = client.get("/api/v1/tasks/hook1").json()
+    assert "secret" not in fetched["trigger"]
+    assert fetched["trigger"]["has_secret"] is True
+
+
+def test_webhook_task_without_secret_reports_has_secret_false(client: TestClient):
+    client.post("/api/v1/tasks", json=_webhook_task("hook1"))  # no secret
+    fetched = client.get("/api/v1/tasks/hook1").json()
+    assert fetched["trigger"]["has_secret"] is False
+
+
+# --- webhook secret preservation on PUT --------------------------------
+
+
+def test_update_preserves_existing_secret_when_omitted(client: TestClient):
+    """The UI never receives the secret on GET (redacted), so it can't
+    echo it back on PUT. A PUT with no secret must therefore mean
+    'keep what's already there', not 'wipe the secret'."""
+    client.post("/api/v1/tasks", json=_webhook_task("hook1", secret="original-secret"))
+
+    update = _webhook_task("hook1")  # secret omitted
+    response = client.put("/api/v1/tasks/hook1", json=update)
+    assert response.status_code == 200
+    assert response.json()["trigger"]["has_secret"] is True
+
+    # Verify directly against the store -- the secret is intact.
+    stored = tasks_route._task_store
+    assert stored is not None
+    import asyncio
+
+    task = asyncio.run(stored.get("hook1"))
+    assert task is not None
+    assert task.trigger.secret == "original-secret"
+
+
+def test_update_can_explicitly_replace_secret(client: TestClient):
+    """The other direction: when the UI submits a NEW secret value,
+    we must take it. Otherwise rotation is impossible."""
+    client.post("/api/v1/tasks", json=_webhook_task("hook1", secret="old"))
+
+    update = _webhook_task("hook1", secret="new-secret")
+    response = client.put("/api/v1/tasks/hook1", json=update)
+    assert response.status_code == 200
+
+    stored = tasks_route._task_store
+    assert stored is not None
+    import asyncio
+
+    task = asyncio.run(stored.get("hook1"))
+    assert task is not None
+    assert task.trigger.secret == "new-secret"
 
 
 # --- delete -------------------------------------------------------------
