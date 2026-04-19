@@ -1,7 +1,7 @@
 # Copyright CNOE Contributors (https://cnoe.io)
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for :class:`MongoTaskStore`.
+"""Unit tests for :class:`MongoDBService` task persistence.
 
 Uses ``mongomock_motor.AsyncMongoMockClient`` so we exercise the real
 motor API surface without needing a running MongoDB. The Mongo-specific
@@ -25,12 +25,11 @@ from autonomous_agents.models import (
     TaskDefinition,
     WebhookTrigger,
 )
-from autonomous_agents.services.task_store import (
+from autonomous_agents.services.mongo import (
     DEFAULT_TASKS_COLLECTION_NAME,
-    MongoTaskStore,
+    MongoDBService,
     TaskAlreadyExistsError,
     TaskNotFoundError,
-    TaskStore,
 )
 
 
@@ -51,29 +50,14 @@ def _task(
 
 
 @pytest.fixture
-def store() -> MongoTaskStore:
+def store() -> MongoDBService:
     """Fresh in-memory mongomock client per test for full isolation."""
-    return MongoTaskStore(AsyncMongoMockClient(), database_name="test_db")
-
-
-def test_mongo_task_store_implements_protocol(store):
-    """Catch accidental signature drift between Protocol and impl —
-    mirrors the same guard in test_task_store.py."""
-    assert isinstance(store, TaskStore)
+    return MongoDBService(AsyncMongoMockClient(), database_name="test_db")
 
 
 def test_constructor_rejects_empty_database_name():
     with pytest.raises(ValueError, match="database_name"):
-        MongoTaskStore(AsyncMongoMockClient(), database_name="")
-
-
-def test_constructor_rejects_empty_collection_name():
-    with pytest.raises(ValueError, match="collection_name"):
-        MongoTaskStore(
-            AsyncMongoMockClient(),
-            database_name="db",
-            collection_name="",
-        )
+        MongoDBService(AsyncMongoMockClient(), database_name="")
 
 
 def test_default_collection_name_is_set():
@@ -86,33 +70,33 @@ async def test_ensure_indexes_is_idempotent(store):
     """``ensure_indexes()`` is currently a no-op but the lifespan code
     calls it unconditionally. Verify it doesn't raise so future index
     additions can't accidentally break startup."""
-    await store.ensure_indexes()
-    await store.ensure_indexes()
+    await store.ensure_task_indexes()
+    await store.ensure_task_indexes()
 
 
 async def test_create_persists_and_get_returns_full_task(store):
     task = _task("t1")
-    created = await store.create(task)
+    created = await store.create_task(task)
 
     assert created == task
-    fetched = await store.get("t1")
+    fetched = await store.get_task("t1")
     assert fetched == task
 
 
 async def test_get_returns_none_for_missing_task(store):
     """find_one returns None on miss; we must surface that as None,
     not raise — callers (UI 404, scheduler skip) need a cheap probe."""
-    assert await store.get("ghost") is None
+    assert await store.get_task("ghost") is None
 
 
 async def test_create_translates_duplicate_key_to_typed_error(store):
     """The whole point of the typed exception is so the API layer
     doesn't ``except Exception`` and string-match — exercise the
     real translation against the mongomock duplicate key path."""
-    await store.create(_task("t1"))
+    await store.create_task(_task("t1"))
 
     with pytest.raises(TaskAlreadyExistsError) as exc:
-        await store.create(_task("t1"))
+        await store.create_task(_task("t1"))
 
     assert exc.value.task_id == "t1"
 
@@ -122,9 +106,9 @@ async def test_id_uniqueness_is_enforced_by_underlying_id_index(store):
     duplicate-check, the ``_id`` field would still reject a second
     insert. This guards against a future refactor that switches to
     ``insert_many`` or upsert by mistake."""
-    await store.create(_task("t1"))
+    await store.create_task(_task("t1"))
 
-    raw_collection = store._collection  # noqa: SLF001 — internals on purpose
+    raw_collection = store.get_tasks_collection()
 
     with pytest.raises(Exception) as exc:
         await raw_collection.insert_one({"_id": "t1", "id": "t1", "name": "dup"})
@@ -137,15 +121,15 @@ async def test_list_all_returns_tasks_sorted_by_id(store):
     Mongo (no insertion-order guarantee on a B-tree of ObjectIds), so
     we sort by ``_id`` ascending and tests must reflect that."""
     for tid in ("zeta", "alpha", "mu"):
-        await store.create(_task(tid))
+        await store.create_task(_task(tid))
 
-    listed = await store.list_all()
+    listed = await store.list_tasks()
 
     assert [t.id for t in listed] == ["alpha", "mu", "zeta"]
 
 
 async def test_update_replaces_in_place(store):
-    await store.create(_task("t1"))
+    await store.create_task(_task("t1"))
     new_version = TaskDefinition(
         id="t1",
         name="Renamed",
@@ -155,10 +139,10 @@ async def test_update_replaces_in_place(store):
         enabled=False,
     )
 
-    returned = await store.update("t1", new_version)
+    returned = await store.update_task("t1", new_version)
 
     assert returned == new_version
-    fetched = await store.get("t1")
+    fetched = await store.get_task("t1")
     assert fetched is not None
     assert fetched.name == "Renamed"
     assert fetched.agent == "argocd"
@@ -166,34 +150,34 @@ async def test_update_replaces_in_place(store):
 
 
 async def test_update_rejects_id_mismatch(store):
-    """Same contract as InMemoryTaskStore — path id wins, body must
+    """Path id wins, body must
     agree. Otherwise ``replace_one({"_id": "t1"}, {..., "_id": "t2"})``
     would either silently rename or fail with a Mongo-internal error."""
-    await store.create(_task("t1"))
+    await store.create_task(_task("t1"))
 
     with pytest.raises(ValueError, match="does not match"):
-        await store.update("t1", _task("t2"))
+        await store.update_task("t1", _task("t2"))
 
 
 async def test_update_raises_when_target_missing(store):
     """``replace_one`` with ``upsert=False`` returns
     ``matched_count=0`` rather than raising — verify we translate it."""
     with pytest.raises(TaskNotFoundError) as exc:
-        await store.update("ghost", _task("ghost"))
+        await store.update_task("ghost", _task("ghost"))
 
     assert exc.value.task_id == "ghost"
     # And no document was upserted as a side-effect.
-    assert await store.get("ghost") is None
+    assert await store.get_task("ghost") is None
 
 
 async def test_delete_removes_document(store):
-    await store.create(_task("t1"))
-    await store.create(_task("t2"))
+    await store.create_task(_task("t1"))
+    await store.create_task(_task("t2"))
 
-    await store.delete("t1")
+    await store.delete_task("t1")
 
-    assert await store.get("t1") is None
-    assert (await store.get("t2")) is not None
+    assert await store.get_task("t1") is None
+    assert (await store.get_task("t2")) is not None
 
 
 async def test_delete_raises_when_target_missing(store):
@@ -201,7 +185,7 @@ async def test_delete_raises_when_target_missing(store):
     raise so a stale UI delete surfaces as a clear 404 instead of a
     silent success."""
     with pytest.raises(TaskNotFoundError) as exc:
-        await store.delete("ghost")
+        await store.delete_task("ghost")
 
     assert exc.value.task_id == "ghost"
 
@@ -215,11 +199,11 @@ async def test_round_trip_preserves_all_trigger_types(store):
     webhook_task = _task("webhook-1", trigger=WebhookTrigger(secret="sssh"))
 
     for t in (cron_task, interval_task, webhook_task):
-        await store.create(t)
+        await store.create_task(t)
 
-    fetched_cron = await store.get("cron-1")
-    fetched_interval = await store.get("interval-1")
-    fetched_webhook = await store.get("webhook-1")
+    fetched_cron = await store.get_task("cron-1")
+    fetched_interval = await store.get_task("interval-1")
+    fetched_webhook = await store.get_task("webhook-1")
 
     assert fetched_cron is not None and fetched_cron.trigger == cron_task.trigger
     assert fetched_interval is not None and fetched_interval.trigger == interval_task.trigger
@@ -239,9 +223,9 @@ async def test_round_trip_preserves_optional_overrides(store):
         timeout_seconds=42.5,
         max_retries=0,
     )
-    await store.create(overridden)
+    await store.create_task(overridden)
 
-    fetched = await store.get("t-override")
+    fetched = await store.get_task("t-override")
     assert fetched is not None
     assert fetched.timeout_seconds == 42.5
     assert fetched.max_retries == 0

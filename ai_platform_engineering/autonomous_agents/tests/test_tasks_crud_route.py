@@ -1,26 +1,18 @@
 # Copyright CNOE Contributors (https://cnoe.io)
 # SPDX-License-Identifier: Apache-2.0
 
-"""Integration tests for the /tasks CRUD endpoints.
-
-These exercise the FastAPI router via ``TestClient`` against a
-freshly-built ``InMemoryTaskStore`` and a paused ``AsyncIOScheduler``,
-asserting both the HTTP contract (status codes, payload shapes) AND
-the runtime side effects (scheduler/webhook registry are kept in
-sync). The latter is the whole point of the hot-reload helpers --
-without these checks, a regression would only surface when an
-operator noticed that a UI edit "looked saved but never fired".
-"""
+"""Integration tests for the /tasks CRUD endpoints."""
 
 import pytest
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from mongomock_motor import AsyncMongoMockClient
 
 from autonomous_agents.routes import tasks as tasks_route
 from autonomous_agents.routes import webhooks as webhooks_route
 from autonomous_agents.scheduler import get_scheduler
-from autonomous_agents.services.task_store import InMemoryTaskStore
+from autonomous_agents.services.mongo import MongoDBService
 
 
 @pytest.fixture
@@ -29,7 +21,7 @@ def client():
 
     We deliberately *don't* use the real ``create_app`` lifespan -- it
     pulls in MongoDB factories and YAML loading we don't need here.
-    Instead we wire fresh in-memory stores by hand and substitute the
+    Instead we wire fresh Mongo-backed stores by hand and substitute the
     real ``AsyncIOScheduler`` (which requires a running event loop)
     with a ``BackgroundScheduler`` started in paused mode. The CRUD
     handlers only touch the scheduler via ``add_job`` / ``remove_job`` /
@@ -43,8 +35,8 @@ def client():
     # Reset singletons so each test starts from a clean slate.
     scheduler_mod._scheduler = BackgroundScheduler(timezone="UTC")
     scheduler_mod._scheduler.start(paused=True)
-    scheduler_mod._run_store = None
-    tasks_route._task_store = InMemoryTaskStore()
+    scheduler_mod._mongo_service = None
+    tasks_route._mongo_service = MongoDBService(AsyncMongoMockClient(), database_name="test_db")
     webhooks_route._webhook_tasks = {}
 
     app = FastAPI()
@@ -56,7 +48,7 @@ def client():
     if scheduler_mod._scheduler is not None and scheduler_mod._scheduler.running:
         scheduler_mod._scheduler.shutdown(wait=False)
     scheduler_mod._scheduler = None
-    tasks_route._task_store = None
+    tasks_route._mongo_service = None
     webhooks_route._webhook_tasks = {}
 
 
@@ -372,11 +364,11 @@ def test_update_preserves_existing_secret_when_omitted(client: TestClient):
     assert response.json()["trigger"]["has_secret"] is True
 
     # Verify directly against the store -- the secret is intact.
-    stored = tasks_route._task_store
+    stored = tasks_route._mongo_service
     assert stored is not None
     import asyncio
 
-    task = asyncio.run(stored.get("hook1"))
+    task = asyncio.run(stored.get_task("hook1"))
     assert task is not None
     assert task.trigger.secret == "original-secret"
 
@@ -390,11 +382,11 @@ def test_update_can_explicitly_replace_secret(client: TestClient):
     response = client.put("/api/v1/tasks/hook1", json=update)
     assert response.status_code == 200
 
-    stored = tasks_route._task_store
+    stored = tasks_route._mongo_service
     assert stored is not None
     import asyncio
 
-    task = asyncio.run(stored.get("hook1"))
+    task = asyncio.run(stored.get_task("hook1"))
     assert task is not None
     assert task.trigger.secret == "new-secret"
 

@@ -19,6 +19,17 @@ class Settings(BaseSettings):
     port: int = 8002
     debug: bool = False
 
+    @field_validator("debug", mode="before")
+    @classmethod
+    def _coerce_debug_aliases(cls, v):
+        if isinstance(v, str):
+            lowered = v.strip().lower()
+            if lowered in {"release", "prod", "production"}:
+                return False
+            if lowered in {"dev", "development"}:
+                return True
+        return v
+
     # LLM (passed through to agents via A2A)
     llm_provider: str = "anthropic-claude"
 
@@ -120,23 +131,18 @@ class Settings(BaseSettings):
             )
         return v
 
-    # MongoDB persistence for run history (optional).
-    # Both must be set to enable MongoRunStore; otherwise the service
-    # falls back to a bounded in-memory store (legacy behaviour) so
-    # development environments need no external infrastructure.
-    mongodb_uri: str | None = None
-    mongodb_database: str | None = None
+    # MongoDB
+    # Full URI takes precedence; if not set, built from components.
+    # Autonomous Agents is now Mongo-backed by default, matching the
+    # dynamic_agents service model.
+    mongodb_uri: str = "mongodb://admin:changeme@caipe-mongodb:27017/caipe?authSource=admin"
+    mongodb_database: str = "caipe"
     mongodb_collection: str = "autonomous_runs"
+    
 
     # MongoDB collection that holds task definitions (the source of
-    # truth for CRUD operations). Only used when both ``mongodb_uri``
-    # and ``mongodb_database`` are set; otherwise the in-memory
-    # TaskStore is used and tasks are seeded from YAML on every boot.
+    # truth for CRUD operations).
     mongodb_tasks_collection: str = "autonomous_tasks"
-
-    # Maximum runs retained by the in-memory store when Mongo is not
-    # configured. Ignored when MongoRunStore is in use.
-    run_history_maxlen: int = 500
 
     # IMP-16 — circuit breaker around the supervisor A2A call.
     #

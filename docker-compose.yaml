@@ -799,7 +799,7 @@ services:
       - AWS_BEDROCK_USE_CONVERSE_API=${AWS_BEDROCK_USE_CONVERSE_API:-true}
       - AWS_BEDROCK_BASE_MODEL_ID=${AWS_BEDROCK_BASE_MODEL_ID:-}
       # MongoDB (same as CAIPE UI)
-      - MONGODB_URI=${MONGODB_URI:-mongodb://${MONGODB_ROOT_USERNAME:-admin}:${MONGODB_ROOT_PASSWORD:-changeme}@caipe-ui-mongodb:27017/${MONGODB_DATABASE:-caipe}?authSource=admin}
+      - MONGODB_URI=mongodb://${MONGODB_ROOT_USERNAME:-admin}:${MONGODB_ROOT_PASSWORD:-changeme}@caipe-ui-mongodb:27017/${MONGODB_DATABASE:-caipe}?authSource=admin
       - MONGODB_DATABASE=${MONGODB_DATABASE:-caipe}
       # Authentication (same OIDC config as CAIPE UI)
       - AUTH_ENABLED=${AUTH_ENABLED:-false}
@@ -841,6 +841,9 @@ services:
   # Ports:
   #   - 8002: Autonomous Agents API (proxied via UI at /api/autonomous, admin-only)
   autonomous-agents:
+    build:
+      context: ./ai_platform_engineering/autonomous_agents
+      dockerfile: Dockerfile
     image: ghcr.io/cnoe-io/caipe-autonomous-agents:${IMAGE_TAG:-0.2.36}
     container_name: autonomous-agents
     # Bind to loopback only -- the FastAPI service has no auth layer of
@@ -861,7 +864,7 @@ services:
       # The caipe-ui-mongodb service is auto-included via the
       # autonomous-agents profile (added to its profiles list below),
       # so a "--profile autonomous-agents" up brings Mongo along.
-      - MONGODB_URI=${MONGODB_URI:-mongodb://${MONGODB_ROOT_USERNAME:-admin}:${MONGODB_ROOT_PASSWORD:-changeme}@caipe-ui-mongodb:27017/${MONGODB_DATABASE:-caipe}?authSource=admin}
+      - MONGODB_URI=mongodb://${MONGODB_ROOT_USERNAME:-admin}:${MONGODB_ROOT_PASSWORD:-changeme}@caipe-ui-mongodb:27017/${MONGODB_DATABASE:-caipe}?authSource=admin
       - MONGODB_DATABASE=${MONGODB_DATABASE:-caipe}
       # IMP-13: publish completed autonomous runs into the UI
       # conversations collection. OFF by default in production -- it
@@ -875,7 +878,7 @@ services:
       # Webhook HMAC fallback secret (set to a strong random value in production).
       - WEBHOOK_SECRET=${WEBHOOK_SECRET:-}
       # CORS -- empty by default (UI talks via server-side proxy, browsers don't hit us).
-      - CORS_ORIGINS=${AUTONOMOUS_CORS_ORIGINS:-}
+      - CORS_ORIGINS=${AUTONOMOUS_CORS_ORIGINS:-[]}
     depends_on:
       # Mongo IS effectively required (we default MONGODB_URI to it
       # above) so wait for the healthcheck. ``required: false`` is the

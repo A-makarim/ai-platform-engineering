@@ -1456,7 +1456,7 @@ services:
       # so browsers never call us directly; leaving cors_origins empty is the
       # safe default. Set AUTONOMOUS_CORS_ORIGINS in .env if you ever expose
       # the port to a browser (NOT recommended -- the proxy enforces auth).
-      - CORS_ORIGINS=${AUTONOMOUS_CORS_ORIGINS:-}
+      - CORS_ORIGINS=${AUTONOMOUS_CORS_ORIGINS:-[]}
     depends_on:
       caipe-mongodb:
         condition: service_healthy

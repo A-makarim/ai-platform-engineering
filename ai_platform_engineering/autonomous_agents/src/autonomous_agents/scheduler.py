@@ -29,12 +29,12 @@ from autonomous_agents.services.chat_history import (
     NoopChatHistoryPublisher,
     _conversation_id_for_run,
 )
-from autonomous_agents.services.run_store import InMemoryRunStore, RunStore
+from autonomous_agents.services.mongo import MongoDBService
 
 logger = logging.getLogger("autonomous_agents")
 
 _scheduler: AsyncIOScheduler | None = None
-_run_store: RunStore | None = None
+_mongo_service: MongoDBService | None = None
 _chat_history_publisher: ChatHistoryPublisher | None = None
 
 
@@ -45,23 +45,19 @@ def get_scheduler() -> AsyncIOScheduler:
     return _scheduler
 
 
-def get_run_store() -> RunStore:
-    """Return the active :class:`RunStore`.
-
-    Lazily falls back to an :class:`InMemoryRunStore` if the lifespan
-    hook hasn't injected one yet (e.g. when scheduler functions are
-    exercised directly from unit tests).
+def get_persistence_service() -> MongoDBService:
+    """Return the active :class:`MongoDBService`.
     """
-    global _run_store
-    if _run_store is None:
-        _run_store = InMemoryRunStore()
-    return _run_store
+    global _mongo_service
+    if _mongo_service is None:
+        raise RuntimeError("MongoDBService not initialized")
+    return _mongo_service
 
 
-def set_run_store(store: RunStore) -> None:
-    """Inject the active :class:`RunStore` — called from the FastAPI lifespan."""
-    global _run_store
-    _run_store = store
+def set_persistence_service(service: MongoDBService) -> None:
+    """Inject the active :class:`MongoDBService` — called from the FastAPI lifespan."""
+    global _mongo_service
+    _mongo_service = service
 
 
 def get_chat_history_publisher() -> ChatHistoryPublisher:
@@ -84,7 +80,7 @@ def set_chat_history_publisher(publisher: ChatHistoryPublisher) -> None:
     _chat_history_publisher = publisher
 
 
-async def _record_safely(store: RunStore, run: TaskRun) -> None:
+async def _record_safely(service: MongoDBService, run: TaskRun) -> None:
     """Persist ``run`` and swallow store-side exceptions.
 
     Run-history persistence is observability, not the source of truth
@@ -94,7 +90,7 @@ async def _record_safely(store: RunStore, run: TaskRun) -> None:
     visible to operators, then return so the scheduler keeps marching.
     """
     try:
-        await store.record(run)
+        await service.record_run(run)
     except Exception as exc:
         logger.error(
             f"[{run.task_id}] Failed to persist run {run.run_id} "
@@ -165,11 +161,11 @@ async def execute_task(task: TaskDefinition, context: dict[str, Any] | None = No
         conversation_id=conversation_id,
     )
 
-    store = get_run_store()
+    persistence = get_persistence_service()
     # Persist the RUNNING state so observers (UI, CLI) can see in-flight
     # work, not only completed runs. Failure here MUST NOT abort the
     # task — see _record_safely.
-    await _record_safely(store, run)
+    await _record_safely(persistence, run)
 
     logger.info(f"[{task.id}] Starting run {run_id}")
     response_text: str | None = None
@@ -195,13 +191,13 @@ async def execute_task(task: TaskDefinition, context: dict[str, Any] | None = No
         logger.error(f"[{task.id}] Run {run_id} failed: {e}")
     finally:
         run.finished_at = datetime.now(timezone.utc)
-        # Persist the terminal state — RunStore.record is upsert by
+        # Persist the terminal state — record_run() is upsert by
         # run_id, so this updates the same document/entry rather than
         # appending a duplicate. Again wrapped to keep store outages
         # from masking the real task outcome.
-        await _record_safely(store, run)
+        await _record_safely(persistence, run)
         # IMP-13: surface the run in the UI chat sidebar. Done after
-        # the RunStore write so a slow/flaky chat database can never
+        # the run-history write so a slow/flaky chat database can never
         # delay the authoritative run-history record. The publisher
         # is a no-op when ``CHAT_HISTORY_PUBLISH_ENABLED`` is off so
         # this is essentially free in the default config.

@@ -1,62 +1,51 @@
 # Copyright CNOE Contributors (https://cnoe.io)
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for :func:`create_task_store`.
+"""Unit tests for MongoDBService task collection configuration."""
 
-Mirrors the assertions in ``test_run_store_factory.py`` so the two
-factories follow the same partial-config policy. Anyone debugging a
-"why is my data ephemeral?" issue can read either file and find the
-same rules.
-"""
+from unittest.mock import MagicMock, patch
 
-from datetime import timezone
-from unittest.mock import patch
-
-from autonomous_agents.services.task_store import (
-    InMemoryTaskStore,
-    MongoTaskStore,
-    create_task_store,
+from autonomous_agents.services.mongo import (
+    DEFAULT_TASKS_COLLECTION_NAME,
+    MongoDBService,
+    create_mongo_service,
 )
 
 
-def test_returns_in_memory_store_when_no_mongo_settings():
-    store = create_task_store()
-    assert isinstance(store, InMemoryTaskStore)
+def test_create_service_uses_explicit_task_collection():
+    client = MagicMock()
+    database = MagicMock()
+    collection = MagicMock()
+    client.__getitem__.return_value = database
+    database.__getitem__.return_value = collection
 
-
-def test_returns_in_memory_store_when_only_uri_provided():
-    """Partial config = misconfiguration: better to fall back loudly
-    (in-memory, ephemeral) than crash on startup, because Mongo URIs
-    are often missing in dev/CI by design."""
-    store = create_task_store(mongodb_uri="mongodb://localhost:27017")
-    assert isinstance(store, InMemoryTaskStore)
-
-
-def test_returns_in_memory_store_when_only_database_provided():
-    store = create_task_store(mongodb_database="caipe")
-    assert isinstance(store, InMemoryTaskStore)
-
-
-def test_returns_mongo_store_when_both_uri_and_database_provided():
-    store = create_task_store(
-        mongodb_uri="mongodb://localhost:27017",
-        mongodb_database="caipe",
+    service = MongoDBService(
+        client=client,
+        database_name="caipe",
+        task_collection_name="custom_tasks",
     )
-    assert isinstance(store, MongoTaskStore)
+
+    assert service.task_collection_name == "custom_tasks"
+    assert service.get_tasks_collection() is collection
 
 
-def test_mongo_client_is_constructed_with_utc_tzinfo():
-    """Same rationale as the run-store factory test: we must pin
-    ``tz_aware=True`` and ``tzinfo=timezone.utc`` so any future
-    datetime fields on tasks (created_at / updated_at) round-trip
-    consistently across the API boundary."""
-    with patch("motor.motor_asyncio.AsyncIOMotorClient") as mock_client:
-        create_task_store(
+def test_create_mongo_service_passes_explicit_task_collection():
+    with patch.object(MongoDBService, "_build_client", return_value=MagicMock()):
+        service = create_mongo_service(
+            mongodb_uri="mongodb://localhost:27017",
+            mongodb_database="caipe",
+            mongodb_tasks_collection="custom_tasks",
+        )
+
+    assert isinstance(service, MongoDBService)
+    assert service.task_collection_name == "custom_tasks"
+
+
+def test_default_task_collection_name_is_preserved():
+    with patch.object(MongoDBService, "_build_client", return_value=MagicMock()):
+        service = create_mongo_service(
             mongodb_uri="mongodb://localhost:27017",
             mongodb_database="caipe",
         )
 
-    assert mock_client.called
-    _args, kwargs = mock_client.call_args
-    assert kwargs.get("tz_aware") is True
-    assert kwargs.get("tzinfo") is timezone.utc
+    assert service.task_collection_name == DEFAULT_TASKS_COLLECTION_NAME

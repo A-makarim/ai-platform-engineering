@@ -22,15 +22,16 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from mongomock_motor import AsyncMongoMockClient
 
 from autonomous_agents.models import CronTrigger, TaskDefinition, TaskStatus
 from autonomous_agents.scheduler import (
     execute_task,
     set_chat_history_publisher,
-    set_run_store,
+    set_persistence_service,
 )
 from autonomous_agents.services.chat_history import _conversation_id_for_run
-from autonomous_agents.services.run_store import InMemoryRunStore
+from autonomous_agents.services.mongo import MongoDBService
 
 
 class _RecordingPublisher:
@@ -88,19 +89,19 @@ def _reset_scheduler_globals():
     """Restore both module-level singletons after every test."""
     import autonomous_agents.scheduler as sched_mod
 
-    original_run = sched_mod._run_store
+    original_run = sched_mod._mongo_service
     original_pub = sched_mod._chat_history_publisher
-    sched_mod._run_store = None
+    sched_mod._mongo_service = None
     sched_mod._chat_history_publisher = None
     yield
-    sched_mod._run_store = original_run
+    sched_mod._mongo_service = original_run
     sched_mod._chat_history_publisher = original_pub
 
 
 @pytest.fixture
-def store() -> InMemoryRunStore:
-    s = InMemoryRunStore(maxlen=10)
-    set_run_store(s)
+def store() -> MongoDBService:
+    s = MongoDBService(AsyncMongoMockClient(), database_name="test_db")
+    set_persistence_service(s)
     return s
 
 
@@ -128,7 +129,7 @@ def task() -> TaskDefinition:
 
 
 async def test_successful_run_is_published_with_response(
-    store: InMemoryRunStore,
+    store: MongoDBService,
     publisher: _RecordingPublisher,
     task: TaskDefinition,
 ):
@@ -151,7 +152,7 @@ async def test_successful_run_is_published_with_response(
 
 
 async def test_failed_run_is_published_with_error(
-    store: InMemoryRunStore,
+    store: MongoDBService,
     publisher: _RecordingPublisher,
     task: TaskDefinition,
 ):
@@ -170,7 +171,7 @@ async def test_failed_run_is_published_with_error(
 
 
 async def test_conversation_id_is_set_on_taskrun_and_matches_derivation(
-    store: InMemoryRunStore,
+    store: MongoDBService,
     publisher: _RecordingPublisher,
     task: TaskDefinition,
 ):
@@ -185,12 +186,12 @@ async def test_conversation_id_is_set_on_taskrun_and_matches_derivation(
 
     assert run.conversation_id is not None
     assert run.conversation_id == _conversation_id_for_run(run.run_id)
-    persisted = (await store.list_all())[0]
+    persisted = (await store.list_runs())[0]
     assert persisted.conversation_id == run.conversation_id
 
 
 async def test_webhook_context_is_redacted_in_published_prompt_by_default(
-    store: InMemoryRunStore,
+    store: MongoDBService,
     publisher: _RecordingPublisher,
     task: TaskDefinition,
 ):
@@ -218,7 +219,7 @@ async def test_webhook_context_is_redacted_in_published_prompt_by_default(
 
 
 async def test_webhook_context_is_inlined_when_opted_in(
-    store: InMemoryRunStore,
+    store: MongoDBService,
     publisher: _RecordingPublisher,
     task: TaskDefinition,
     monkeypatch,
@@ -250,7 +251,7 @@ async def test_webhook_context_is_inlined_when_opted_in(
 
 
 async def test_unserialisable_context_does_not_abort_task(
-    store: InMemoryRunStore,
+    store: MongoDBService,
     publisher: _RecordingPublisher,
     task: TaskDefinition,
     monkeypatch,
@@ -282,7 +283,7 @@ async def test_unserialisable_context_does_not_abort_task(
 
 
 async def test_publisher_failure_does_not_abort_task(
-    store: InMemoryRunStore,
+    store: MongoDBService,
     task: TaskDefinition,
 ):
     """A broken chat-history publisher must never bubble out of
@@ -302,12 +303,12 @@ async def test_publisher_failure_does_not_abort_task(
     # RunStore record must still hold the terminal state -- the
     # authoritative history is unaffected by the chat-publisher
     # failure.
-    persisted = (await store.list_all())[0]
+    persisted = (await store.list_runs())[0]
     assert persisted.status == TaskStatus.SUCCESS
 
 
 async def test_publisher_failure_is_logged_at_error_level(
-    store: InMemoryRunStore,
+    store: MongoDBService,
     task: TaskDefinition,
     caplog,
 ):
@@ -327,7 +328,7 @@ async def test_publisher_failure_is_logged_at_error_level(
 
 
 async def test_default_publisher_is_noop_when_unset(
-    store: InMemoryRunStore,
+    store: MongoDBService,
     task: TaskDefinition,
 ):
     """If the lifespan hook never injected a publisher, scheduler

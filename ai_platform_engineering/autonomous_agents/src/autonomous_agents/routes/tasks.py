@@ -1,14 +1,7 @@
 # Copyright CNOE Contributors (https://cnoe.io)
 # SPDX-License-Identifier: Apache-2.0
 
-"""Task management endpoints -- CRUD, run history, manual trigger.
-
-The :class:`TaskStore` (in-memory or MongoDB-backed) is the single
-source of truth for task definitions. Every mutation here goes through
-the store first, then immediately re-syncs the APScheduler job and the
-webhook registry via the hot-reload helpers so changes take effect
-without a service restart.
-"""
+"""Task management endpoints -- CRUD, run history, manual trigger."""
 
 import asyncio
 import logging
@@ -22,51 +15,40 @@ from autonomous_agents.routes.webhooks import (
 )
 from autonomous_agents.scheduler import (
     execute_task,
-    get_run_store,
     get_scheduler,
+    get_persistence_service as get_scheduler_persistence_service,
     register_task,
     unregister_task,
 )
-from autonomous_agents.services.task_store import (
-    InMemoryTaskStore,
+from autonomous_agents.services.mongo import (
+    MongoDBService,
     TaskAlreadyExistsError,
     TaskNotFoundError,
-    TaskStore,
 )
 
 logger = logging.getLogger("autonomous_agents")
 
 router = APIRouter(tags=["tasks"])
 
-# Maximum runs returned by /tasks/{id}/runs. Matches the legacy
-# in-memory cap so existing callers see no behaviour change beyond
-# the bug fix in IMP-01; raise this if the UI ever needs deeper
-# history in a single round-trip.
+# Maximum runs returned by /tasks/{id}/runs.
 _MAX_TASK_RUNS = 500
 
-# Module-level TaskStore singleton. Injected by the FastAPI lifespan
-# in ``main.py``; falls back to an in-memory store when accessed before
-# injection (e.g. from unit tests that don't spin up the full app).
-_task_store: TaskStore | None = None
+# Module-level MongoDBService singleton. Injected by the FastAPI lifespan.
+_mongo_service: MongoDBService | None = None
 
 
-def get_task_store() -> TaskStore:
-    """Return the active :class:`TaskStore`.
-
-    Lazy fallback to :class:`InMemoryTaskStore` mirrors the
-    ``get_run_store`` pattern so route-level tests can exercise the
-    handlers without running the FastAPI lifespan.
-    """
-    global _task_store
-    if _task_store is None:
-        _task_store = InMemoryTaskStore()
-    return _task_store
+def get_persistence_service() -> MongoDBService:
+    """Return the active :class:`MongoDBService`."""
+    global _mongo_service
+    if _mongo_service is None:
+        raise RuntimeError("MongoDBService not initialized")
+    return _mongo_service
 
 
-def set_task_store(store: TaskStore) -> None:
-    """Inject the active :class:`TaskStore` -- called from the FastAPI lifespan."""
-    global _task_store
-    _task_store = store
+def set_persistence_service(service: MongoDBService) -> None:
+    """Inject the active :class:`MongoDBService` -- called from the FastAPI lifespan."""
+    global _mongo_service
+    _mongo_service = service
 
 
 async def _sync_task_to_runtime(task: TaskDefinition) -> None:
@@ -151,14 +133,14 @@ def _next_run_iso_for(task_id: str) -> str | None:
 @router.get("/tasks", response_model=list[dict])
 async def list_tasks() -> list[dict]:
     """List all configured tasks plus their next scheduled run time."""
-    tasks = await get_task_store().list_all()
+    tasks = await get_persistence_service().list_tasks()
     return [_serialize_task(t, _next_run_iso_for(t.id)) for t in tasks]
 
 
 @router.get("/tasks/{task_id}", response_model=dict)
 async def get_task(task_id: str) -> dict:
     """Return a single task definition (used by the UI edit form)."""
-    task = await get_task_store().get(task_id)
+    task = await get_persistence_service().get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
     return _serialize_task(task, _next_run_iso_for(task_id))
@@ -179,9 +161,9 @@ async def create_task(task: TaskDefinition) -> dict:
     task would sit in MongoDB unschedulable while every retry POST
     bounced with 409 (PR #5 review, Codex P2).
     """
-    store = get_task_store()
+    store = get_persistence_service()
     try:
-        created = await store.create(task)
+        created = await store.create_task(task)
     except TaskAlreadyExistsError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -195,7 +177,7 @@ async def create_task(task: TaskDefinition) -> dict:
         # 4xx; otherwise we'd surface a confusing 500 for what is
         # plainly a client validation problem.
         try:
-            await store.delete(created.id)
+            await store.delete_task(created.id)
         except Exception:
             logger.exception(
                 "[%s] Compensating delete failed after sync error -- "
@@ -225,14 +207,14 @@ async def update_task(task_id: str, task: TaskDefinition) -> dict:
         # immutable text, but we don't want to trust that contract.
         task = task.model_copy(update={"id": task_id})
 
-    store = get_task_store()
+    store = get_persistence_service()
     # Capture the previous trigger type *before* committing the update.
     # We need this to know whether the update is a trigger-type swap
     # (e.g. cron -> webhook), in which case the old runtime entry on
     # the *other* side has to be explicitly torn down. ``existing`` is
     # ``None`` for unknown ids -- the store update call below will
     # then raise TaskNotFoundError and we 404 cleanly.
-    existing = await store.get(task_id)
+    existing = await store.get_task(task_id)
 
     # Webhook secret preservation: GET responses redact the secret to
     # ``has_secret: bool``, so when the UI submits an unchanged form
@@ -255,7 +237,7 @@ async def update_task(task_id: str, task: TaskDefinition) -> dict:
         task = task.model_copy(update={"trigger": preserved_trigger})
 
     try:
-        updated = await store.update(task_id, task)
+        updated = await store.update_task(task_id, task)
     except TaskNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -281,7 +263,7 @@ async def delete_task(task_id: str) -> None:
     operators are deleting concurrently.
     """
     try:
-        await get_task_store().delete(task_id)
+        await get_persistence_service().delete_task(task_id)
     except TaskNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -294,17 +276,20 @@ async def get_task_runs(task_id: str) -> list[TaskRun]:
     """Return run history for a specific task."""
     # Pre-IMP-01 the in-memory deque retained up to 500 runs across
     # all tasks and this endpoint returned every match. Calling
-    # ``list_by_task(task_id)`` with the protocol's default ``limit=100``
+    # ``list_runs_by_task(task_id)`` with the default ``limit=100``
     # silently truncated history for any task with more than 100 past
     # runs -- a regression. Pass an explicit cap so behaviour matches
-    # the legacy contract regardless of which RunStore is active.
-    history = await get_run_store().list_by_task(task_id, limit=_MAX_TASK_RUNS)
+    # the legacy contract regardless of which persistence backend is active.
+    history = await get_scheduler_persistence_service().list_runs_by_task(
+        task_id,
+        limit=_MAX_TASK_RUNS,
+    )
     if history:
         return history
     # Only 404 when there is BOTH no history AND no current task
     # definition. This keeps the endpoint useful for inspecting runs
     # of tasks whose definition was deleted from config.yaml.
-    if await get_task_store().get(task_id) is None:
+    if await get_persistence_service().get_task(task_id) is None:
         raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
     return history
 
@@ -312,7 +297,7 @@ async def get_task_runs(task_id: str) -> list[TaskRun]:
 @router.post("/tasks/{task_id}/run", response_model=dict)
 async def trigger_task_manually(task_id: str) -> dict:
     """Manually trigger a task to run immediately (for testing)."""
-    task = await get_task_store().get(task_id)
+    task = await get_persistence_service().get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
 
@@ -325,4 +310,4 @@ async def trigger_task_manually(task_id: str) -> dict:
 @router.get("/runs", response_model=list[TaskRun])
 async def list_all_runs() -> list[TaskRun]:
     """Return the full run history across all tasks."""
-    return await get_run_store().list_all()
+    return await get_scheduler_persistence_service().list_runs()

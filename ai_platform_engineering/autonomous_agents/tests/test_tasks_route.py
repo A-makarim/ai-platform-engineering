@@ -1,19 +1,12 @@
 # Copyright CNOE Contributors (https://cnoe.io)
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the /tasks router run-history endpoints.
-
-These tests focus on the contract between the router and the
-``RunStore`` abstraction -- specifically, the ``limit`` arguments the
-router passes through. We don't need a FastAPI ``TestClient`` here:
-the router functions are plain ``async def`` callables, so we can
-``await`` them directly with a stub store and a fresh
-``InMemoryTaskStore``.
-"""
+"""Unit tests for the /tasks router run-history endpoints."""
 
 from datetime import datetime, timezone
 
 import pytest
+from mongomock_motor import AsyncMongoMockClient
 
 from autonomous_agents.models import CronTrigger, TaskDefinition, TaskRun, TaskStatus
 from autonomous_agents.routes import tasks as tasks_route
@@ -21,13 +14,13 @@ from autonomous_agents.routes.tasks import (
     _MAX_TASK_RUNS,
     get_task_runs,
     list_all_runs,
-    set_task_store,
+    set_persistence_service,
 )
-from autonomous_agents.services.task_store import InMemoryTaskStore
+from autonomous_agents.services.mongo import MongoDBService
 
 
 class _RecordingStore:
-    """RunStore stub that captures the ``limit`` it was invoked with.
+    """Mongo persistence stub that captures run-list limits.
 
     Lets each test assert on the exact call shape the router used
     without standing up a real backend.
@@ -38,16 +31,16 @@ class _RecordingStore:
         self.list_by_task_calls: list[tuple[str, int]] = []
         self.list_all_calls: list[int] = []
 
-    async def record(self, run: TaskRun) -> None:  # pragma: no cover -- unused
+    async def record_run(self, run: TaskRun) -> None:  # pragma: no cover -- unused
         self._runs.append(run)
 
-    async def list_by_task(self, task_id: str, limit: int = 100) -> list[TaskRun]:
+    async def list_runs_by_task(self, task_id: str, limit: int = 100) -> list[TaskRun]:
         self.list_by_task_calls.append((task_id, limit))
         # Filter + cap so tests can also assert on returned data.
         matching = [r for r in self._runs if r.task_id == task_id]
         return matching[:limit]
 
-    async def list_all(self, limit: int = 500) -> list[TaskRun]:
+    async def list_runs(self, limit: int = 500) -> list[TaskRun]:
         self.list_all_calls.append(limit)
         return self._runs[:limit]
 
@@ -76,30 +69,27 @@ def _make_task(task_id: str = "t1") -> TaskDefinition:
 def _reset_router_state():
     """Reset module-level singletons between tests so state doesn't bleed."""
     yield
-    tasks_route._task_store = None
-    tasks_route._run_store = None if hasattr(tasks_route, "_run_store") else None
+    tasks_route._mongo_service = None
 
 
 @pytest.fixture
 def _swap_run_store(monkeypatch):
-    """Patch ``get_run_store`` for the route module so tests inject
+    """Patch the scheduler-backed persistence getter so tests inject
     a stub without touching the scheduler's global state."""
 
     def _apply(store):
-        monkeypatch.setattr(tasks_route, "get_run_store", lambda: store)
+        monkeypatch.setattr(tasks_route, "get_scheduler_persistence_service", lambda: store)
         return store
 
     return _apply
 
 
 async def _seed_tasks(tasks: list[TaskDefinition]) -> None:
-    """Replace the router's TaskStore with a fresh in-memory one
-    pre-populated with ``tasks``. Each test calls this with the exact
-    set it expects so ordering / leakage between tests is impossible."""
-    store = InMemoryTaskStore()
+    """Replace the router's persistence service with a fresh Mongo-backed one."""
+    store = MongoDBService(AsyncMongoMockClient(), database_name="test_db")
     for t in tasks:
-        await store.create(t)
-    set_task_store(store)
+        await store.create_task(t)
+    set_persistence_service(store)
 
 
 async def test_get_task_runs_passes_max_task_runs_limit(_swap_run_store):

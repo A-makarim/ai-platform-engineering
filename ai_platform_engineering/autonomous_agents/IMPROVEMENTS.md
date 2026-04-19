@@ -19,6 +19,88 @@ needed before this is production-deployable, or a quality-of-life fix.
 
 ---
 
+## Service Role
+
+`autonomous_agents` is a **FastAPI service**, not an AI agent.
+
+Its job is to validate, persist, register, trigger, dispatch, and track
+autonomous work on behalf of CAIPE. The actual reasoning/execution happens
+either through the CAIPE Supervisor or, in future/direct-dispatch flows,
+through sub-agents reached by the service.
+
+---
+
+## Workflow Model
+
+The intended workflow for Autonomous Agents is:
+
+1. A user creates a task through the **Task Builder** or through the
+   **Supervisor** acting as an initializer.
+2. The Task Builder or Supervisor generates a **structured task definition**
+   and calls the Autonomous Agents API.
+3. The task definition contains, at minimum:
+   - `task_id`
+   - `name`
+   - `sub_agents`
+   - `enabled`
+   - `task_prompt`
+   - `triggers` (for example schedule and trigger type)
+   - `dispatch_mode` (`direct` or `supervisor`)
+4. The Autonomous Agents service validates the task definition and stores it
+   in MongoDB.
+5. The service registers the task trigger:
+   - time-based triggers are registered with the scheduler
+   - event-based triggers are registered to the appropriate webhook path
+6. The system waits until either:
+   - the scheduled time arrives, or
+   - the external webhook is received
+7. When triggered, a trigger manager checks for duplicate delivery and other
+   execution policies such as retry and concurrency, then creates or resolves
+   a **Trigger Instance** containing:
+   - `task_id`
+   - `trigger_id`
+   - `trigger_instance_id`
+   - `dedupe_key`
+   - `trigger_source`
+8. Run creation then creates a **Task Run** record and prepares execution
+   context containing:
+   - `task_id`
+   - `run_id`
+   - `trigger_instance_id`
+   - `status`
+   - `result_summary`
+   - `error_message`
+9. The run dispatcher sends the task either:
+   - to the **Supervisor** over A2A, or
+   - directly to sub-agents, depending on `dispatch_mode`
+10. If `dispatch_mode=supervisor`, the Supervisor interprets the task and
+    routes execution to the appropriate sub-agent(s) or workflow.
+11. The result is returned to Autonomous Agents, which updates run status and
+    exposes task history for UI/API consumers.
+12. If the task is recurring, the schedule remains active and the workflow
+    repeats on the next trigger.
+
+### Dispatch semantics
+
+- `supervisor`: use when the task requires routing, decomposition,
+  orchestration, or replanning.
+- `direct`: use when the target sub-agent is already known and the task can
+  be executed without Supervisor-side replanning.
+
+### Important note on current implementation
+
+The current codebase already implements the FastAPI service, task validation,
+task persistence, trigger registration, run recording, webhook handling, and
+Supervisor dispatch over A2A.
+
+The workflow above is the **target operating model** for the service and
+should be treated as the design baseline for future improvements. Some pieces
+in that model, especially explicit `dispatch_mode`, richer trigger-instance
+tracking, deduplication policy, and direct-to-sub-agent dispatch, are planned
+capabilities rather than fully implemented runtime behavior today.
+
+---
+
 ## Status legend
 
 | Marker      | Meaning                                                |

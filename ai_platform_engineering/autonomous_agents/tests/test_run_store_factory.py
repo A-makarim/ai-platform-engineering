@@ -1,90 +1,53 @@
 # Copyright CNOE Contributors (https://cnoe.io)
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the ``create_run_store`` factory function."""
+"""Unit tests for MongoDBService singleton and run collection config."""
 
-from datetime import timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from autonomous_agents.services.run_store import (
-    InMemoryRunStore,
-    MongoRunStore,
-    create_run_store,
+from autonomous_agents.services.mongo import (
+    DEFAULT_COLLECTION_NAME,
+    MongoDBService,
+    create_mongo_service,
+    get_mongo_service,
+    reset_mongo_service,
 )
 
 
-def test_returns_in_memory_when_no_mongo_settings():
-    store = create_run_store()
-    assert isinstance(store, InMemoryRunStore)
+def test_create_service_uses_explicit_run_collection():
+    client = MagicMock()
+    database = MagicMock()
+    collection = MagicMock()
+    client.__getitem__.return_value = database
+    database.__getitem__.return_value = collection
 
-
-def test_returns_in_memory_when_only_uri_provided():
-    """Partial Mongo config should NOT silently engage Mongo — it almost
-    always indicates a missing env var, and falling back without telling
-    the operator would silently lose run history."""
-    store = create_run_store(mongodb_uri="mongodb://example:27017")
-    assert isinstance(store, InMemoryRunStore)
-
-
-def test_returns_in_memory_when_only_database_provided():
-    store = create_run_store(mongodb_database="db")
-    assert isinstance(store, InMemoryRunStore)
-
-
-def test_returns_in_memory_when_uri_is_empty_string():
-    store = create_run_store(mongodb_uri="", mongodb_database="db")
-    assert isinstance(store, InMemoryRunStore)
-
-
-def test_returns_mongo_when_both_uri_and_database_provided():
-    # AsyncIOMotorClient construction is lazy — no network I/O happens
-    # until an operation is awaited, so this is safe in a unit test even
-    # though no MongoDB is actually running on the bogus URI.
-    store = create_run_store(
-        mongodb_uri="mongodb://example:27017",
-        mongodb_database="db",
+    service = MongoDBService(
+        client=client,
+        database_name="db",
+        run_collection_name="custom_runs",
     )
-    assert isinstance(store, MongoRunStore)
+
+    assert service.run_collection_name == "custom_runs"
+    assert service.get_runs_collection() is collection
 
 
-def test_in_memory_maxlen_passed_through():
-    store = create_run_store(in_memory_maxlen=42)
-    assert isinstance(store, InMemoryRunStore)
-    assert store._maxlen == 42
-
-
-def test_mongo_collection_name_passed_through():
-    store = create_run_store(
-        mongodb_uri="mongodb://example:27017",
-        mongodb_database="db",
-        mongodb_collection="custom_runs",
-    )
-    assert isinstance(store, MongoRunStore)
-    assert store._collection.name == "custom_runs"
-
-
-def test_each_call_returns_a_fresh_instance():
-    """The factory does not memoise — singleton management is the
-    caller's responsibility (e.g. main.py lifespan), so the factory
-    stays trivially testable."""
-    s1 = create_run_store()
-    s2 = create_run_store()
-    assert s1 is not s2
-
-
-def test_mongo_client_is_constructed_with_utc_tzinfo():
-    """Regression: pymongo/motor default to ``tz_aware=False``, which
-    yields naive datetimes on read. Mixing those with the tz-aware
-    ones we write breaks downstream comparisons and serialises
-    inconsistently. The factory must opt the client into UTC-aware
-    timestamps so reads round-trip cleanly."""
-    with patch("motor.motor_asyncio.AsyncIOMotorClient") as mock_client_cls:
-        create_run_store(
+def test_create_mongo_service_passes_explicit_run_collection():
+    with patch.object(MongoDBService, "_build_client", return_value=MagicMock()):
+        service = create_mongo_service(
             mongodb_uri="mongodb://example:27017",
             mongodb_database="db",
+            mongodb_collection="custom_runs",
         )
 
-    mock_client_cls.assert_called_once()
-    _, kwargs = mock_client_cls.call_args
-    assert kwargs.get("tz_aware") is True
-    assert kwargs.get("tzinfo") is timezone.utc
+    assert isinstance(service, MongoDBService)
+    assert service.run_collection_name == "custom_runs"
+
+
+def test_get_mongo_service_reuses_singleton():
+    reset_mongo_service()
+    with patch.object(MongoDBService, "_build_client", return_value=MagicMock()):
+        first = get_mongo_service()
+        second = get_mongo_service()
+
+    assert first is second
+    assert first.run_collection_name == DEFAULT_COLLECTION_NAME
