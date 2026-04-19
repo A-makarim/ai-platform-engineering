@@ -136,8 +136,8 @@ don't persist).
 ---
 
 ### IMP-12 — UI: create / edit / disable autonomous tasks
-- **Status**: BACKEND DONE; UI pending in PR B
-- **Backend shipped on**: branch `prebuild/feat/autonomous-agents-task-crud`
+- **Status**: DONE
+- **Backend shipped on**: branch `prebuild/feat/autonomous-agents-task-crud` (PR #5)
   - `services/task_store.py` (Protocol + InMemory + Mongo + factory)
   - `routes/tasks.py` full CRUD: `POST /tasks`, `GET /tasks/{id}`,
     `PUT /tasks/{id}`, `DELETE /tasks/{id}`.
@@ -150,11 +150,16 @@ don't persist).
   - 51 new tests across `test_task_store.py`, `test_mongo_task_store.py`,
     `test_task_store_factory.py`, `test_scheduler_hot_reload.py`,
     `test_tasks_crud_route.py`.
-  - Auth (IMP-10) is **deliberately** not bundled here -- the UI
-    proxy enforces session auth in PR B; the autonomous-agents
-    service itself is still localhost-only.
-- **Remaining (PR B)**: Next.js page, API proxy, form dialog. See
-  `prebuild/feat/autonomous-agents-ui-tab`.
+- **UI shipped on**: branch `prebuild/feat/autonomous-agents-ui-tab` (PR #6)
+  - `ui/src/app/(app)/autonomous/page.tsx` -- tab landing with
+    list / detail / run-history split-pane.
+  - `ui/src/app/api/autonomous/[...path]/route.ts` -- session-gated
+    Next.js proxy to the FastAPI service.
+  - `ui/src/components/autonomous/{TaskList,TaskFormDialog,RunHistory,api,types}.tsx`.
+  - Header nav entry in `AppHeader.tsx`.
+- **Auth note**: The proxy initially required only a NextAuth session;
+  IMP-19 hardens it with per-method admin gating. Service-side auth
+  (IMP-10) is still pending and tracked separately.
 
 ---
 
@@ -233,6 +238,55 @@ don't persist).
   `ui/src/components/autonomous/__tests__/RunHistory.test.tsx` (new).
 - **Depends on**: IMP-13 (publishes the `conversation_id` field this
   feature deep-links into).
+
+---
+
+### IMP-19 — Admin-gate the autonomous-agents UI proxy
+- **Status**: DONE (PR — branch `prebuild/feat/autonomous-agents-admin-gating`)
+- **Why**: After IMP-12 the proxy at `/api/autonomous/[...path]` only
+  required a NextAuth session. That meant any signed-in user could
+  list, create, edit, delete, and *trigger* autonomous tasks — i.e.
+  burn LLM budget and write to downstream systems with someone else's
+  schedule. Fine on a single-tenant dev box; a real production gap once
+  the UI is shared. IMP-10 (service-side auth on the FastAPI app) is
+  still pending; this PR closes the most exploitable surface in the
+  meantime.
+- **What shipped**:
+  1. Proxy refactor (`ui/src/app/api/autonomous/[...path]/route.ts`):
+     - `GET` requires `requireAdminView(session)` — operators / on-call
+       responders can read scheduled tasks and run history.
+     - `POST` / `PUT` / `PATCH` / `DELETE` require `requireAdmin(session)`
+       — full admin role for any mutation.
+     - `POST /tasks/{id}/run` deliberately falls under `requireAdmin`:
+       a manual trigger spends LLM budget and may mutate downstream
+       systems, so view-only users must not have it.
+     - The proxy never opens an upstream HTTP connection until authz
+       passes (regression-tested) — closes a probe-oracle.
+     - Switched to `withErrorHandler` + `withAuth` to share the
+       project-standard auth/error envelope (matches `skill-hubs` etc.).
+  2. UI gating (`ui/src/app/(app)/autonomous/page.tsx`,
+     `ui/src/components/autonomous/TaskList.tsx`):
+     - Uses `useAdminRole` to render a read-only banner for view-only
+       users and to hide "New task" + the per-row Run / Edit / Delete
+       toolbar.
+     - Fully blocks the page (with a helpful message) for users without
+       even view access; suppresses the initial `listTasks` fetch in
+       that mode so we don't spam toast errors.
+     - Mounts `TaskFormDialog` only for admins — defence in depth on
+       top of the proxy 403.
+  3. Tests: new `ui/src/app/api/autonomous/__tests__/route.test.ts`
+     covers all five HTTP methods × {no session, view-only, full admin},
+     plus a dedicated guard for the `POST /tasks/:id/run` LLM-cost path.
+     18 tests, all passing.
+- **Out of scope (still TODO via IMP-10)**: end-to-end auth between the
+  Next.js proxy and the FastAPI service itself. Today the proxy still
+  speaks plaintext HTTP to `localhost:8002`; a malicious in-cluster
+  workload could bypass the UI entirely. IMP-10 closes that.
+- **Touches**: `ui/src/app/api/autonomous/[...path]/route.ts`,
+  `ui/src/app/(app)/autonomous/page.tsx`,
+  `ui/src/components/autonomous/TaskList.tsx`,
+  `ui/src/app/api/autonomous/__tests__/route.test.ts` (new).
+- **Depends on**: IMP-12 (UI surface this gates).
 
 ---
 

@@ -4,11 +4,12 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { Plus, RefreshCw, Bot } from "lucide-react";
+import { Plus, RefreshCw, Bot, Eye } from "lucide-react";
 
 import { AuthGuard } from "@/components/auth-guard";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/components/ui/toast";
+import { useAdminRole } from "@/hooks/use-admin-role";
 import { cn } from "@/lib/utils";
 
 import {
@@ -30,6 +31,13 @@ export default function AutonomousAgentsPage() {
 
 function AutonomousAgentsView() {
   const { toast } = useToast();
+  // IMP-19: gate writes behind the OIDC admin role. ``canViewAdmin``
+  // covers ops/on-call who need to see what's scheduled and inspect
+  // run history; only ``isAdmin`` is allowed to create / edit /
+  // delete / fire tasks. The proxy at /api/autonomous enforces the
+  // same split server-side -- this hook just keeps the UI honest so
+  // we don't render buttons that will 403 on click.
+  const { isAdmin, canViewAdmin, loading: roleLoading } = useAdminRole();
   const [tasks, setTasks] = useState<AutonomousTask[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -69,8 +77,12 @@ function AutonomousAgentsView() {
   }, []);
 
   useEffect(() => {
+    // Don't bother hitting /api/autonomous if the role check is still
+    // resolving or the user lacks even view access -- every call would
+    // 403 and the only thing we'd accomplish is a noisy error toast.
+    if (roleLoading || !canViewAdmin) return;
     reload();
-  }, [reload]);
+  }, [reload, roleLoading, canViewAdmin]);
 
   const markBusy = (id: string, busy: boolean) => {
     setBusyIds((prev) => {
@@ -171,19 +183,55 @@ function AutonomousAgentsView() {
             <RefreshCw className={cn("h-3.5 w-3.5 mr-1.5", loading && "animate-spin")} />
             Refresh
           </Button>
-          <Button type="button" size="sm" onClick={handleCreate}>
-            <Plus className="h-3.5 w-3.5 mr-1.5" />
-            New task
-          </Button>
+          {isAdmin && (
+            <Button
+              type="button"
+              size="sm"
+              onClick={handleCreate}
+              data-testid="autonomous-new-task"
+            >
+              <Plus className="h-3.5 w-3.5 mr-1.5" />
+              New task
+            </Button>
+          )}
         </div>
       </header>
 
-      {loadError && (
+      {!roleLoading && !isAdmin && canViewAdmin && (
+        // Read-only banner: tells the operator why "New task" is
+        // missing and why Edit/Delete/Run will be disabled. Without
+        // this they'd assume the page was broken.
+        <div
+          className="mx-6 mt-4 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300 flex items-center gap-2"
+          data-testid="autonomous-readonly-banner"
+        >
+          <Eye className="h-3.5 w-3.5 shrink-0" />
+          <span>
+            Read-only view. Ask an administrator to create or modify
+            autonomous tasks.
+          </span>
+        </div>
+      )}
+
+      {!roleLoading && !canViewAdmin && (
+        // No view access at all -- bail rather than rendering a page
+        // whose every API call will 403.
+        <div
+          className="mx-6 mt-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-700 dark:text-red-300"
+          data-testid="autonomous-forbidden"
+        >
+          You don&apos;t have permission to view autonomous tasks.
+          Membership in the OIDC admin or admin-view group is required.
+        </div>
+      )}
+
+      {loadError && canViewAdmin && (
         <div className="mx-6 mt-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-700 dark:text-red-300">
           {loadError}
         </div>
       )}
 
+      {canViewAdmin && (
       <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-4 px-6 py-4 overflow-hidden">
         <section className="overflow-y-auto">
           {loading && tasks.length === 0 ? (
@@ -199,6 +247,7 @@ function AutonomousAgentsView() {
               onDelete={handleDelete}
               onTrigger={handleTrigger}
               busyIds={busyIds}
+              readOnly={!isAdmin}
             />
           )}
         </section>
@@ -250,19 +299,26 @@ function AutonomousAgentsView() {
           ) : (
             <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
               {tasks.length === 0
-                ? "Create a task to get started."
+                ? (isAdmin ? "Create a task to get started." : "No autonomous tasks configured yet.")
                 : "Select a task to view details and run history."}
             </div>
           )}
         </section>
       </div>
+      )}
 
-      <TaskFormDialog
-        open={dialogOpen}
-        onOpenChange={setDialogOpen}
-        task={editingTask}
-        onSubmit={handleSubmitTask}
-      />
+      {isAdmin && (
+        // The form dialog is the *only* way to create or edit a task.
+        // Keep it mounted only for admins so a clever user can't pop
+        // it open via DOM tooling and try to submit -- the proxy
+        // would still 403, but defence in depth is cheap here.
+        <TaskFormDialog
+          open={dialogOpen}
+          onOpenChange={setDialogOpen}
+          task={editingTask}
+          onSubmit={handleSubmitTask}
+        />
+      )}
     </div>
   );
 }
