@@ -41,15 +41,7 @@ _(IMP-03 — completed; see Done section.)_
 
 ---
 
-### IMP-04 — Container hardening (Dockerfile)
-- **Status**: TODO
-- **Why**: Image runs as `root`. Violates the project-wide container rule.
-- **Approach**:
-  - Add `RUN groupadd -r app && useradd -r -g app app && chown -R app:app /app`
-  - `USER app`
-  - Document `--security-opt=no-new-privileges` and `--read-only` in the run
-    examples in the README.
-- **Touches**: `Dockerfile`, `README.md`.
+_(IMP-04 — completed; see Done section.)_
 
 ---
 
@@ -247,6 +239,37 @@ Don't do these until you have a real reason. Premature.
 ## Done
 
 _Short audit trail of completed items. Newest first._
+
+### IMP-04 — Container hardening (Dockerfile)
+- **Shipped on**: branch `prebuild/feat/autonomous-agents-dockerfile-hardening`
+- **What landed**:
+  - `Dockerfile` is now a true two-stage build matching the pattern
+    used by `dynamic_agents/build/Dockerfile`. Builder stage
+    (`ghcr.io/astral-sh/uv:python3.13-bookworm-slim`) resolves the
+    venv with `uv sync --locked --no-dev`. Runtime stage
+    (`python:3.13-slim-bookworm`) contains only the venv + source +
+    config — no `uv`, no apt, no build toolchain. Both base images
+    are pinned to specific Debian variants for reproducible builds.
+  - Source code, `pyproject.toml`/`uv.lock`, and `config.yaml` are
+    copied from the builder as **root-owned** with default 644 perms.
+    The `app` user can read them but can't modify them, even when the
+    container is run without `--read-only`. Only `/app/.venv` is
+    chowned to `app:app` (and it isn't mutated during normal
+    operation).
+  - System `app` user (UID/GID `1001`) created with
+    `--no-create-home --shell /usr/sbin/nologin`. `USER app:app` is
+    set in the runtime stage so the container is non-root by default
+    without any extra runtime flags.
+  - Build args `APP_UID` / `APP_GID` let downstream chart authors
+    pin the IDs to whatever their cluster's PSS expects.
+  - README "Run with Docker" section now ships the recommended
+    runtime flag set as **defence in depth** on top of the non-root
+    default: `--user app:app --read-only --tmpfs /tmp
+    --security-opt=no-new-privileges --cap-drop=ALL --pids-limit=256
+    --memory=512m --cpus=1`. Each flag carries a one-line rationale
+    so reviewers don't have to guess why it's there.
+
+---
 
 ### IMP-03 / IMP-07 — Webhook hardening (global secret fallback + replay protection)
 - **Shipped on**: branch `prebuild/feat/autonomous-agents-webhook-hardening`
