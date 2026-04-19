@@ -72,6 +72,35 @@ class Settings(BaseSettings):
     # CORS — keep empty by default; open only in explicit dev/test configs
     cors_origins: list[str] = []
 
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def _parse_cors_origins(cls, v):
+        # Accept either a JSON list (native pydantic-settings behaviour)
+        # OR a plain comma-separated string from `.env`. Operators
+        # routinely paste the latter ("http://localhost:3000,https://app.example.com")
+        # and would otherwise hit an opaque parse error. Strings are
+        # split on commas and whitespace-trimmed.
+        if isinstance(v, str):
+            v = [origin.strip() for origin in v.split(",") if origin.strip()]
+        return v
+
+    @field_validator("cors_origins")
+    @classmethod
+    def _reject_unsafe_cors_wildcard(cls, v: list[str]) -> list[str]:
+        # IMP-05: ``cors_origins=["*"]`` plus ``allow_credentials=True``
+        # (the FastAPI default in main.py) is a CORS spec violation --
+        # browsers refuse the response and you get cryptic "credentialed
+        # request rejected" errors at runtime. Worse, some misconfigured
+        # gateways DO honour it and expose every authenticated route to
+        # any origin. Fail fast at startup so the misconfig is obvious.
+        if any(origin.strip() == "*" for origin in v):
+            raise ValueError(
+                "cors_origins=['*'] is unsafe with allow_credentials=True; "
+                "list each allowed origin explicitly (e.g. "
+                "['http://localhost:3000','https://app.example.com'])"
+            )
+        return v
+
     # MongoDB persistence for run history (optional).
     # Both must be set to enable MongoRunStore; otherwise the service
     # falls back to a bounded in-memory store (legacy behaviour) so
@@ -79,6 +108,12 @@ class Settings(BaseSettings):
     mongodb_uri: str | None = None
     mongodb_database: str | None = None
     mongodb_collection: str = "autonomous_runs"
+
+    # MongoDB collection that holds task definitions (the source of
+    # truth for CRUD operations). Only used when both ``mongodb_uri``
+    # and ``mongodb_database`` are set; otherwise the in-memory
+    # TaskStore is used and tasks are seeded from YAML on every boot.
+    mongodb_tasks_collection: str = "autonomous_tasks"
 
     # Maximum runs retained by the in-memory store when Mongo is not
     # configured. Ignored when MongoRunStore is in use.
