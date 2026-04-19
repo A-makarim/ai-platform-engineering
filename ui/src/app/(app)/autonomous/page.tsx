@@ -62,8 +62,11 @@ function AutonomousAgentsView() {
     [tasks, selectedId],
   );
 
-  const reload = useCallback(async () => {
-    setLoading(true);
+  // Internal worker that fetches and merges task list. ``silent`` skips
+  // the spinner so the polling loop (spec #099 FR-011) doesn't flicker
+  // the UI every 30 seconds.
+  const fetchTasks = useCallback(async (silent: boolean) => {
+    if (!silent) setLoading(true);
     try {
       const data = await autonomousApi.listTasks();
       setTasks(data);
@@ -75,6 +78,11 @@ function AutonomousAgentsView() {
         return data[0]?.id ?? null;
       });
     } catch (err) {
+      // Polling failures are silent — we keep the last successful task
+      // list visible rather than blanking the UI on a transient blip.
+      // Manual refresh / first load surfaces the error so the operator
+      // sees the failure state.
+      if (silent) return;
       const msg =
         err instanceof AutonomousApiError
           ? err.message
@@ -82,9 +90,11 @@ function AutonomousAgentsView() {
       setLoadError(msg);
       setTasks([]);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, []);
+
+  const reload = useCallback(() => fetchTasks(false), [fetchTasks]);
 
   useEffect(() => {
     // Don't bother hitting /api/autonomous if the role check is still
@@ -103,6 +113,19 @@ function AutonomousAgentsView() {
     }
     reload();
   }, [reload, roleLoading, hasViewAccess]);
+
+  // Spec #099 FR-011: poll for ack + next-run updates so the badge
+  // refreshes after a background preflight resolves and the next-run
+  // countdown stays accurate without a manual refresh. 30 seconds is
+  // the spec-recommended cadence; cheap enough for the UI, infrequent
+  // enough to avoid unnecessary load on the autonomous-agents service.
+  useEffect(() => {
+    if (roleLoading || !hasViewAccess) return;
+    const interval = window.setInterval(() => {
+      fetchTasks(true);
+    }, 30_000);
+    return () => window.clearInterval(interval);
+  }, [fetchTasks, roleLoading, hasViewAccess]);
 
   const markBusy = (id: string, busy: boolean) => {
     setBusyIds((prev) => {

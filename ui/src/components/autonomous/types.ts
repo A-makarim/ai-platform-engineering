@@ -47,6 +47,30 @@ export interface WebhookTrigger {
 
 export type Trigger = CronTrigger | IntervalTrigger | WebhookTrigger;
 
+/**
+ * Pre-flight acknowledgement returned by the supervisor when a task is
+ * created or its routing-relevant fields change. Mirror of the Python
+ * ``Acknowledgement`` model in
+ * ``ai_platform_engineering/autonomous_agents/src/autonomous_agents/services/preflight.py``.
+ *
+ * Spec #099 FR-001..005 / AD-003. The UI surfaces this as a per-row
+ * status badge ("Ack OK / Ack failed / Ack pending") with the
+ * ``ack_detail`` and ``dry_run_summary`` rendered in a tooltip.
+ */
+export type AcknowledgementStatus = 'ok' | 'warn' | 'failed' | 'pending';
+
+export interface Acknowledgement {
+  ack_status: AcknowledgementStatus;
+  ack_detail?: string;
+  routed_to?: string | null;
+  tools?: string[];
+  available_agents?: string[];
+  credentials_status?: Record<string, string>;
+  dry_run_summary?: string;
+  /** ISO-8601 string from the supervisor. */
+  ack_at?: string;
+}
+
 export interface AutonomousTask {
   id: string;
   name: string;
@@ -60,6 +84,19 @@ export interface AutonomousTask {
   max_retries?: number | null;
   /** ISO-8601 string from APScheduler; null for webhook/disabled. */
   next_run?: string | null;
+  /**
+   * Most recent supervisor pre-flight acknowledgement for this task.
+   * Null until the first preflight attempt has completed (e.g. the
+   * brief window between POST /tasks responding and the background
+   * preflight resolving). Spec #099 FR-002.
+   */
+  last_ack?: Acknowledgement | null;
+  /**
+   * Deterministic UUIDv5 chat conversation id for this task. Stable
+   * across restarts so the UI can deep-link to ``/chat/<id>`` from
+   * anywhere. Spec #099 FR-006.
+   */
+  chat_conversation_id?: string | null;
 }
 
 export interface TaskRun {
