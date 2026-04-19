@@ -50,19 +50,54 @@ _(IMP-05 — completed; see Done section.)_
 ---
 
 ### IMP-06 — Validate `metadata.agent` hint end-to-end vs the live supervisor
-- **Status**: TODO
+- **Status**: DONE (PR — branch `prebuild/feat/autonomous-agents-validate-agent-hint`)
 - **Why**: Open question #1 in `NOTES.md`. Today `a2a_client.py` sends
   `metadata={"agent": task.agent}` optimistically. If the supervisor's LLM
   router ignores it, the README is misleading and we're paying for an extra
   routing LLM call. We need to know before building UI on top.
-- **Approach**:
-  1. Manual: send the same prompt with and without `metadata.agent`,
-     observe routing in supervisor logs.
-  2. Codify the result: either drop the hint and accept LLM routing, or
-     propose a small supervisor change for hint-based fast-path routing
-     (separate PR upstream).
-  3. Update `README.md` to match reality.
-- **Touches**: `services/a2a_client.py` (maybe), `README.md`, `NOTES.md` (close Q1).
+- **Investigation finding**: The CAIPE supervisor (`AIPlatformEngineerA2AExecutor` /
+  `AIPlatformEngineerA2ABinding.stream` in
+  `multi_agents/platform_engineer/protocol_bindings/a2a/`) reads only
+  `message.metadata.user_id` / `user_email` from incoming A2A messages.
+  `metadata.agent` and `metadata.llm_provider` are **silently ignored**;
+  routing is done by the Deep Agent supervisor LLM based on the prompt
+  text alone. The single `LLMFactory().get_llm()` is built once at
+  `deep_agent.py:238` and used for every request, so `metadata.llm_provider`
+  has no effect either.
+- **What shipped**:
+  1. New `build_prompt_with_routing()` helper in
+     `services/a2a_client.py` that prepends a clearly-demarcated
+     `[Routing directive: This task is targeted at the \`<agent>\`
+     sub-agent. Delegate to that sub-agent unless the request cannot be
+     fulfilled by it.]` line whenever a task supplies an `agent` hint.
+     This makes the UI's per-task agent picker actually pin routing
+     (today it would otherwise be decorative -- the supervisor LLM
+     ignores `metadata.agent` and routes purely on prompt text).
+  2. The directive is **permissive** -- a typo'd or decommissioned
+     agent name degrades into normal LLM routing instead of hard-
+     failing the run. Whitespace-only / empty `agent` values skip the
+     directive entirely so LLM-routed tasks aren't polluted.
+  3. `metadata.agent` and `metadata.llm_provider` are still sent on the
+     A2A message even though the supervisor ignores them today --
+     forward-compat for a future supervisor change that adds structured
+     fast-path routing (which would skip the LLM router entirely and
+     save tokens). That follow-up is left as a separate upstream PR.
+  4. `README.md` rewritten: dedicated **Routing the agent hint**
+     subsection under *Configuration*, plus inline notes on the task
+     schema explaining what `agent` and `llm_provider` actually do.
+  5. 7 new tests in `test_a2a_client.py` covering the directive
+     contract: present iff `agent` non-empty, ordering vs context
+     block, whitespace handling, and an end-to-end `invoke_agent`
+     assertion that the directive lands in the outgoing payload's
+     text part.
+- **Touches**:
+    `src/autonomous_agents/services/a2a_client.py`
+    `tests/test_a2a_client.py`
+    `README.md`
+    `IMPROVEMENTS.md`
+- **Not touched (intentionally)**: `NOTES.md` close-out and the
+  upstream supervisor PR adding structured fast-path routing on
+  `metadata.agent`. Both follow this PR.
 
 ---
 
@@ -114,7 +149,11 @@ don't persist).
 ---
 
 ### IMP-11 — UI: read-only "Autonomous Tasks" view in CAIPE UI
-- **Status**: TODO
+- **Status**: DONE (subsumed by IMP-12 -- the IMP-12 UI shipped both
+  the read-only list/run-history view AND the create/edit/disable
+  controls in a single page on `prebuild/feat/autonomous-agents-ui-tab`
+  (PR #6). Keeping this entry for historical context; no separate
+  PR was opened.)
 - **Why**: First step of the END GOAL. Get the data on screen before adding
   CRUD. Lets users see what's scheduled and the run history without changing
   any persistence shape.

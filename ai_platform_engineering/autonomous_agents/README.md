@@ -45,7 +45,14 @@ config.yaml (task definitions)
   Sub-agents: GitHub, ArgoCD, Jira, PagerDuty ...
 ```
 
-Tasks are loaded at startup from `config.yaml`. Each task is sent to the CAIPE supervisor via the [A2A protocol](https://google.github.io/A2A/) when its trigger fires. The supervisor routes the task to the appropriate sub-agent.
+Tasks are loaded at startup from `config.yaml` (or MongoDB once the CRUD UI has been used). Each task is sent to the CAIPE supervisor via the [A2A protocol](https://google.github.io/A2A/) when its trigger fires.
+
+How the supervisor picks a sub-agent (see *Routing the agent hint* below):
+
+- The supervisor today is a Deep Agent whose router is an LLM. It reads the **prompt text** to choose a sub-agent and does **not** read `message.metadata.agent`.
+- When a task specifies `agent: "github"`, the autonomous-agents service therefore prepends a short `[Routing directive: ...]` line to the prompt. That tells the supervisor LLM to delegate to the named sub-agent.
+- The directive is permissive (`unless the request cannot be fulfilled by it`), so a typo'd agent name degrades gracefully into normal LLM routing instead of failing the run.
+- The structured `metadata.agent` / `metadata.llm_provider` keys are still sent on the wire — they're forward-compat for a future supervisor change that adds structured fast-path routing.
 
 ---
 
@@ -116,17 +123,41 @@ tasks:
   - id: "my-task"                    # unique identifier (used in API + webhook URL)
     name: "My Task"                  # human-readable label
     description: "Optional"
-    agent: "github"                  # CAIPE agent to invoke (must be enabled in supervisor)
+    agent: "github"                  # CAIPE sub-agent to delegate to (must be enabled in supervisor).
+                                     # Surfaced to the supervisor as an in-band routing directive on
+                                     # the prompt -- see "Routing the agent hint" below. Leave unset
+                                     # (or empty) to let the supervisor LLM pick from prompt text.
     prompt: |                        # prompt sent to the agent
       Check all open PRs and flag any that have been open for more than 7 days.
     trigger:
       type: cron
       schedule: "0 9 * * *"
-    llm_provider: "aws-bedrock"      # optional: overrides global LLM_PROVIDER
+    llm_provider: "aws-bedrock"      # optional: sent as message metadata (currently informational --
+                                     # the supervisor uses its own configured LLM, see "Routing the
+                                     # agent hint" below).
     enabled: true
     timeout_seconds: 600             # optional: override A2A_TIMEOUT_SECONDS for this task
     max_retries: 5                   # optional: override A2A_MAX_RETRIES for this task (0 disables retries)
 ```
+
+#### Routing the agent hint
+
+The CAIPE supervisor is a Deep Agent whose router is an LLM that reads the **prompt text**, not the A2A message metadata. To make the per-task `agent` choice actually take effect (rather than being decorative on the UI), `services/a2a_client.py` prepends a short directive to the outgoing prompt whenever `agent` is set:
+
+```
+[Routing directive: This task is targeted at the `github` sub-agent. Delegate to that sub-agent unless the request cannot be fulfilled by it.]
+
+<your task prompt>
+
+Context:
+{ ... optional structured payload, e.g. webhook body ... }
+```
+
+Notes:
+
+- The directive is **permissive**. If the task name doesn't match a registered sub-agent (typo, decommissioned agent, etc.), the supervisor falls back to normal LLM routing instead of failing the run.
+- `agent` left unset or empty (`""`) skips the directive entirely — useful when you want the supervisor to pick.
+- `llm_provider` and `agent` are also sent as `message.metadata` for forward-compat. Today the supervisor only reads `metadata.user_id` / `metadata.user_email` from incoming messages; structured fast-path routing on `metadata.agent` would be a separate supervisor PR (tracked as a future iteration of IMP-06 in `IMPROVEMENTS.md`).
 
 ### Environment Variables
 
