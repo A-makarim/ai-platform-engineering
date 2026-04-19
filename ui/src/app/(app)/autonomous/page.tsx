@@ -37,7 +37,17 @@ function AutonomousAgentsView() {
   // delete / fire tasks. The proxy at /api/autonomous enforces the
   // same split server-side -- this hook just keeps the UI honest so
   // we don't render buttons that will 403 on click.
+  //
+  // ``hasViewAccess`` deliberately includes admins. ``useAdminRole``
+  // can promote a user to ``isAdmin=true`` via the MongoDB profile
+  // fallback (`/api/auth/role`) without ever flipping
+  // ``canViewAdmin`` (which is sourced strictly from OIDC claims).
+  // The proxy's ``requireAdminView`` short-circuits on ``role ===
+  // 'admin'``, so MongoDB-promoted admins are server-authorised to
+  // GET /api/autonomous; gating the UI strictly on ``canViewAdmin``
+  // would lock those legitimate admins out (caught by Codex review).
   const { isAdmin, canViewAdmin, loading: roleLoading } = useAdminRole();
+  const hasViewAccess = isAdmin || canViewAdmin;
   const [tasks, setTasks] = useState<AutonomousTask[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -78,11 +88,21 @@ function AutonomousAgentsView() {
 
   useEffect(() => {
     // Don't bother hitting /api/autonomous if the role check is still
-    // resolving or the user lacks even view access -- every call would
-    // 403 and the only thing we'd accomplish is a noisy error toast.
-    if (roleLoading || !canViewAdmin) return;
+    // resolving. Once it resolves, branch on access:
+    //   * has view access -> fetch tasks
+    //   * no view access  -> drop the initial loading/error state so
+    //     the header Refresh button doesn't sit disabled with a
+    //     spinning icon forever (the page itself is replaced with the
+    //     forbidden banner below, but the header is still rendered).
+    //     Caught by Copilot review.
+    if (roleLoading) return;
+    if (!hasViewAccess) {
+      setLoading(false);
+      setLoadError(null);
+      return;
+    }
     reload();
-  }, [reload, roleLoading, canViewAdmin]);
+  }, [reload, roleLoading, hasViewAccess]);
 
   const markBusy = (id: string, busy: boolean) => {
     setBusyIds((prev) => {
@@ -213,7 +233,7 @@ function AutonomousAgentsView() {
         </div>
       )}
 
-      {!roleLoading && !canViewAdmin && (
+      {!roleLoading && !hasViewAccess && (
         // No view access at all -- bail rather than rendering a page
         // whose every API call will 403.
         <div
@@ -225,13 +245,13 @@ function AutonomousAgentsView() {
         </div>
       )}
 
-      {loadError && canViewAdmin && (
+      {loadError && hasViewAccess && (
         <div className="mx-6 mt-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-700 dark:text-red-300">
           {loadError}
         </div>
       )}
 
-      {canViewAdmin && (
+      {hasViewAccess && (
       <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-4 px-6 py-4 overflow-hidden">
         <section className="overflow-y-auto">
           {loading && tasks.length === 0 ? (

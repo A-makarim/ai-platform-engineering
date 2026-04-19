@@ -84,8 +84,17 @@ function makeRequest(
   const url = new URL(`/api/autonomous/${path}`, 'http://localhost:3000');
   const init: RequestInit & { duplex?: string } = { method };
   if (body !== undefined) {
-    init.headers = { 'Content-Type': 'application/json', 'content-length': '99' };
-    init.body = JSON.stringify(body);
+    // Compute the actual byte length so this stays correct if a future
+    // Node release starts validating Content-Length against the real
+    // payload (caught by Copilot review). The proxy itself doesn't
+    // currently care, but a brittle hard-coded '99' is a trap waiting
+    // to bite the next person who adds a larger fixture.
+    const serializedBody = JSON.stringify(body);
+    init.headers = {
+      'Content-Type': 'application/json',
+      'content-length': Buffer.byteLength(serializedBody).toString(),
+    };
+    init.body = serializedBody;
     // Node 20+ requires this for streamable bodies in fetch-style Requests.
     init.duplex = 'half';
   }
@@ -172,6 +181,24 @@ describe('GET /api/autonomous/[...path]', () => {
     );
     expect(res.status).toBe(200);
     expect(mockFetch).toHaveBeenCalled();
+  });
+
+  it('200 when user is admin even if canViewAdmin is false (MongoDB-promoted admin)', async () => {
+    // Regression guard for the Codex P1 finding on PR #12: admins
+    // promoted via the /api/auth/role MongoDB fallback can have
+    // role='admin' without ever picking up the OIDC view-group claim
+    // that drives `canViewAdmin`. The proxy must still let them in;
+    // otherwise the corresponding UI gate (`hasViewAccess = isAdmin
+    // || canViewAdmin`) would be diverging from the server.
+    mockGetServerSession.mockResolvedValue({
+      user: { email: 'mongo-admin@example.com', name: 'Mongo Admin' },
+      role: 'admin',
+      canViewAdmin: false,
+    });
+    mockFetch.mockResolvedValue(okJsonResponse([{ id: 'demo' }]));
+    const res = await GET(makeRequest('GET', 'tasks'), paramsFor('tasks'));
+    expect(res.status).toBe(200);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 });
 
