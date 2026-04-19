@@ -355,6 +355,14 @@ services:
       - caipe-mongodb
       - caipe-supervisor-all-in-one
       - deps
+      # Auto-include Mongo whenever the autonomous-agents profile is
+      # selected. The autonomous-agents service hard-codes its
+      # MONGODB_URI default to caipe-mongodb (so tasks created via the
+      # UI survive restarts); without this, "docker compose --profile
+      # autonomous-agents up" would start the service against a host
+      # that doesn't resolve and it would fail during MongoTaskStore
+      # index creation. See PR #14 review feedback.
+      - autonomous-agents
 
   # MongoDB Admin UI
   caipe-ui-mongo-express:
