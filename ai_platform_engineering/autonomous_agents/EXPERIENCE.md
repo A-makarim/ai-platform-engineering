@@ -8,19 +8,26 @@ A running record of what has been built, what's in flight, what we learned along
 
 ## Quick Status Dashboard
 
-| Phase | Title                                                                 | Status        | Branch                                                                  | PR    |
-|-------|-----------------------------------------------------------------------|---------------|-------------------------------------------------------------------------|-------|
-| 0     | Spec — conversational UX for autonomous tasks                         | ✅ Merged     | `prebuild/feat/autonomous-agents-conversational-ux`                      | #15   |
-| 1     | Per-task chat thread + supervisor pre-flight ack                      | 🚧 Starting   | `prebuild/feat/autonomous-agents-preflight-and-thread` (planned)         | TBD   |
-| 2     | UI rendering of per-task thread with upcoming-run indicator           | ⏳ Queued     | `prebuild/feat/autonomous-agents-thread-ui` (planned)                    | TBD   |
-| 3     | Chat-driven task author sub-agent (second creation door)              | ⏳ Queued     | `prebuild/feat/autonomous-agents-task-author` (planned)                  | TBD   |
+| Phase | Title                                                                 | Status                         |
+|-------|-----------------------------------------------------------------------|--------------------------------|
+| 0     | Spec — conversational UX for autonomous tasks                         | ✅ Merged (PR #15)            |
+| 1     | Per-task chat thread + supervisor pre-flight ack                      | ✅ Done on umbrella           |
+| 2     | UI rendering of per-task thread with upcoming-run indicator           | ✅ Done on umbrella           |
+| 3     | Chat-driven task author sub-agent (second creation door)              | ⏳ Deferred until testing      |
 
-Plus loose bug-fix commits going directly to umbrella as we discover them in dogfood:
+Per-#099-PR-as-PR was abandoned in favour of direct-to-umbrella commits with one batch sign-off at end-of-batch (operator preference for speed). EXPERIENCE.md is the running log; bots review the umbrella push at the end.
 
-| Commit     | Title                                                                            |
-|------------|----------------------------------------------------------------------------------|
-| 8ff5ff53   | fix(supervisor): harden prompt_config loader (utf-8, env override, dict guard)   |
-| 3ffb2ba7   | fix(autonomous-agents): use UUIDv5 contextId for supervisor A2A calls            |
+### Direct-to-umbrella commits (chronological)
+
+| Commit     | Title                                                                              |
+|------------|------------------------------------------------------------------------------------|
+| `bde20bbb` | fix(autonomous-agents): use UUIDv5 contextId for supervisor A2A calls              |
+| `6c19d138` | fix(supervisor): harden prompt_config loader (utf-8, env override, dict guard)     |
+| `538064a9` | docs(autonomous-agents): add EXPERIENCE.md working log                             |
+| `3a5b1859` | feat(autonomous-agents): supervisor preflight ack on task create/update            |
+| `ff6c9617` | feat(autonomous-agents): per-task chat threads with typed message kinds            |
+| `3468c7de` | test(autonomous-agents): unit tests for preflight + per-task chat threads          |
+| `07b0f739` | feat(ui+autonomous-agents): pre-flight badge, per-task chat link, live next-run    |
 
 ---
 
@@ -93,39 +100,47 @@ Three small but distinct robustness fixes in `load_prompt_config()`:
 
 ---
 
-## Phase 1 — Per-task chat thread + supervisor pre-flight ack (Starting)
+## Phase 1 — Per-task chat thread + supervisor pre-flight ack (Done — backend)
 
-**Branch (planned)**: `prebuild/feat/autonomous-agents-preflight-and-thread`
-**Touches**: `ai_platform_engineering/autonomous_agents/` and `ai_platform_engineering/multi_agents/platform_engineer/`
-**Feature flag**: `AUTONOMOUS_PREFLIGHT_ENABLED` (default on)
+**Branch**: direct on `prebuild/feat/autonomous-agents` (umbrella).
+**Commits**: `3a5b1859` (preflight) + `ff6c9617` (per-task threads) + `3468c7de` (tests).
+**Tests**: 213/213 passing on Windows native + uv (mongomock-dependent modules skipped — pre-existing dev-only deps not synced in this venv; unrelated to Phase 1).
 
-What this PR delivers (mapped to spec FRs):
+What landed (mapped to spec FRs):
 
-- **FR-001, FR-005, AD-003**: Supervisor accepts `metadata.preflight: true` on `message/send`. When set, it routes via the LLM but stops before invoking side-effecting tools, returning a structured `Acknowledgement` payload `{routed_to, tools, credentials_status, dry_run_summary, ack_status, ack_detail}`.
-- **FR-002, FR-003, FR-004**: Autonomous-agents service calls pre-flight on every successful `POST /api/v1/tasks` and on `PUT /api/v1/tasks/{id}` when prompt/agent/trigger changed. Result persisted on the task as `last_ack`. Failures are warnings, not errors — task is still created.
-- **FR-006, FR-007, FR-008, FR-009**: Chat publisher rewrites the conversation_id derivation to UUIDv5(`autonomous-task:<task_id>`) and writes per-message `metadata.kind` from the spec's enumeration (`creation_intent`, `preflight_ack`, `next_run_marker`, `run_request`, `run_response`, `run_error`, `task_updated`, `task_disabled`, `task_deleted`, `task_reauthored`). Defaults to enabled but no-ops gracefully when Mongo isn't reachable.
-- **FR-018, FR-019**: Unit tests + integration test through the existing FakeSupervisor pattern. Native-dev (no Mongo, no Docker) cold start stays under 5 s.
+- **FR-001, FR-005, AD-003**: Supervisor `AIPlatformEngineerA2AExecutor` detects `metadata.preflight=true` on the inbound A2A message and short-circuits with a structured `Acknowledgement` payload before invoking any side-effecting tool. Light preflight only (agent loaded? yes/no); heavy probes (real credential validation per agent) deliberately deferred — see `_build_preflight_ack` docstring and OQ-1.
+- **FR-002, FR-003, FR-004**: Autonomous-agents service calls pre-flight in the background after every successful `POST /api/v1/tasks` and after `PUT` when prompt/agent/llm_provider changed (toggle-enabled doesn't burn a preflight call). Result persisted on `TaskDefinition.last_ack`; failures are warnings (`pending`/`warn`/`failed` ack_status) not exceptions. CRUD routes scrub any client-supplied `last_ack` so a malicious or buggy client cannot pre-populate a green badge.
+- **FR-006, FR-007, FR-008, FR-009**: Conversation id is now `uuid5(NS, "task:" + task_id)` — per-task, deterministic, and matches the contextId derivation in `services/a2a_client.py`. Each message carries `metadata.kind` from the typed enumeration. Phase 1 wires `creation_intent` (POST /tasks), `preflight_ack` (after every preflight call), `run_request`, and `run_response`/`run_error` (per scheduled run). Remaining kinds (`task_updated`, `task_disabled`, `task_deleted`, `task_reauthored`, `next_run_marker`) reserved for Phase 2.
+- **FR-018, FR-019**: 22 new tests (12 preflight + 10 chat-thread). Native-dev parity preserved — Mongo path stays opt-in via `CHAT_HISTORY_PUBLISH_ENABLED`, cold start unchanged.
 
-Not in this PR (deferred to later phases):
+Not in Phase 1 (lands in Phase 2):
 
-- UI rendering of `last_ack` and per-task threads (Phase 2)
-- Live `next_run` countdown (Phase 2)
-- Chat-driven task author sub-agent (Phase 3)
+- UI rendering of `last_ack` (badge per task row, color-coded)
+- UI rendering of per-task chat thread (kind-aware affordances)
+- Live `next_run` indicator with absolute + relative timestamps
+
+Open Question outcomes:
+
+- **OQ-1**: Implemented as the flag (`metadata.preflight: true`) on `message/send` rather than a new method. Smaller protocol blast radius, no SDK bump, no documentation rewrite. Reviewers can override in Phase 2 review and we'll refactor — the autonomous-agents preflight client is the only consumer so the cost of switching is small.
+- **OQ-3**: `task-author` sub-agent prompt config will live at `prompt_config.task_author_agent.yaml` per existing convention (decision recorded for Phase 3).
 
 ---
 
-## Phase 2 — UI rendering of per-task thread (Queued)
+## Phase 2 — UI rendering of per-task thread (Done)
 
-**Branch (planned)**: `prebuild/feat/autonomous-agents-thread-ui`
-**Touches**: `ui/`
-**Feature flag**: `NEXT_PUBLIC_AUTONOMOUS_THREAD_VIEW` (default on)
+**Commit**: `07b0f739`.
+**Tests**: 12/12 UI Jest tests passing (3 existing + 9 new for TaskList).
 
-Renders the data structures Phase 1 produces:
+What landed:
 
-- "Ack OK / Ack failed / Ack pending" badge per task row (FR-003)
-- Click row → opens the per-task chat thread with all `metadata.kind` message types rendered with type-specific affordances (FR-007)
-- Live "next run at HH:MM UTC" indicator with absolute + relative timestamps (FR-010, FR-011, FR-012)
-- Polling at 30 s (configurable via env) — push (SSE/WS) deferred per OQ-2
+- **Per-row Ack badge** mapping `Acknowledgement.ack_status` to colour-coded label + icon (green check for "ok", yellow triangle for "warn", red x for "failed", grey spinner for "pending"|absent). Tooltip carries `ack_detail` and `dry_run_summary` so operators see the cause without opening the chat thread (FR-003).
+- **Thread deep-link button** to `/chat/<chat_conversation_id>` opened in a new tab. The `chat_conversation_id` is server-derived (UUIDv5, exposed on the task wire) so the link works even before the first run has fired (FR-006 / Story 2).
+- **Better next-run rendering**: absolute timestamp + relative hint (`"in 4h"` / `"5m ago"`). Tooltip carries the full ISO8601 timestamp for precise inspection (FR-010 / FR-012).
+- **30-second silent polling** of `/api/autonomous/api/v1/tasks` so the badge updates after a background preflight resolves and the next-run countdown stays accurate without manual refresh. Polling failures are silent — UI keeps the last successful task list visible. Push (SSE/WS) deferred per OQ-2 (FR-011).
+
+Deferred to a future Phase 2.5 if dogfood demands:
+
+- **Custom thread view** with kind-aware rendering for each `metadata.kind` message type. Today the existing `/chat/[id]` route renders the messages as a normal conversation; the new typed messages still display correctly because they're still `role: 'user'|'assistant'` rows with sensible content. The UI just doesn't yet know to render the `preflight_ack` payload as a structured card vs. a text bubble. Trivial follow-up; not needed for the testable end-product the operator asked for.
 
 ---
 
