@@ -12,10 +12,36 @@ without changing the outcome.
 The retry policy is configurable via ``Settings.a2a_max_retries`` and
 ``Settings.a2a_timeout_seconds``, with optional per-call overrides supplied
 by the scheduler (``TaskDefinition.max_retries`` / ``timeout_seconds``).
+
+Agent routing hint (IMP-06)
+---------------------------
+The autonomous-tasks UI lets the operator pick a target sub-agent (e.g.
+``github``, ``argocd``) per task. We surface that choice to the supervisor
+two ways and intentionally so:
+
+1. **In-band prompt directive** — when ``agent`` is set we prepend a short,
+   clearly-demarcated ``[Routing directive: ...]`` line to the prompt. The
+   supervisor today is a Deep Agent whose router is an LLM that reads the
+   prompt text -- it does **not** read ``message.metadata.agent``. The
+   directive is the only way to actually pin routing today, otherwise the
+   UI agent-picker is purely cosmetic. The directive is permissive
+   (``unless the request cannot be fulfilled``) so a misconfigured task
+   name degrades gracefully into normal LLM routing instead of hard-
+   failing.
+
+2. **Out-of-band metadata** — we still send ``metadata.agent`` and
+   ``metadata.llm_provider`` on the A2A message even though the supervisor
+   ignores them today. They cost nothing on the wire and are already in
+   place for a future supervisor change that adds structured fast-path
+   routing (would skip the LLM router round-trip entirely).
+
+Investigation that led to this design is captured in
+``IMPROVEMENTS.md`` -> IMP-06.
 """
 
 import json
 import logging
+import re
 import uuid
 from typing import Any
 
@@ -37,7 +63,116 @@ from autonomous_agents.services.circuit_breaker import (
 
 logger = logging.getLogger("autonomous_agents")
 
-__all__ = ["invoke_agent", "CircuitBreakerOpenError"]
+__all__ = ["invoke_agent", "CircuitBreakerOpenError", "build_prompt_with_routing"]
+
+
+# Allow-list of characters permitted in a sub-agent identifier for the
+# purposes of the in-band routing directive. Real agent ids in CAIPE are
+# things like ``github``, ``argo-cd``, ``aws_bedrock``; alphanumerics
+# plus ``-``, ``_``, ``.`` covers every existing case while making it
+# impossible for a malicious or buggy task definition to inject prose,
+# newlines, brackets, or backticks into the directive text. Anything
+# outside the allow-list is dropped (rather than escaped) so the
+# directive stays human-readable in supervisor logs.
+_AGENT_HINT_ALLOWED = re.compile(r"[^A-Za-z0-9._-]")
+
+# Hard cap on the resulting hint length. Prevents a pathological
+# config (e.g. a 100KB string in the agent field) from inflating every
+# outbound prompt and -- worse -- from drowning the actual user prompt
+# behind boilerplate. 64 chars is generous: the longest CAIPE agent id
+# in use is ``rag-knowledge-bases`` at 19 chars.
+_AGENT_HINT_MAX_LEN = 64
+
+
+def _normalize_agent_hint(agent: str | None) -> str:
+    """Return a routing-safe version of ``agent`` for use everywhere.
+
+    Single source of truth for "what counts as a usable agent hint":
+    ``build_prompt_with_routing`` calls this for the directive AND
+    ``invoke_agent`` calls it for ``message.metadata.agent`` so the two
+    can never disagree (Copilot review on PR #13). The empty-string
+    return value is the unambiguous "no hint" signal.
+
+    Steps:
+        1. ``None`` or non-str -> ``""``.
+        2. Strip leading/trailing whitespace.
+        3. Drop any character outside ``[A-Za-z0-9._-]``. This both
+           normalises operator typos (``"GitHub "`` -> ``"GitHub"``)
+           and neutralises prompt-injection attempts that try to smuggle
+           newlines, backticks, or ``]`` into the directive text.
+        4. Truncate to ``_AGENT_HINT_MAX_LEN`` chars.
+    """
+    if not isinstance(agent, str):
+        return ""
+    cleaned = _AGENT_HINT_ALLOWED.sub("", agent.strip())
+    return cleaned[:_AGENT_HINT_MAX_LEN]
+
+
+def build_prompt_with_routing(
+    prompt: str,
+    *,
+    agent: str | None,
+    context: dict[str, Any] | None = None,
+) -> str:
+    """Compose the final text payload sent to the supervisor.
+
+    Layout, in order:
+
+        [Routing directive: ...]   (only if ``agent`` is set)
+        <prompt>
+        Context:                   (only if ``context`` is non-empty)
+        <pretty-printed JSON>
+
+    The routing directive is the IMP-06 mitigation: the supervisor LLM
+    reads it as part of the user message and treats it as an operator
+    instruction to delegate to that sub-agent. Without this, the UI's
+    agent-picker is decorative -- the supervisor doesn't read
+    ``message.metadata.agent`` and would pick a sub-agent purely from
+    the prompt text.
+
+    The directive is intentionally permissive ("unless the request
+    cannot be fulfilled by that sub-agent") so a typo in the agent
+    name -- or a prompt that genuinely needs a different sub-agent --
+    degrades into normal routing instead of a hard failure. That
+    matches the behaviour operators expect from a hint, not a hard
+    constraint.
+
+    Edge cases:
+        * ``agent`` is None, empty/whitespace, or contains *only*
+          characters outside the identifier allow-list -> no directive
+          (some tasks intentionally let the LLM route).
+        * ``context`` is None or empty -> no Context block.
+        * Both empty -> returns ``prompt`` unchanged so this remains a
+          drop-in for callers that don't care about routing.
+
+    Sanitisation: the agent identifier is constrained to
+    ``[A-Za-z0-9._-]`` via ``_normalize_agent_hint`` before
+    interpolation. This keeps a malicious or typo'd agent name (e.g.
+    one containing newlines, backticks, or ``]``) from breaking out of
+    the directive and injecting additional instructions into the
+    supervisor prompt. See the helper for details.
+    """
+    parts: list[str] = []
+
+    agent_clean = _normalize_agent_hint(agent)
+    if agent_clean:
+        # Backticks help the supervisor parser distinguish the sub-agent
+        # identifier from prose. The "unless cannot be fulfilled" escape
+        # hatch keeps a misconfigured task graceful. ``agent_clean`` is
+        # already restricted to a safe character class so the f-string
+        # cannot be used to break out of the directive.
+        parts.append(
+            f"[Routing directive: This task is targeted at the `{agent_clean}` "
+            f"sub-agent. Delegate to that sub-agent unless the request cannot "
+            f"be fulfilled by it.]"
+        )
+
+    parts.append(prompt)
+
+    if context:
+        parts.append(f"Context:\n{json.dumps(context, indent=2)}")
+
+    return "\n\n".join(parts)
 
 
 def _is_retryable_exception(exc: BaseException) -> bool:
@@ -114,15 +249,29 @@ async def invoke_agent(
     effective_timeout = timeout_seconds if timeout_seconds is not None else settings.a2a_timeout_seconds
     effective_max_retries = max_retries if max_retries is not None else settings.a2a_max_retries
 
-    # Augment prompt with any extra context (e.g. webhook payload)
-    full_prompt = prompt
-    if context:
-        full_prompt = f"{prompt}\n\nContext:\n{json.dumps(context, indent=2)}"
+    # IMP-06: prepend the in-band routing directive when an agent hint
+    # was supplied, then append any context block. See
+    # ``build_prompt_with_routing`` for the rationale -- short version:
+    # the supervisor LLM router does not read ``message.metadata.agent``,
+    # so without this directive the UI's agent-picker is cosmetic.
+    full_prompt = build_prompt_with_routing(prompt, agent=agent, context=context)
 
-    # Build metadata for routing — pass agent name and LLM provider to supervisor
+    # Normalise once and reuse for metadata so the directive (above)
+    # and the structured metadata (below) cannot disagree on what the
+    # operator asked for. Whitespace-only or all-junk agent values
+    # produce an empty hint, in which case we omit ``metadata.agent``
+    # entirely rather than send a misleading whitespace value
+    # (Copilot review on PR #13).
+    agent_hint = _normalize_agent_hint(agent)
+
+    # We still attach the structured metadata. The supervisor ignores
+    # ``agent`` / ``llm_provider`` keys today (only ``user_id`` /
+    # ``user_email`` are honoured) but sending them costs nothing and
+    # keeps us forward-compat with a future supervisor change that
+    # adds structured fast-path routing.
     metadata: dict[str, Any] = {}
-    if agent:
-        metadata["agent"] = agent
+    if agent_hint:
+        metadata["agent"] = agent_hint
     effective_llm = llm_provider or settings.llm_provider
     if effective_llm:
         metadata["llm_provider"] = effective_llm
@@ -151,7 +300,8 @@ async def invoke_agent(
 
     logger.info(
         f"Invoking supervisor at {settings.supervisor_url} for task '{task_id}' "
-        f"(agent={agent!r}, llm_provider={effective_llm!r}, "
+        f"(agent_hint={agent_hint!r}, raw_agent={agent!r}, "
+        f"llm_provider={effective_llm!r}, "
         f"timeout={effective_timeout}s, max_retries={effective_max_retries})"
     )
 
