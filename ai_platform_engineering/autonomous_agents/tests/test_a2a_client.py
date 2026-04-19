@@ -24,6 +24,7 @@ import pytest
 
 from autonomous_agents.config import Settings, get_settings
 from autonomous_agents.services import a2a_client
+from autonomous_agents.services import circuit_breaker as cb_mod
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -75,10 +76,25 @@ def _fast_retries():
         a2a_retry_backoff_max_seconds=0.001,
         a2a_max_retries=3,
         a2a_timeout_seconds=10.0,
+        # IMP-16: keep the breaker high so the existing retry tests
+        # never trip it. Dedicated breaker tests build their own
+        # CircuitBreaker instance with tighter thresholds.
+        circuit_breaker_failure_threshold=1000,
     )
-    with patch.object(a2a_client, "get_settings", return_value=fast):
+    # Drop the cached singleton so the breaker is rebuilt with these
+    # (test-only) settings on the next ``get_circuit_breaker()`` call.
+    # We must patch ``cb_mod.get_settings`` too, not just
+    # ``a2a_client.get_settings``: the breaker singleton reads its
+    # config from the binding inside ``circuit_breaker``, which is a
+    # separate import. (Caught by Copilot review on PR #9.)
+    cb_mod.reset_circuit_breaker()
+    with (
+        patch.object(a2a_client, "get_settings", return_value=fast),
+        patch.object(cb_mod, "get_settings", return_value=fast),
+    ):
         yield fast
     get_settings.cache_clear()
+    cb_mod.reset_circuit_breaker()
 
 
 # ---------------------------------------------------------------------------
