@@ -54,10 +54,13 @@ class Settings(BaseSettings):
     )
     @classmethod
     def _reject_nonfinite(cls, v: float) -> float:
-        # Pydantic happily accepts inf/nan from env vars cast to float.
-        # Both would break httpx and tenacity respectively.
+        # Pydantic happily accepts inf/nan from env vars cast to float;
+        # both would silently break httpx (timeout) or tenacity (wait).
+        # Sign / non-negative bounds are enforced separately by the
+        # per-field ``gt=0`` / ``ge=0`` constraints — this validator is
+        # *only* responsible for the finiteness check.
         if v != v or v in (float("inf"), float("-inf")):
-            raise ValueError("must be a finite positive number")
+            raise ValueError("must be a finite number")
         return v
 
     # Path to the YAML file that defines scheduled tasks
