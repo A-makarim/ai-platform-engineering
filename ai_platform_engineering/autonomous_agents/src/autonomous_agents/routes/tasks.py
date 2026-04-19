@@ -3,7 +3,7 @@
 from fastapi import APIRouter, HTTPException
 
 from autonomous_agents.models import TaskDefinition, TaskRun
-from autonomous_agents.scheduler import _execute_task, get_run_store, get_scheduler
+from autonomous_agents.scheduler import execute_task, get_run_store, get_scheduler
 
 router = APIRouter(tags=["tasks"])
 
@@ -70,7 +70,7 @@ async def trigger_task_manually(task_id: str) -> dict:
         raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
 
     import asyncio
-    asyncio.create_task(_execute_task(task))
+    asyncio.create_task(execute_task(task))
     return {"status": "triggered", "task_id": task_id}
 
 

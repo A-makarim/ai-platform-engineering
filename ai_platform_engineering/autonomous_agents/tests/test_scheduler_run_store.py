@@ -3,7 +3,7 @@
 
 """Integration tests for the scheduler <-> RunStore wiring.
 
-These tests exercise the public effect: when ``_execute_task`` runs to
+These tests exercise the public effect: when ``execute_task`` runs to
 completion (success or failure), the configured ``RunStore`` ends up
 holding a single, terminal-state ``TaskRun`` with the run_id returned
 by the call.
@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from autonomous_agents.models import CronTrigger, TaskDefinition, TaskStatus
-from autonomous_agents.scheduler import _execute_task, get_run_store, set_run_store
+from autonomous_agents.scheduler import execute_task, get_run_store, set_run_store
 from autonomous_agents.services.run_store import InMemoryRunStore
 
 
@@ -73,7 +73,7 @@ async def test_execute_task_records_running_then_success(store: InMemoryRunStore
         "autonomous_agents.scheduler.invoke_agent",
         new=AsyncMock(return_value="hello world"),
     ):
-        run = await _execute_task(task)
+        run = await execute_task(task)
 
     assert run.status == TaskStatus.SUCCESS
     assert run.response_preview == "hello world"
@@ -92,7 +92,7 @@ async def test_execute_task_records_failure_with_error_message(store: InMemoryRu
         "autonomous_agents.scheduler.invoke_agent",
         new=AsyncMock(side_effect=RuntimeError("boom")),
     ):
-        run = await _execute_task(task)
+        run = await execute_task(task)
 
     assert run.status == TaskStatus.FAILED
 
@@ -120,7 +120,7 @@ async def test_running_state_is_visible_before_completion(store: InMemoryRunStor
         return "done"
 
     with patch("autonomous_agents.scheduler.invoke_agent", new=AsyncMock(side_effect=slow_agent)):
-        await _execute_task(task)
+        await execute_task(task)
 
     assert snapshot == [TaskStatus.RUNNING]
     runs = await store.list_all()
@@ -135,7 +135,7 @@ async def test_execute_task_returns_same_run_object_as_persisted(store: InMemory
         "autonomous_agents.scheduler.invoke_agent",
         new=AsyncMock(return_value="x"),
     ):
-        run = await _execute_task(task)
+        run = await execute_task(task)
 
     persisted = (await store.list_all())[0]
     assert persisted is run
@@ -165,7 +165,7 @@ class _FlakyStore:
 
 
 async def test_run_store_failure_does_not_abort_task(task: TaskDefinition, caplog):
-    """Regression: a broken RunStore must not bubble out of _execute_task.
+    """Regression: a broken RunStore must not bubble out of execute_task.
 
     Before this fix the very first ``await store.record(run)`` ran
     outside any try/except, so a transient Mongo failure would crash
@@ -178,7 +178,7 @@ async def test_run_store_failure_does_not_abort_task(task: TaskDefinition, caplo
         "autonomous_agents.scheduler.invoke_agent",
         new=AsyncMock(return_value="ok"),
     ):
-        run = await _execute_task(task)
+        run = await execute_task(task)
 
     assert run.status == TaskStatus.SUCCESS
     assert run.response_preview == "ok"
@@ -195,7 +195,7 @@ async def test_run_store_failure_is_logged_at_error_level(task: TaskDefinition, 
             "autonomous_agents.scheduler.invoke_agent",
             new=AsyncMock(return_value="ok"),
         ):
-            await _execute_task(task)
+            await execute_task(task)
 
     # Two record attempts (start + finish), both should have logged.
     assert flaky.record_calls == 2
@@ -216,7 +216,7 @@ async def test_run_store_failure_during_finalization_still_returns_completed_run
         "autonomous_agents.scheduler.invoke_agent",
         new=AsyncMock(return_value="hello"),
     ):
-        run = await _execute_task(task)
+        run = await execute_task(task)
 
     assert run.status == TaskStatus.SUCCESS
     assert run.response_preview == "hello"

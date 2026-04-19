@@ -1,10 +1,16 @@
-"""APScheduler setup — registers cron and interval tasks at startup."""
+"""APScheduler setup — registers cron and interval tasks at startup.
+
+Also exposes single-task ``register_task`` / ``unregister_task`` helpers so
+the CRUD endpoints can hot-reload the scheduler without bouncing the
+service.
+"""
 
 import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from apscheduler.jobstores.base import JobLookupError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger as APSCronTrigger
 from apscheduler.triggers.interval import IntervalTrigger as APSIntervalTrigger
@@ -70,8 +76,14 @@ async def _record_safely(store: RunStore, run: TaskRun) -> None:
         )
 
 
-async def _execute_task(task: TaskDefinition, context: dict[str, Any] | None = None) -> TaskRun:
-    """Run a single task, record the result, and return the TaskRun."""
+async def execute_task(task: TaskDefinition, context: dict[str, Any] | None = None) -> TaskRun:
+    """Run a single task, record the result, and return the TaskRun.
+
+    Public entry point used both by APScheduler (cron/interval) and by
+    the routes layer (manual trigger, webhook). Keeping this public is
+    intentional — it's part of the contract with the FastAPI handlers
+    that drive ad-hoc execution. Don't add a leading underscore back.
+    """
     run_id = str(uuid.uuid4())
     run = TaskRun(run_id=run_id, task_id=task.id, task_name=task.name, status=TaskStatus.RUNNING)
 
@@ -110,56 +122,99 @@ async def _execute_task(task: TaskDefinition, context: dict[str, Any] | None = N
     return run
 
 
-def register_tasks(tasks: list[TaskDefinition]) -> None:
-    """Register all cron and interval tasks with APScheduler.
+def register_task(task: TaskDefinition) -> None:
+    """Register a single cron / interval task with APScheduler.
 
-    Webhook tasks are handled by the /hooks router and do not need scheduling.
+    Idempotent: ``replace_existing=True`` means re-registering the same
+    ``task.id`` (e.g. on update via the CRUD API) atomically replaces
+    the prior job and any in-flight run completes against the new
+    definition only on its *next* trigger fire.
+
+    Webhook-only and disabled tasks are no-ops here — webhooks have
+    their own router-side registry, and disabled tasks must be silently
+    skipped so the operator can flip ``enabled=false`` from the UI
+    without restarting the service.
+    """
+    if not task.enabled:
+        logger.info(f"[{task.id}] Disabled — not scheduling")
+        return
+
+    trigger = task.trigger
+
+    if trigger.type == TriggerType.WEBHOOK:
+        logger.info(f"[{task.id}] Webhook task — handled by /hooks router, not APScheduler")
+        return
+
+    if trigger.type == TriggerType.CRON:
+        if not isinstance(trigger, CronTrigger):
+            logger.warning(f"[{task.id}] Expected CronTrigger, got {type(trigger).__name__} — skipping")
+            return
+        aps_trigger = APSCronTrigger.from_crontab(trigger.schedule, timezone="UTC")
+        logger.info(f"[{task.id}] Scheduling cron: {trigger.schedule}")
+
+    elif trigger.type == TriggerType.INTERVAL:
+        if not isinstance(trigger, IntervalTrigger):
+            logger.warning(f"[{task.id}] Expected IntervalTrigger, got {type(trigger).__name__} — skipping")
+            return
+        aps_trigger = APSIntervalTrigger(
+            seconds=trigger.seconds or 0,
+            minutes=trigger.minutes or 0,
+            hours=trigger.hours or 0,
+        )
+        logger.info(f"[{task.id}] Scheduling interval: {trigger.seconds}s / {trigger.minutes}m / {trigger.hours}h")
+
+    else:
+        logger.warning(f"[{task.id}] Unknown trigger type '{trigger.type}' — skipping")
+        return
+
+    get_scheduler().add_job(
+        execute_task,
+        trigger=aps_trigger,
+        args=[task],
+        id=task.id,
+        name=task.name,
+        replace_existing=True,
+        misfire_grace_time=60,
+    )
+
+
+def unregister_task(task_id: str) -> bool:
+    """Remove ``task_id`` from APScheduler if present.
+
+    Returns ``True`` if a job was removed, ``False`` if no such job
+    existed (e.g. a webhook-only task, a disabled task that was never
+    scheduled, or a stale id from a duplicate UI delete). Returning a
+    bool instead of raising lets the CRUD endpoint be idempotent
+    without an extra "does it exist?" round-trip.
     """
     scheduler = get_scheduler()
+    try:
+        scheduler.remove_job(task_id)
+        logger.info(f"[{task_id}] Removed from scheduler")
+        return True
+    except JobLookupError:
+        # Not an error: webhook tasks and disabled tasks are never
+        # added, so a "missing" job on delete is the common case.
+        return False
 
+
+def register_tasks(tasks: list[TaskDefinition]) -> None:
+    """Bulk-register all cron and interval tasks, then start the scheduler.
+
+    Called once from the FastAPI lifespan with the YAML-seeded task
+    list. Subsequent CRUD-driven changes go through
+    :func:`register_task` / :func:`unregister_task` directly so the
+    scheduler is never restarted at runtime.
+    """
     for task in tasks:
-        trigger = task.trigger
+        register_task(task)
 
-        if trigger.type == TriggerType.WEBHOOK:
-            logger.info(f"[{task.id}] Webhook task — will fire on POST /hooks/{task.id}")
-            continue
-
-        if trigger.type == TriggerType.CRON:
-            if not isinstance(trigger, CronTrigger):
-                logger.warning(f"[{task.id}] Expected CronTrigger, got {type(trigger).__name__} — skipping")
-                continue
-            aps_trigger = APSCronTrigger.from_crontab(trigger.schedule, timezone="UTC")
-            logger.info(f"[{task.id}] Scheduling cron: {trigger.schedule}")
-
-        elif trigger.type == TriggerType.INTERVAL:
-            if not isinstance(trigger, IntervalTrigger):
-                logger.warning(f"[{task.id}] Expected IntervalTrigger, got {type(trigger).__name__} — skipping")
-                continue
-            aps_trigger = APSIntervalTrigger(
-                seconds=trigger.seconds or 0,
-                minutes=trigger.minutes or 0,
-                hours=trigger.hours or 0,
-            )
-            logger.info(f"[{task.id}] Scheduling interval: {trigger.seconds}s / {trigger.minutes}m / {trigger.hours}h")
-
-        else:
-            logger.warning(f"[{task.id}] Unknown trigger type '{trigger.type}' — skipping")
-            continue
-
-        scheduler.add_job(
-            _execute_task,
-            trigger=aps_trigger,
-            args=[task],
-            id=task.id,
-            name=task.name,
-            replace_existing=True,
-            misfire_grace_time=60,
-        )
-
-    scheduler.start()
+    scheduler = get_scheduler()
+    if not scheduler.running:
+        scheduler.start()
     logger.info(f"Scheduler started with {len(scheduler.get_jobs())} job(s)")
 
 
 async def fire_webhook_task(task: TaskDefinition, context: dict[str, Any]) -> TaskRun:
     """Immediately execute a webhook-triggered task and return the completed run."""
-    return await _execute_task(task, context=context)
+    return await execute_task(task, context=context)
