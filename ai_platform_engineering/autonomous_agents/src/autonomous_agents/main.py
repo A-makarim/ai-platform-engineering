@@ -98,7 +98,21 @@ async def lifespan(app: FastAPI):
         messages_collection=settings.chat_history_messages_collection,
     )
     if isinstance(chat_publisher, MongoChatHistoryPublisher):
-        await chat_publisher.ensure_indexes()
+        # Best-effort index creation: a transient chat-DB outage or a
+        # missing ``createIndex`` permission must NOT take down the
+        # autonomous service (chat-history publishing is observability,
+        # not source-of-truth -- same contract as ``_publish_safely``
+        # in the scheduler). PR #10 Codex P1 review.
+        try:
+            await chat_publisher.ensure_indexes()
+        except Exception as exc:
+            logger.error(
+                "ChatHistoryPublisher: ensure_indexes() failed (%s) -- "
+                "continuing without dedicated chat-history indexes; "
+                "queries will still work but may be slower until the "
+                "operator creates the indexes manually.",
+                exc,
+            )
         logger.info(
             "ChatHistoryPublisher: MongoDB (database=%s, owner=%s)",
             settings.chat_history_database or settings.mongodb_database,

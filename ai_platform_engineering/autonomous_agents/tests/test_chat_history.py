@@ -310,6 +310,66 @@ async def test_publish_run_is_idempotent_across_status_transitions(
     assert assistant["metadata"]["is_final"] is True
 
 
+async def test_re_publish_preserves_original_created_at_and_bumps_updated_at(
+    publisher: MongoChatHistoryPublisher,
+):
+    """When a run transitions RUNNING -> SUCCESS the publisher
+    re-upserts both messages. The UI sorts the thread by
+    ``created_at``, so overwriting it would reorder rows on every
+    retry (PR #10 Copilot review). ``created_at`` is pinned in
+    ``$setOnInsert``; ``updated_at`` tracks the latest publish.
+    """
+    run = _make_run(status=TaskStatus.RUNNING, response_preview=None, error=None)
+    await publisher.publish_run(
+        run, prompt="hello", response=None, error=None, agent="github"
+    )
+    first = await publisher._messages.find_one({"role": "assistant"})
+    original_created_at = first["created_at"]
+
+    # Same run id, terminal state, fresh wall clock.
+    run.status = TaskStatus.SUCCESS
+    run.response_preview = "world"
+    await publisher.publish_run(
+        run, prompt="hello", response="world", error=None, agent="github"
+    )
+    second = await publisher._messages.find_one({"role": "assistant"})
+
+    assert second["created_at"] == original_created_at
+    # Content reflects the terminal state; sort key did NOT shift.
+    assert second["content"] == "world"
+    # ``updated_at`` is set on every publish so operators can spot
+    # the latest attempt without losing the original timestamp.
+    assert "updated_at" in second
+    assert second["updated_at"] >= original_created_at
+
+
+async def test_message_upsert_filter_includes_conversation_id(
+    publisher: MongoChatHistoryPublisher,
+):
+    """Two runs that *somehow* generated the same ``message_id``
+    suffix (different run-id namespaces, schema migration, etc.)
+    must NOT cross-write into each other. The filter is keyed on
+    ``(conversation_id, message_id)`` -- PR #10 Copilot review."""
+    run_a = _make_run(run_id="ra")
+    run_b = _make_run(run_id="rb")
+
+    await publisher.publish_run(
+        run_a, prompt="prompt-a", response="resp-a", error=None, agent="github"
+    )
+    await publisher.publish_run(
+        run_b, prompt="prompt-b", response="resp-b", error=None, agent="github"
+    )
+
+    # Two distinct conversations, two distinct message pairs.
+    convs = [doc async for doc in publisher._conversations.find({})]
+    msgs = [doc async for doc in publisher._messages.find({})]
+    assert len(convs) == 2
+    assert len(msgs) == 4
+    # No row was overwritten across conversations.
+    contents = sorted(m["content"] for m in msgs)
+    assert contents == ["prompt-a", "prompt-b", "resp-a", "resp-b"]
+
+
 async def test_publish_uses_explicit_conversation_id_when_provided(
     publisher: MongoChatHistoryPublisher,
 ):
@@ -350,7 +410,12 @@ async def test_ensure_indexes_creates_filter_and_deeplink_indexes(
 
     msg_info = await publisher._messages.index_information()
     msg_keys = {tuple(idx["key"]) for idx in msg_info.values()}
-    assert (("message_id", 1),) in msg_keys
+    # Compound (conversation_id, message_id) -- mirrors the UI's
+    # message upsert key shape (see PR #10 Copilot review). NOT a
+    # unique index on ``message_id`` alone, because the same
+    # client-generated message id may legitimately appear in
+    # different conversations.
+    assert (("conversation_id", 1), ("message_id", 1)) in msg_keys
 
 
 async def test_ensure_indexes_is_idempotent(publisher: MongoChatHistoryPublisher):

@@ -155,6 +155,7 @@ tasks:
 | `CHAT_HISTORY_DATABASE` | `None` | Optional override of the chat database name when the UI's chat data lives in a different database than `MONGODB_DATABASE`. |
 | `CHAT_HISTORY_CONVERSATIONS_COLLECTION` | `conversations` | Collection that the UI sidebar reads. |
 | `CHAT_HISTORY_MESSAGES_COLLECTION` | `messages` | Collection that the UI message panel reads. |
+| `CHAT_HISTORY_INCLUDE_CONTEXT` | `false` | When `true`, inlines raw webhook context payloads into the published prompt. **Default off** because autonomous chat rows are read-accessible to all authenticated UI users (audit visibility); inlining payloads risks leaking customer/internal data. With this off, the published prompt records `Context: <redacted N keys>` so debugging "did the webhook fire?" is still possible. |
 
 ---
 
@@ -211,16 +212,21 @@ configured), every autonomous run is **mirrored** into those collections
 as it completes. The sidebar then has a chip to flip between *human*
 chats and *autonomous* runs without a separate page.
 
-| Document | Collection | `_id` strategy | Notes |
+| Document | Collection | Deterministic key | Notes |
 |---|---|---|---|
-| Conversation (1 per run) | `CHAT_HISTORY_CONVERSATIONS_COLLECTION` (default `conversations`) | `uuid5(run_id)` — deterministic UUID, satisfies the UI route validator | `source: "autonomous"`, `task_id`, `run_id` set; `owner_id = CHAT_HISTORY_OWNER_EMAIL` |
-| User message | `CHAT_HISTORY_MESSAGES_COLLECTION` (default `messages`) | `f"autorun-{run_id}-user"` | Reconstructed prompt actually sent to the supervisor (includes any context block / webhook payload) |
-| Assistant message | same | `f"autorun-{run_id}-assistant"` | Final response on success, the error message on failure, a placeholder while the run is still `RUNNING` |
+| Conversation (1 per run) | `CHAT_HISTORY_CONVERSATIONS_COLLECTION` (default `conversations`) | `_id = uuid5(run_id)` — deterministic UUID, satisfies the UI route validator | `source: "autonomous"`, `task_id`, `run_id` set; `owner_id = CHAT_HISTORY_OWNER_EMAIL` |
+| User message | `CHAT_HISTORY_MESSAGES_COLLECTION` (default `messages`) | `message_id = f"{run_id}-user"` | Reconstructed prompt sent to the supervisor. Webhook context is **redacted** by default (`Context: <redacted N keys>`) — set `CHAT_HISTORY_INCLUDE_CONTEXT=true` to inline the raw payload. Mongo `_id` stays as the default `ObjectId`. |
+| Assistant message | same | `message_id = f"{run_id}-assistant"` | Final response on success, the error message on failure, a placeholder while the run is still `RUNNING`. Mongo `_id` stays as the default `ObjectId`. |
 
-All three writes are upserts keyed on the deterministic IDs, so the
-publisher is **idempotent** across status transitions (e.g. when a run
-moves from `RUNNING` to `SUCCESS` the same documents are updated in
-place — no duplicates).
+The conversation write is an upsert keyed on the deterministic `_id`;
+the message writes are upserts keyed on `(conversation_id, message_id)`
+(matching the UI's own message upsert shape in
+`ui/src/app/api/chat/conversations/[id]/messages/route.ts`). The
+publisher is therefore **idempotent** across status transitions: when a
+run moves from `RUNNING` to `SUCCESS` the same documents are updated in
+place — no duplicates. The original `created_at` is pinned in
+`$setOnInsert` so the UI's chronological sort is stable across retries
+(a separate `updated_at` field tracks the last publish attempt).
 
 The publisher is wired into `_publish_safely`, which mirrors
 `_record_safely`: any exception inside the publisher is logged at

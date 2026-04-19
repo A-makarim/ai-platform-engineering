@@ -80,7 +80,16 @@ export const GET = withErrorHandler(async (request: NextRequest) => {
 
       if (sourceFilter === 'web') {
         // Tighten further when the caller wants pure web-only.
-        query.source = 'web';
+        // Conversations created via the existing POST handler do NOT
+        // currently set a ``source`` field, so a strict
+        // ``source: 'web'`` match would silently hide every legacy /
+        // freshly-created human chat. Treat missing/null as 'web'.
+        query.source = {
+          $in: ['web', null],
+        } as { $in: (string | null)[] };
+        // Mongo's ``$in`` with ``null`` matches both explicit nulls
+        // and missing fields, so legacy and new web conversations
+        // both come through.
       }
     }
 

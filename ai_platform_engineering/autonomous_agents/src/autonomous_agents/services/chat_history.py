@@ -73,10 +73,13 @@ class ChatHistoryPublisher(Protocol):
     """Async publisher contract -- one method, no return value.
 
     Implementations MUST be safe to call concurrently from the
-    scheduler event loop and MUST NOT raise on transient store
-    failures (caller wraps in :func:`publish_safely`, but raising
-    inside the implementation makes that wrapper noisier than
-    necessary).
+    scheduler event loop. They MAY raise on transient store failures
+    (e.g. ``MongoChatHistoryPublisher`` lets the underlying motor
+    exception propagate so operators see the real cause); the
+    scheduler always wraps the call in
+    ``scheduler._publish_safely`` which catches and logs, so a
+    raising implementation never aborts task execution. Implementing
+    swallow-and-log inside the publisher is allowed but not required.
     """
 
     async def publish_run(
@@ -180,13 +183,17 @@ class MongoChatHistoryPublisher:
             unique=True,
             sparse=True,
         )
-        # Message lookup by client-generated id -- same shape as the
-        # UI's POST /messages route uses for upserts. Sparse for the
-        # same reason as run_id above.
+        # Message lookup follows the UI's upsert key shape:
+        # ``(conversation_id, message_id)`` (see the UI's
+        # ``/api/chat/conversations/[id]/messages/route.ts``). We do
+        # NOT enforce global uniqueness on ``message_id`` alone --
+        # the same client-generated message id may legitimately appear
+        # in different conversations, and a unique index would either
+        # fail to build on existing data or break the UI's normal
+        # writes once enabled. Compound + non-unique gives us the
+        # query coverage we need without those failure modes.
         await self._messages.create_index(
-            [("message_id", 1)],
-            unique=True,
-            sparse=True,
+            [("conversation_id", 1), ("message_id", 1)],
         )
 
     async def publish_run(
@@ -303,14 +310,22 @@ class MongoChatHistoryPublisher:
         # assistant) pair. Using ``run_id`` makes both messages share
         # a turn so the UI's debug panel groups them correctly.
         turn_id = f"autonomous-{run.run_id}"
+        # Filter by ``(conversation_id, message_id)`` to mirror the
+        # UI's POST upsert shape. Filtering on ``message_id`` alone
+        # would risk hitting a row from a different conversation if
+        # the run-id collision space ever changes.
         await self._messages.update_one(
-            {"message_id": message_id},
+            {"conversation_id": conversation_id, "message_id": message_id},
             {
                 "$set": {
-                    "conversation_id": conversation_id,
+                    # ``content`` and ``is_final`` flip across the
+                    # RUNNING -> SUCCESS|FAILED transition (e.g. the
+                    # placeholder turns into the final response). We
+                    # also bump ``updated_at`` so operators can spot
+                    # the last publish attempt.
                     "role": role,
                     "content": content,
-                    "created_at": created_at,
+                    "updated_at": created_at,
                     "metadata": {
                         "turn_id": turn_id,
                         # Marks the row as autonomous-origin so analytics
@@ -323,8 +338,14 @@ class MongoChatHistoryPublisher:
                     },
                 },
                 "$setOnInsert": {
+                    # Pin immutables on first insert so a re-publish
+                    # never overwrites the original ``created_at`` --
+                    # the UI sorts the thread by ``created_at`` and
+                    # would otherwise reorder rows on every retry.
+                    "conversation_id": conversation_id,
                     "message_id": message_id,
                     "owner_id": self._owner_email,
+                    "created_at": created_at,
                 },
             },
             upsert=True,

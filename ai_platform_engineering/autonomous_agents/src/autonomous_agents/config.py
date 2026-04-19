@@ -205,6 +205,22 @@ class Settings(BaseSettings):
     chat_history_conversations_collection: str = "conversations"
     chat_history_messages_collection: str = "messages"
 
+    # Webhook-context redaction switch (default OFF).
+    # The autonomous agent's published prompt could otherwise contain
+    # the entire raw webhook payload (e.g. a GitHub PR body, a
+    # PagerDuty incident JSON) which the UI then renders to *any*
+    # authenticated viewer, because chat-history rows tagged
+    # ``source: 'autonomous'`` are read-accessible to all logged-in
+    # users for audit visibility (see ``requireConversationAccess``).
+    # Defaulting to OFF means an operator must opt in deliberately
+    # before potentially-sensitive webhook bodies are mirrored into
+    # broad-readable chat. With this off, the published prompt is
+    # the bare ``task.prompt`` plus an opaque
+    # ``Context: <redacted N keys>`` marker so debugging "did the
+    # webhook fire?" is still possible without exposing payload
+    # contents.
+    chat_history_include_context: bool = False
+
 
 @lru_cache
 def get_settings() -> Settings:

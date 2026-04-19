@@ -105,8 +105,9 @@ async def _record_safely(store: RunStore, run: TaskRun) -> None:
 async def _publish_safely(
     publisher: ChatHistoryPublisher,
     run: TaskRun,
+    task: TaskDefinition,
+    context: dict[str, Any] | None,
     *,
-    prompt: str,
     response: str | None,
     error: str | None,
     agent: str | None,
@@ -118,8 +119,15 @@ async def _publish_safely(
     A misconfigured or unavailable chat database must never propagate
     out and either abort the task or 500 the webhook that fired it.
     Log loudly, swallow the exception, return.
+
+    Note: prompt construction lives *inside* the try block on purpose
+    -- a non-JSON-serialisable webhook context would otherwise raise
+    out of ``execute_task``'s finally clause, contradicting the "chat
+    publishing must never abort a task" goal (Copilot review on PR
+    #10).
     """
     try:
+        prompt = _prompt_for_publish(task, context)
         await publisher.publish_run(
             run,
             prompt=prompt,
@@ -200,7 +208,8 @@ async def execute_task(task: TaskDefinition, context: dict[str, Any] | None = No
         await _publish_safely(
             get_chat_history_publisher(),
             run,
-            prompt=_prompt_for_publish(task, context),
+            task,
+            context,
             response=response_text,
             error=error_text,
             agent=task.agent,
@@ -222,12 +231,32 @@ def _prompt_for_publish(
     chat keeps the conversation honest -- otherwise a webhook-triggered
     run would look like the bare prompt fired with no context, and
     debugging "why did the agent do X?" becomes much harder.
+
+    Webhook payloads frequently contain internal/customer data
+    (incident bodies, PR descriptions, customer ids). The chat
+    history is read-accessible to *any* authenticated UI user via
+    ``requireConversationAccess`` (see PR #10 Codex P1 review), so
+    inlining the raw context into the published prompt would be a
+    data-exposure regression. We default to a redacted marker
+    (``Context: <redacted N keys>``) and only inline the payload
+    when the operator explicitly opts in via
+    ``CHAT_HISTORY_INCLUDE_CONTEXT=true``.
     """
     if not context:
         return task.prompt
+
+    from autonomous_agents.config import get_settings
+
+    if not get_settings().chat_history_include_context:
+        return f"{task.prompt}\n\nContext: <redacted {len(context)} keys>"
+
     import json as _json
 
-    return f"{task.prompt}\n\nContext:\n{_json.dumps(context, indent=2)}"
+    try:
+        rendered = _json.dumps(context, indent=2, default=str)
+    except (TypeError, ValueError):
+        rendered = f"<unserialisable context: {len(context)} keys>"
+    return f"{task.prompt}\n\nContext:\n{rendered}"
 
 
 def register_task(task: TaskDefinition) -> None:

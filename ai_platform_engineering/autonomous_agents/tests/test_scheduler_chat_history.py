@@ -189,15 +189,18 @@ async def test_conversation_id_is_set_on_taskrun_and_matches_derivation(
     assert persisted.conversation_id == run.conversation_id
 
 
-async def test_webhook_context_is_appended_to_published_prompt(
+async def test_webhook_context_is_redacted_in_published_prompt_by_default(
     store: InMemoryRunStore,
     publisher: _RecordingPublisher,
     task: TaskDefinition,
 ):
-    """When a webhook fires the task with a context payload, the
-    agent sees ``f"{prompt}\n\nContext:\n{json}"`` (see a2a_client).
-    The chat publisher must surface the same text -- otherwise
-    debugging "why did the agent do X?" loses the trigger payload."""
+    """By default, webhook payloads must NOT be inlined into the
+    published prompt. The chat-history rows are read-accessible to
+    all authenticated UI users (operator/audit visibility), so
+    surfacing raw webhook contents would be a data-exposure
+    regression (PR #10 Codex P1 review). Operators who explicitly
+    opt in via ``CHAT_HISTORY_INCLUDE_CONTEXT=true`` get the
+    inlined payload back -- see the companion test below."""
     with patch(
         "autonomous_agents.scheduler.invoke_agent",
         new=AsyncMock(return_value="ok"),
@@ -207,9 +210,70 @@ async def test_webhook_context_is_appended_to_published_prompt(
     assert len(publisher.calls) == 1
     prompt = publisher.calls[0]["prompt"]
     assert prompt.startswith("list open PRs")
-    assert "Context:" in prompt
-    assert "pull_request.opened" in prompt
-    assert "42" in prompt
+    # Marker is present so operators can still see "context fired".
+    assert "Context: <redacted" in prompt
+    # Raw payload is NOT inlined.
+    assert "pull_request.opened" not in prompt
+    assert "42" not in prompt
+
+
+async def test_webhook_context_is_inlined_when_opted_in(
+    store: InMemoryRunStore,
+    publisher: _RecordingPublisher,
+    task: TaskDefinition,
+    monkeypatch,
+):
+    """``CHAT_HISTORY_INCLUDE_CONTEXT=true`` brings back the
+    pre-redaction behavior for operators who have decided the data
+    in their webhook payloads is safe to surface broadly."""
+    from autonomous_agents.config import get_settings
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("CHAT_HISTORY_INCLUDE_CONTEXT", "true")
+    try:
+        with patch(
+            "autonomous_agents.scheduler.invoke_agent",
+            new=AsyncMock(return_value="ok"),
+        ):
+            await execute_task(
+                task,
+                context={"event": "pull_request.opened", "pr": 42},
+            )
+
+        prompt = publisher.calls[0]["prompt"]
+        assert prompt.startswith("list open PRs")
+        assert "Context:" in prompt
+        assert "pull_request.opened" in prompt
+        assert "42" in prompt
+    finally:
+        get_settings.cache_clear()
+
+
+async def test_unserialisable_context_does_not_abort_task(
+    store: InMemoryRunStore,
+    publisher: _RecordingPublisher,
+    task: TaskDefinition,
+    monkeypatch,
+):
+    """A non-JSON-serialisable webhook payload must not bubble out
+    of execute_task -- prompt construction lives inside
+    ``_publish_safely``'s try/except (PR #10 Copilot review)."""
+    from autonomous_agents.config import get_settings
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("CHAT_HISTORY_INCLUDE_CONTEXT", "true")
+    try:
+        # ``object()`` is a deliberate JSON-hostile sentinel.
+        weird_context = {"sentinel": object()}
+        with patch(
+            "autonomous_agents.scheduler.invoke_agent",
+            new=AsyncMock(return_value="ok"),
+        ):
+            run = await execute_task(task, context=weird_context)
+        # The task must still complete normally.
+        assert run.status == TaskStatus.SUCCESS
+    finally:
+        get_settings.cache_clear()
 
 
 # ---------------------------------------------------------------------------
