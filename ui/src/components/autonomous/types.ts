@@ -71,6 +71,14 @@ export interface TaskRun {
   finished_at?: string | null;
   response_preview?: string | null;
   error?: string | null;
+  /**
+   * Deterministic UUID derived from ``run_id`` by the autonomous
+   * service when chat-history publishing is enabled (IMP-13). Lets
+   * the run-row UI deep-link straight to ``/chat/<conversation_id>``.
+   * Null when chat publishing is disabled or when the run pre-dates
+   * the IMP-13 ship.
+   */
+  conversation_id?: string | null;
 }
 
 /**

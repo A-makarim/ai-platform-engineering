@@ -4,7 +4,8 @@
 "use client";
 
 import React, { useEffect, useState, useCallback, useRef } from "react";
-import { RefreshCw, ChevronDown, ChevronRight } from "lucide-react";
+import Link from "next/link";
+import { RefreshCw, ChevronDown, ChevronRight, MessageSquare } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -193,6 +194,32 @@ export function RunHistory({ taskId, refreshKey = 0 }: RunHistoryProps) {
                       {formatTimestamp(run.finished_at)}
                     </div>
                   </div>
+                  {run.conversation_id && (
+                    // IMP-13 wired conversation_id onto the run; this
+                    // closes the UX loop by giving operators a one-click
+                    // jump from a run row to the full prompt + response
+                    // thread in /chat/<id>. Hidden when the field is
+                    // absent (chat publishing disabled or pre-IMP-13
+                    // run) so the row stays tidy in those modes.
+                    <div className="flex justify-end">
+                      <Button
+                        asChild
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-7 gap-1.5 text-xs"
+                      >
+                        <Link
+                          href={`/chat/${run.conversation_id}`}
+                          aria-label={`Open run ${run.run_id} in chat`}
+                          data-testid="run-chat-link"
+                        >
+                          <MessageSquare className="h-3.5 w-3.5" />
+                          Open in chat
+                        </Link>
+                      </Button>
+                    </div>
+                  )}
                   {run.error && (
                     <div>
                       <div className="font-medium text-foreground mb-1">Error</div>
