@@ -89,6 +89,8 @@ async def _execute_task(task: TaskDefinition, context: dict[str, Any] | None = N
             agent=task.agent,
             llm_provider=task.llm_provider,
             context=context,
+            timeout_seconds=task.timeout_seconds,
+            max_retries=task.max_retries,
         )
         run.status = TaskStatus.SUCCESS
         run.response_preview = response[:500]
