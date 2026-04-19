@@ -29,7 +29,7 @@ from autonomous_agents.scheduler import (
     set_chat_history_publisher,
     set_run_store,
 )
-from autonomous_agents.services.chat_history import _conversation_id_for_run
+from autonomous_agents.services.chat_history import _conversation_id_for_task
 from autonomous_agents.services.run_store import InMemoryRunStore
 
 
@@ -176,7 +176,13 @@ async def test_conversation_id_is_set_on_taskrun_and_matches_derivation(
 ):
     """The UI deep-links from a run row to ``/chat/<conversation_id>``;
     that means the run record itself MUST carry the same id the
-    publisher wrote -- otherwise the link 404s."""
+    publisher wrote -- otherwise the link 404s.
+
+    Spec #099 FR-006 / AD-002: conversation_id is now per-TASK so multiple
+    runs of the same task share a single chat thread. The link target is
+    therefore ``_conversation_id_for_task(task.id)``, not the legacy
+    per-run derivation.
+    """
     with patch(
         "autonomous_agents.scheduler.invoke_agent",
         new=AsyncMock(return_value="ok"),
@@ -184,7 +190,7 @@ async def test_conversation_id_is_set_on_taskrun_and_matches_derivation(
         run = await execute_task(task)
 
     assert run.conversation_id is not None
-    assert run.conversation_id == _conversation_id_for_run(run.run_id)
+    assert run.conversation_id == _conversation_id_for_task(task.id)
     persisted = (await store.list_all())[0]
     assert persisted.conversation_id == run.conversation_id
 
