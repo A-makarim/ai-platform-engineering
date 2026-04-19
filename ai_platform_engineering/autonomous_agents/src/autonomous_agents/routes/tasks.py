@@ -27,6 +27,7 @@ from autonomous_agents.scheduler import (
     register_task,
     unregister_task,
 )
+from autonomous_agents.services.preflight import Acknowledgement, preflight
 from autonomous_agents.services.task_store import (
     InMemoryTaskStore,
     TaskAlreadyExistsError,
@@ -121,6 +122,17 @@ def _serialize_task(task: TaskDefinition, next_run_iso: str | None) -> dict:
     exact same structure -- otherwise the React side has to deal with
     "this field shows up on POST responses but not on GET" drift.
     """
+    # Render the persisted Acknowledgement (Pydantic model OR plain dict
+    # depending on which TaskStore backend is in use). The UI treats this
+    # as a discriminated record by ``ack_status``; missing means the
+    # preflight has not yet been attempted (e.g. in-flight after CREATE).
+    ack_dump: dict | None = None
+    raw_ack = getattr(task, "last_ack", None)
+    if isinstance(raw_ack, Acknowledgement):
+        ack_dump = raw_ack.model_dump(mode="json")
+    elif isinstance(raw_ack, dict):
+        ack_dump = raw_ack
+
     return {
         "id": task.id,
         "name": task.name,
@@ -133,7 +145,86 @@ def _serialize_task(task: TaskDefinition, next_run_iso: str | None) -> dict:
         "timeout_seconds": task.timeout_seconds,
         "max_retries": task.max_retries,
         "next_run": next_run_iso,
+        "last_ack": ack_dump,
     }
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight orchestration (spec #099, FR-001..005)
+# ---------------------------------------------------------------------------
+
+def _ack_relevant_changed(old: TaskDefinition | None, new: TaskDefinition) -> bool:
+    """Return True if a re-ack is warranted for a task update.
+
+    Re-ack on prompt / agent / llm_provider changes — those affect what
+    the supervisor would do at run time. Trigger / enabled / metadata
+    changes don't change routing or tool availability so we keep the
+    existing ack to avoid an unnecessary supervisor round-trip on every
+    enable/disable toggle.
+    """
+    if old is None:
+        return True
+    return (
+        old.prompt != new.prompt
+        or old.agent != new.agent
+        or old.llm_provider != new.llm_provider
+    )
+
+
+async def _run_preflight_and_persist(task_id: str) -> None:
+    """Background coroutine: call preflight and persist the result on the task.
+
+    Runs after CREATE / qualifying UPDATE so the user gets a fast 2xx
+    response and the badge updates async (~ tens of ms locally,
+    seconds against a slow supervisor). Failures NEVER raise out of
+    this coroutine — preflight() returns an ``Acknowledgement`` even
+    for transport errors and we persist whatever we got.
+    """
+    store = get_task_store()
+    task = await store.get(task_id)
+    if task is None:
+        # User deleted the task between CREATE and the background tick.
+        # Nothing to persist; nothing to log loudly.
+        return
+    try:
+        ack = await preflight(
+            task_id=task.id,
+            prompt=task.prompt,
+            agent=task.agent,
+            llm_provider=task.llm_provider,
+        )
+    except Exception:
+        # Defensive: preflight() is contractually no-raise but if a future
+        # code change regresses that we still don't want to nuke the task.
+        logger.exception("[%s] Preflight raised unexpectedly", task_id)
+        return
+
+    refreshed = await store.get(task_id)
+    if refreshed is None:
+        return
+    # Mutating + re-saving keeps the in-memory and Mongo backends in
+    # sync; the TaskStore.update path is the same one the CRUD routes
+    # use so trigger registration is unaffected.
+    refreshed_with_ack = refreshed.model_copy(update={"last_ack": ack})
+    try:
+        await store.update(task_id, refreshed_with_ack)
+    except TaskNotFoundError:
+        # Race with delete; ignore.
+        return
+    logger.info(
+        "[%s] Preflight ack persisted: status=%s routed_to=%s",
+        task_id, ack.ack_status, ack.routed_to,
+    )
+
+
+def _schedule_preflight(task_id: str) -> None:
+    """Fire-and-forget the background preflight coroutine.
+
+    Wrapped here (instead of inline ``asyncio.create_task``) so the
+    test suite can patch a single seam if it wants to disable the
+    background work and assert the synchronous CRUD path independently.
+    """
+    asyncio.create_task(_run_preflight_and_persist(task_id))
 
 
 def _next_run_iso_for(task_id: str) -> str | None:
@@ -179,6 +270,12 @@ async def create_task(task: TaskDefinition) -> dict:
     task would sit in MongoDB unschedulable while every retry POST
     bounced with 409 (PR #5 review, Codex P2).
     """
+    # last_ack is server-managed (spec #099 FR-002). Scrub any value the
+    # caller supplied so a malicious or buggy client cannot pre-populate
+    # a green "Ack OK" badge for a task the supervisor has not seen.
+    if task.last_ack is not None:
+        task = task.model_copy(update={"last_ack": None})
+
     store = get_task_store()
     try:
         created = await store.create(task)
@@ -207,6 +304,11 @@ async def create_task(task: TaskDefinition) -> dict:
             detail=f"Task definition could not be scheduled: {exc}",
         ) from exc
 
+    # Fire the supervisor preflight in the background so the form gets
+    # a fast 2xx and the badge updates as soon as the supervisor responds.
+    # The coroutine handles its own error reporting.
+    _schedule_preflight(created.id)
+
     logger.info(f"[{created.id}] Created via API")
     return _serialize_task(created, _next_run_iso_for(created.id))
 
@@ -224,6 +326,12 @@ async def update_task(task_id: str, task: TaskDefinition) -> dict:
         # Coerce rather than 400 -- the UI typically renders the id as
         # immutable text, but we don't want to trust that contract.
         task = task.model_copy(update={"id": task_id})
+
+    # last_ack is server-managed (spec #099 FR-002). Scrub the inbound
+    # value here too so an UPDATE round-trip from the UI (which round-trips
+    # the existing ack on the wire) doesn't accidentally pin an old badge.
+    if task.last_ack is not None:
+        task = task.model_copy(update={"last_ack": None})
 
     store = get_task_store()
     # Capture the previous trigger type *before* committing the update.
@@ -254,6 +362,12 @@ async def update_task(task_id: str, task: TaskDefinition) -> dict:
         )
         task = task.model_copy(update={"trigger": preserved_trigger})
 
+    # When the update doesn't touch ack-relevant fields (prompt / agent /
+    # llm_provider) preserve the existing ack so a simple "toggle enabled"
+    # doesn't blank the badge while a fresh preflight is in flight.
+    if existing is not None and not _ack_relevant_changed(existing, task):
+        task = task.model_copy(update={"last_ack": existing.last_ack})
+
     try:
         updated = await store.update(task_id, task)
     except TaskNotFoundError as exc:
@@ -267,6 +381,12 @@ async def update_task(task_id: str, task: TaskDefinition) -> dict:
     if existing is not None and existing.trigger.type != updated.trigger.type:
         _detach_task_from_runtime(task_id)
     await _sync_task_to_runtime(updated)
+
+    # Re-ack only when the change actually affects what the supervisor
+    # would do at run time — see ``_ack_relevant_changed``.
+    if _ack_relevant_changed(existing, updated):
+        _schedule_preflight(updated.id)
+
     logger.info(f"[{updated.id}] Updated via API")
     return _serialize_task(updated, _next_run_iso_for(updated.id))
 
