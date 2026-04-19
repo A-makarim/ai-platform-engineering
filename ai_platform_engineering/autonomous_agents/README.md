@@ -125,8 +125,10 @@ tasks:
     description: "Optional"
     agent: "github"                  # CAIPE sub-agent to delegate to (must be enabled in supervisor).
                                      # Surfaced to the supervisor as an in-band routing directive on
-                                     # the prompt -- see "Routing the agent hint" below. Leave unset
-                                     # (or empty) to let the supervisor LLM pick from prompt text.
+                                     # the prompt -- see "Routing the agent hint" below. This field is
+                                     # currently required by the task schema; set it to "" (empty
+                                     # string) or whitespace to skip the directive and let the
+                                     # supervisor LLM pick a sub-agent from prompt text instead.
     prompt: |                        # prompt sent to the agent
       Check all open PRs and flag any that have been open for more than 7 days.
     trigger:
@@ -156,8 +158,9 @@ Context:
 Notes:
 
 - The directive is **permissive**. If the task name doesn't match a registered sub-agent (typo, decommissioned agent, etc.), the supervisor falls back to normal LLM routing instead of failing the run.
-- `agent` left unset or empty (`""`) skips the directive entirely — useful when you want the supervisor to pick.
-- `llm_provider` and `agent` are also sent as `message.metadata` for forward-compat. Today the supervisor only reads `metadata.user_id` / `metadata.user_email` from incoming messages; structured fast-path routing on `metadata.agent` would be a separate supervisor PR (tracked as a future iteration of IMP-06 in `IMPROVEMENTS.md`).
+- `agent` is a **required** task field (`TaskDefinition.agent`). To give no routing hint, set it to an empty string (`""`) or whitespace; the directive is skipped entirely and the supervisor chooses from prompt text alone.
+- The agent identifier is sanitised before interpolation: only `[A-Za-z0-9._-]` survives (real agent ids are simple identifiers like `github`, `argo-cd`, `aws_bedrock`). This prevents a malformed or hostile agent value from breaking out of the directive and injecting extra instructions into the supervisor prompt.
+- `llm_provider` and the **sanitised** `agent` are also sent as `message.metadata` for forward-compat. Today the supervisor only reads `metadata.user_id` / `metadata.user_email` from incoming messages, so the current routing effect comes entirely from the prompt directive above; structured fast-path routing on `metadata.agent` would be a separate supervisor PR (tracked as a future iteration of IMP-06 in `IMPROVEMENTS.md`).
 
 ### Environment Variables
 
