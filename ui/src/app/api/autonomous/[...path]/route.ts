@@ -2,9 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { NextRequest, NextResponse } from 'next/server';
-import { getServerSession } from 'next-auth';
 
-import { authOptions } from '@/lib/auth-config';
+import {
+  withAuth,
+  withErrorHandler,
+  requireAdmin,
+  requireAdminView,
+  ApiError,
+} from '@/lib/api-middleware';
 
 /**
  * Autonomous Agents API Proxy.
@@ -28,9 +33,20 @@ import { authOptions } from '@/lib/auth-config';
  *      always hits `/api/autonomous/...` regardless of where the
  *      backend physically runs.
  *
- * Auth gating: a missing/expired session returns 401. We don't try to
- * be clever about anonymous access here -- the autonomous task
- * surface is only meaningful for signed-in operators.
+ * Authorization model (IMP-19):
+ *   - Read endpoints (GET) require the OIDC **admin-view** role
+ *     (`requireAdminView`). Operators and on-call responders need to
+ *     see what's scheduled and inspect run history without being
+ *     handed the keys to mutate config.
+ *   - Mutation endpoints (POST/PUT/PATCH/DELETE) require the OIDC
+ *     **admin** role (`requireAdmin`). This includes
+ *     `POST /tasks/{id}/run`: triggering a run is a write-equivalent
+ *     side effect (LLM cost, downstream actions) and must not be
+ *     available to view-only users.
+ *
+ * Without these guards, any authenticated user could create / edit /
+ * delete / fire autonomous tasks -- which is fine in a single-tenant
+ * dev box but a real production gap once the UI is shared.
  */
 
 /**
@@ -58,36 +74,9 @@ function getAutonomousAgentsUrl(): string {
  */
 const AUTONOMOUS_API_PREFIX = '/api/v1';
 
-async function requireSession(): Promise<{ ok: true } | { ok: false; response: NextResponse }> {
-  try {
-    const session = await getServerSession(authOptions);
-    // Falsey session OR a session without an authenticated user counts
-    // as unauthorised. Mirrors the pattern used by the chat proxies.
-    if (!session?.user) {
-      return {
-        ok: false,
-        response: NextResponse.json(
-          { error: 'Authentication required' },
-          { status: 401 },
-        ),
-      };
-    }
-    return { ok: true };
-  } catch (error) {
-    console.error('[Autonomous Proxy] Session lookup failed:', error);
-    return {
-      ok: false,
-      response: NextResponse.json(
-        { error: 'Authentication unavailable' },
-        { status: 503 },
-      ),
-    };
-  }
-}
-
 function buildTargetUrl(request: NextRequest, pathSegments: string[]): URL {
   const targetPath = pathSegments.join('/');
-  // Strip a leading slash on the env var so we don't end up with
+  // Strip a trailing slash on the env var so we don't end up with
   // ``//api/v1/tasks`` (some HTTP stacks tolerate it, others don't).
   const base = getAutonomousAgentsUrl().replace(/\/$/, '');
   const targetUrl = new URL(`${base}${AUTONOMOUS_API_PREFIX}/${targetPath}`);
@@ -116,97 +105,122 @@ async function readBody(request: NextRequest): Promise<unknown> {
   }
 }
 
+/**
+ * Method → required role mapping. Kept as data so the auth gating
+ * lives in one obvious place rather than being scattered across the
+ * five HTTP verb handlers.
+ */
+type SupportedMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+
+function enforceRole(
+  method: SupportedMethod,
+  session: { role?: string; canViewAdmin?: boolean },
+): void {
+  if (method === 'GET') {
+    requireAdminView(session);
+    return;
+  }
+  requireAdmin(session);
+}
+
 async function forward(
   request: NextRequest,
   pathSegments: string[],
-  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE',
+  method: SupportedMethod,
 ): Promise<NextResponse> {
-  const guard = await requireSession();
-  if (guard.ok === false) return guard.response;
+  return await withAuth(request, async (_req, _user, session) => {
+    enforceRole(method, session);
 
-  const targetUrl = buildTargetUrl(request, pathSegments);
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-  };
+    const targetUrl = buildTargetUrl(request, pathSegments);
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
 
-  const fetchOptions: RequestInit = { method, headers };
-  if (method !== 'GET' && method !== 'DELETE') {
-    const body = await readBody(request);
-    if (body !== undefined) {
-      fetchOptions.body = JSON.stringify(body);
-    }
-  }
-
-  try {
-    const response = await fetch(targetUrl.toString(), fetchOptions);
-
-    // 204 No Content -- pass through verbatim so the UI sees a clean
-    // success without a body parse attempt.
-    if (response.status === 204) {
-      return new NextResponse(null, { status: 204 });
+    const fetchOptions: RequestInit = { method, headers };
+    if (method !== 'GET' && method !== 'DELETE') {
+      const body = await readBody(request);
+      if (body !== undefined) {
+        fetchOptions.body = JSON.stringify(body);
+      }
     }
 
-    // The autonomous-agents service always replies in JSON, but read
-    // as text first so we can surface a useful error envelope even if
-    // the upstream returned a non-JSON body (e.g. on a crash).
-    const text = await response.text();
-    if (!text) {
-      return new NextResponse(null, { status: response.status });
-    }
     try {
-      const data = JSON.parse(text);
-      return NextResponse.json(data, { status: response.status });
-    } catch {
-      return NextResponse.json(
-        { error: 'Upstream returned non-JSON response', body: text.slice(0, 500) },
-        { status: response.status },
+      const response = await fetch(targetUrl.toString(), fetchOptions);
+
+      // 204 No Content -- pass through verbatim so the UI sees a clean
+      // success without a body parse attempt.
+      if (response.status === 204) {
+        return new NextResponse(null, { status: 204 });
+      }
+
+      // The autonomous-agents service always replies in JSON, but read
+      // as text first so we can surface a useful error envelope even if
+      // the upstream returned a non-JSON body (e.g. on a crash).
+      const text = await response.text();
+      if (!text) {
+        return new NextResponse(null, { status: response.status });
+      }
+      try {
+        const data = JSON.parse(text);
+        return NextResponse.json(data, { status: response.status });
+      } catch {
+        return NextResponse.json(
+          { error: 'Upstream returned non-JSON response', body: text.slice(0, 500) },
+          { status: response.status },
+        );
+      }
+    } catch (error) {
+      console.error(`[Autonomous Proxy] ${method} ${targetUrl} failed:`, error);
+      // Map upstream connectivity failures to ``ApiError`` so they
+      // flow through the shared ``withErrorHandler`` envelope and we
+      // don't leak ``error.toString()`` shapes that vary by Node
+      // version.
+      throw new ApiError(
+        `Failed to reach autonomous-agents service: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        502,
       );
     }
-  } catch (error) {
-    console.error(`[Autonomous Proxy] ${method} ${targetUrl} failed:`, error);
-    return NextResponse.json(
-      { error: 'Failed to reach autonomous-agents service', details: String(error) },
-      { status: 502 },
-    );
-  }
+  });
 }
 
-export async function GET(
+export const GET = withErrorHandler(async (
   request: NextRequest,
-  { params }: { params: Promise<{ path: string[] }> },
-) {
-  const { path } = await params;
+  context: { params: Promise<{ path: string[] }> },
+) => {
+  const { path } = await context.params;
   return forward(request, path, 'GET');
-}
+});
 
-export async function POST(
+export const POST = withErrorHandler(async (
   request: NextRequest,
-  { params }: { params: Promise<{ path: string[] }> },
-) {
-  const { path } = await params;
+  context: { params: Promise<{ path: string[] }> },
+) => {
+  const { path } = await context.params;
   return forward(request, path, 'POST');
-}
+});
 
-export async function PUT(
+export const PUT = withErrorHandler(async (
   request: NextRequest,
-  { params }: { params: Promise<{ path: string[] }> },
-) {
-  const { path } = await params;
+  context: { params: Promise<{ path: string[] }> },
+) => {
+  const { path } = await context.params;
   return forward(request, path, 'PUT');
-}
+});
 
-export async function PATCH(
+export const PATCH = withErrorHandler(async (
   request: NextRequest,
-  { params }: { params: Promise<{ path: string[] }> },
-) {
-  const { path } = await params;
+  context: { params: Promise<{ path: string[] }> },
+) => {
+  const { path } = await context.params;
   return forward(request, path, 'PATCH');
-}
+});
 
-export async function DELETE(
+export const DELETE = withErrorHandler(async (
   request: NextRequest,
-  { params }: { params: Promise<{ path: string[] }> },
-) {
-  const { path } = await params;
+  context: { params: Promise<{ path: string[] }> },
+) => {
+  const { path } = await context.params;
   return forward(request, path, 'DELETE');
-}
+});

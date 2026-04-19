@@ -21,6 +21,13 @@ interface TaskListProps {
   onTrigger: (task: AutonomousTask) => void;
   /** ids that are currently being acted on (delete/trigger) — used to grey out buttons. */
   busyIds: Set<string>;
+  /**
+   * IMP-19: when true, the per-task action toolbar (Run / Edit /
+   * Delete) is hidden entirely. Used for the read-only operator
+   * view -- the proxy will 403 these mutations server-side anyway,
+   * but rendering buttons that always 403 is hostile UX.
+   */
+  readOnly?: boolean;
 }
 
 function describeTrigger(trigger: Trigger): string {
@@ -58,11 +65,14 @@ export function TaskList({
   onDelete,
   onTrigger,
   busyIds,
+  readOnly = false,
 }: TaskListProps) {
   if (tasks.length === 0) {
     return (
       <div className="rounded-md border border-dashed border-border px-4 py-12 text-center text-sm text-muted-foreground">
-        No autonomous tasks yet. Click &quot;New task&quot; to create one.
+        {readOnly
+          ? "No autonomous tasks configured yet."
+          : 'No autonomous tasks yet. Click "New task" to create one.'}
       </div>
     );
   }
@@ -117,49 +127,54 @@ export function TaskList({
                   </div>
                 </div>
               </button>
-              <div className="flex items-center justify-end gap-1 border-t border-border px-2 py-1.5">
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onTrigger(task);
-                  }}
-                  disabled={isBusy || !task.enabled}
-                  title={task.enabled ? "Run now" : "Enable the task to run it"}
+              {!readOnly && (
+                <div
+                  className="flex items-center justify-end gap-1 border-t border-border px-2 py-1.5"
+                  data-testid="autonomous-task-actions"
                 >
-                  <Play className="h-3.5 w-3.5" />
-                  <span className="ml-1 text-xs">Run</span>
-                </Button>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onEdit(task);
-                  }}
-                  disabled={isBusy}
-                >
-                  <Pencil className="h-3.5 w-3.5" />
-                  <span className="ml-1 text-xs">Edit</span>
-                </Button>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onDelete(task);
-                  }}
-                  disabled={isBusy}
-                  className="text-red-600 hover:text-red-700 hover:bg-red-500/10"
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                  <span className="ml-1 text-xs">Delete</span>
-                </Button>
-              </div>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onTrigger(task);
+                    }}
+                    disabled={isBusy || !task.enabled}
+                    title={task.enabled ? "Run now" : "Enable the task to run it"}
+                  >
+                    <Play className="h-3.5 w-3.5" />
+                    <span className="ml-1 text-xs">Run</span>
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onEdit(task);
+                    }}
+                    disabled={isBusy}
+                  >
+                    <Pencil className="h-3.5 w-3.5" />
+                    <span className="ml-1 text-xs">Edit</span>
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onDelete(task);
+                    }}
+                    disabled={isBusy}
+                    className="text-red-600 hover:text-red-700 hover:bg-red-500/10"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                    <span className="ml-1 text-xs">Delete</span>
+                  </Button>
+                </div>
+              )}
             </div>
           </li>
         );
