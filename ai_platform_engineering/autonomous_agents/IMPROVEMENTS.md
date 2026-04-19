@@ -206,6 +206,36 @@ don't persist).
 
 ---
 
+### IMP-18 — Deep-link autonomous run rows to UI chat conversations
+- **Status**: DONE (PR — branch `prebuild/feat/autonomous-agents-run-deeplink`)
+- **Why**: IMP-13 already publishes one chat conversation per autonomous
+  run and exposes the deterministic `conversation_id` on each `TaskRun`,
+  but there was no path from the "Run history" panel to the actual
+  conversation. Operators who spotted a failed or interesting run still
+  had to copy the id, switch tabs, and paste it into the URL. Closes
+  the UX loop opened by IMP-13.
+- **What shipped**:
+  1. UI: `TaskRun` (in `ui/src/components/autonomous/types.ts`) gains
+     `conversation_id?: string | null` so the typed surface mirrors the
+     backend response shipped in IMP-13.
+  2. UI: `RunHistory` row's expandable detail now renders an "Open in
+     chat" button that links to `/chat/<conversation_id>` (uses
+     `next/link` + the `MessageSquare` lucide icon). The button is
+     conditional on `run.conversation_id` being present — runs that
+     pre-date IMP-13 *or* that ran while
+     `CHAT_HISTORY_PUBLISH_ENABLED=false` continue to render unchanged.
+  3. Tests: new `RunHistory.test.tsx` covers (a) link rendered with the
+     correct per-run href, (b) link hidden when `conversation_id` is
+     `null`, (c) two runs render two distinct hrefs (regression guard
+     against a shared-URL bug). 3 tests, all passing.
+- **Touches**: `ui/src/components/autonomous/types.ts`,
+  `ui/src/components/autonomous/RunHistory.tsx`,
+  `ui/src/components/autonomous/__tests__/RunHistory.test.tsx` (new).
+- **Depends on**: IMP-13 (publishes the `conversation_id` field this
+  feature deep-links into).
+
+---
+
 ### IMP-14 — Tie autonomous tasks to Skills / TaskConfigs (not raw prompts)
 - **Status**: TODO
 - **Why**: Today a task = `agent + raw prompt`. The UI already has a
