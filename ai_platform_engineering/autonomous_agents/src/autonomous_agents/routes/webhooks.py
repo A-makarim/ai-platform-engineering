@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import time
 
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -85,6 +86,16 @@ def _validate_timestamp(raw: str | None, window: int) -> float:
         raise HTTPException(
             status_code=400, detail="X-Webhook-Timestamp must be a numeric epoch"
         ) from exc
+    # ``float()`` happily parses ``nan`` / ``inf`` / ``-inf``. ``nan``
+    # silently bypasses the replay-window check below because every
+    # comparison with NaN returns ``False``, so ``abs(now - nan) > window``
+    # is ``False`` and the request would be accepted (Copilot P1 on PR #7).
+    # Reject any non-finite value with the same 400 we use for non-numeric
+    # input -- both are "client sent garbage" not "replay attack".
+    if not math.isfinite(ts):
+        raise HTTPException(
+            status_code=400, detail="X-Webhook-Timestamp must be a finite number"
+        )
     now = time.time()
     if abs(now - ts) > window:
         raise HTTPException(

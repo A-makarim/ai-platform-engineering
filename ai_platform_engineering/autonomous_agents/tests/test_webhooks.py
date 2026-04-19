@@ -98,9 +98,13 @@ def client(monkeypatch) -> TestClient:
 
     monkeypatch.setattr(webhooks_route, "fire_webhook_task", _fake_fire)
 
-    test_client = TestClient(app)
-    test_client.captured = captured  # type: ignore[attr-defined]
-    yield test_client
+    # ``with TestClient(...)`` triggers FastAPI startup/shutdown lifespan
+    # hooks and ensures the underlying httpx.Client is closed when the
+    # test exits, so we don't leak connections across the suite (Copilot
+    # P2 on PR #7).
+    with TestClient(app) as test_client:
+        test_client.captured = captured  # type: ignore[attr-defined]
+        yield test_client
 
     webhooks_route._webhook_tasks.clear()
     get_settings.cache_clear()
@@ -128,6 +132,14 @@ def test_no_secret_anywhere_accepts_unsigned_request(client, monkeypatch):
 
     assert resp.status_code == 200
     assert resp.json()["task_id"] == "wh-1"
+
+    # The fixture stubs ``fire_webhook_task`` and records every call so
+    # we can assert the endpoint actually dispatched the task with the
+    # parsed JSON body as context — otherwise a buggy router that
+    # 200s without firing would silently pass these tests.
+    assert client.captured["calls"] == [
+        ("wh-1", {"source": None, "event": None, "data": {"hello": "world"}})
+    ]
 
 
 def test_per_task_secret_required_when_set(client, monkeypatch):
@@ -294,6 +306,27 @@ def test_replay_window_rejects_non_numeric_timestamp(client, monkeypatch):
     )
     assert resp.status_code == 400
     assert "numeric epoch" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize("bad_ts", ["nan", "NaN", "inf", "-inf", "Infinity"])
+def test_replay_window_rejects_non_finite_timestamp(client, monkeypatch, bad_ts):
+    """Non-finite floats parse cleanly via ``float()`` but silently
+    bypass the ``abs(now - ts) > window`` range check (every comparison
+    with NaN is ``False``, ``inf - now`` is also non-finite). Must be
+    rejected with the same 400 we return for non-numeric input. Copilot
+    P1 on PR #7.
+    """
+    _set_settings(monkeypatch, webhook_replay_window_seconds=60)
+    _register(_make_task(secret="s"))
+
+    body = b"{}"
+    resp = client.post(
+        "/api/v1/hooks/wh-1",
+        content=body,
+        headers={"X-Hub-Signature-256": "sha256=zz", "X-Webhook-Timestamp": bad_ts},
+    )
+    assert resp.status_code == 400
+    assert "finite" in resp.json()["detail"]
 
 
 def test_replay_window_disabled_ignores_timestamp_header(client, monkeypatch):
