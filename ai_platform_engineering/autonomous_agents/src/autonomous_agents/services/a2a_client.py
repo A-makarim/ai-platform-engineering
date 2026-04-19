@@ -276,11 +276,16 @@ async def invoke_agent(
     if effective_llm:
         metadata["llm_provider"] = effective_llm
 
+    # Supervisor (a2a-sdk >=0.3) requires contextId to be a valid UUID. Derive
+    # a deterministic UUIDv5 per task so the supervisor's checkpointer keeps
+    # one conversation thread per autonomous task across runs while still
+    # validating as a proper UUID.
+    context_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"autonomous-task:{task_id}"))
     message: dict[str, Any] = {
         "role": "user",
         "parts": [{"kind": "text", "text": full_prompt}],
         "messageId": message_id,
-        "contextId": f"autonomous-{task_id}",
+        "contextId": context_uuid,
     }
     if metadata:
         message["metadata"] = metadata
