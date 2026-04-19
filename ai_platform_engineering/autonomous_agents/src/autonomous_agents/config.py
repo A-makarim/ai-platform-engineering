@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,6 +24,44 @@ class Settings(BaseSettings):
 
     # Supervisor A2A endpoint — autonomous agents send tasks here
     supervisor_url: str = "http://localhost:8000"
+
+    # A2A call timeout (seconds) for the per-attempt HTTP request to the
+    # supervisor. The previous implementation hard-coded this to 300; it is
+    # now overridable per environment and per task (see TaskDefinition).
+    a2a_timeout_seconds: float = Field(default=300.0, gt=0)
+
+    # Maximum *additional* retry attempts after the initial request when the
+    # supervisor returns a 5xx status or the transport fails. 0 disables
+    # retries (single attempt). 4xx responses are never retried — those
+    # signal a client-side error that retrying cannot fix.
+    a2a_max_retries: int = Field(default=3, ge=0)
+
+    # Initial backoff (seconds) for the first retry. Exposed mainly so
+    # tests can drive the retry loop without sleeping for real seconds;
+    # production tuning should usually leave this at 1.
+    a2a_retry_backoff_initial_seconds: float = Field(default=1.0, ge=0)
+
+    # Maximum backoff (seconds) between retry attempts. Backoff is
+    # exponential with jitter starting at ``a2a_retry_backoff_initial_seconds``;
+    # this caps the upper bound so a long-degraded supervisor cannot
+    # stall a run for arbitrarily long.
+    a2a_retry_backoff_max_seconds: float = Field(default=30.0, gt=0)
+
+    @field_validator(
+        "a2a_timeout_seconds",
+        "a2a_retry_backoff_initial_seconds",
+        "a2a_retry_backoff_max_seconds",
+    )
+    @classmethod
+    def _reject_nonfinite(cls, v: float) -> float:
+        # Pydantic happily accepts inf/nan from env vars cast to float;
+        # both would silently break httpx (timeout) or tenacity (wait).
+        # Sign / non-negative bounds are enforced separately by the
+        # per-field ``gt=0`` / ``ge=0`` constraints — this validator is
+        # *only* responsible for the finiteness check.
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("must be a finite number")
+        return v
 
     # Path to the YAML file that defines scheduled tasks
     task_config_path: str = "config.yaml"

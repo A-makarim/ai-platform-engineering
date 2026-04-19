@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class TriggerType(str, Enum):
@@ -68,6 +68,36 @@ class TaskDefinition(BaseModel):
     llm_provider: str | None = Field(None, description="Override global LLM provider for this task")
     enabled: bool = True
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    # Optional per-task overrides for the supervisor A2A call. When None,
+    # the service-wide defaults from Settings (A2A_TIMEOUT_SECONDS /
+    # A2A_MAX_RETRIES) apply. Useful for slow-running synthesis prompts
+    # (raise the timeout) or for "best-effort, don't burn quota" tasks
+    # (force max_retries=0).
+    timeout_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        description="Override A2A_TIMEOUT_SECONDS for this task (seconds, > 0).",
+    )
+    max_retries: int | None = Field(
+        default=None,
+        ge=0,
+        description="Override A2A_MAX_RETRIES for this task (>= 0; 0 disables retries).",
+    )
+
+    @field_validator("timeout_seconds")
+    @classmethod
+    def _timeout_must_be_finite(cls, v: float | None) -> float | None:
+        # Pydantic's ``gt=0`` constraint accepts ``float('inf')`` and ``nan``,
+        # and PyYAML happily parses ``.inf`` / ``.nan`` from config.yaml.
+        # Either would silently break the httpx timeout at runtime, so reject
+        # both at load time. ``Settings`` has the same guard for the global
+        # default — keep them in lockstep.
+        if v is None:
+            return v
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("timeout_seconds must be a finite number")
+        return v
 
 
 # =============================================================================

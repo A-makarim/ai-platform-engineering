@@ -37,22 +37,6 @@ the UI on top of. None of them change the public API shape.
 
 ---
 
-### IMP-02 — Retries + configurable timeout in `a2a_client.py`
-- **Status**: TODO
-- **Why**: Hard-coded `httpx.AsyncClient(timeout=300)`, zero retries.
-  A transient 502 / brief supervisor restart fails the whole run permanently.
-  Once we move to UI users will rightly expect transient failures to recover.
-- **Approach**:
-  1. Add `A2A_TIMEOUT_SECONDS` and `A2A_MAX_RETRIES` to `Settings`.
-  2. Optional per-task `timeout` and `max_retries` overrides in `TaskDefinition`.
-  3. Use `tenacity` with exponential backoff (`@retry` only on
-     `httpx.HTTPStatusError` for 5xx / `httpx.TransportError`, *not* on 4xx).
-  4. Log each attempt with `attempt`/`max_attempts` so retries are observable.
-- **Touches**: `config.py`, `models.py`, `services/a2a_client.py`,
-  `pyproject.toml` (`tenacity`), `tests/test_a2a_client.py` (new).
-
----
-
 ### IMP-03 — Wire `WEBHOOK_SECRET` env var as a global fallback
 - **Status**: TODO
 - **Why**: Env var is documented in `README.md` but `routes/webhooks.py`
@@ -289,6 +273,32 @@ Don't do these until you have a real reason. Premature.
 
 _Short audit trail of completed items. Newest first._
 
+### IMP-02 — Retries + configurable timeout in `a2a_client.py`
+- **Shipped on**: branch `prebuild/feat/autonomous-agents-a2a-retries`
+- **What landed**:
+  - `tenacity==9.1.4` added as a runtime dependency.
+  - `Settings` extended with `A2A_TIMEOUT_SECONDS` (default 300),
+    `A2A_MAX_RETRIES` (default 3), `A2A_RETRY_BACKOFF_INITIAL_SECONDS`
+    (default 1.0) and `A2A_RETRY_BACKOFF_MAX_SECONDS` (default 30.0),
+    all validated to reject non-positive / inf / NaN values.
+  - `TaskDefinition` gained optional `timeout_seconds` and
+    `max_retries` per-task overrides; the scheduler forwards them
+    through to `invoke_agent`.
+  - `services/a2a_client.invoke_agent` now wraps the HTTP call in
+    `tenacity.AsyncRetrying` with `wait_exponential_jitter`. The
+    retry classifier (`_is_retryable_exception`) retries
+    `httpx.TransportError` and 5xx `HTTPStatusError`s only — 4xx
+    propagates immediately, as does any non-httpx exception.
+  - Each retry logs at `WARNING` via `before_sleep_log`, so retries
+    are visible in operator logs.
+  - 22 new unit tests across `test_a2a_client.py`, `test_config.py`,
+    and `test_models.py` covering the classifier, the attempt
+    budget, per-call overrides, and the A2A error-envelope path.
+  - README documents the new env vars, per-task overrides, and the
+    retry classification table.
+
+---
+
 ### IMP-01 — Persist run history to MongoDB
 - **Shipped on**: branch `prebuild/feat/autonomous-agents-mongo-store`
 - **What landed**:
@@ -316,4 +326,4 @@ _Short audit trail of completed items. Newest first._
 
 ---
 
-_Last updated: 2026-04-18_
+_Last updated: 2026-04-19_
