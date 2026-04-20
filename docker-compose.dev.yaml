@@ -54,6 +54,13 @@ services:
       # Disable cache so UI edits are reflected immediately in the agent
       - TASK_CONFIG_CACHE_TTL=${TASK_CONFIG_CACHE_TTL:-0}
 
+      # Spec #099 Phase 3 — autonomous-task management tools registered on
+      # the supervisor (multi_agents/tools/autonomous_tasks.py) call back
+      # to the autonomous-agents FastAPI service. Defaults to the
+      # autonomous-agents container's service name; override only if the
+      # service is reached via a non-default hostname/port.
+      - AUTONOMOUS_AGENTS_URL=${AUTONOMOUS_AGENTS_URL:-http://autonomous-agents:8002}
+
       # A2A transport configuration (p2p or slim)
       - A2A_TRANSPORT=${A2A_TRANSPORT:-p2p}
 
@@ -223,6 +230,13 @@ services:
       - A2A_TRANSPORT=${A2A_TRANSPORT:-p2p}
       # Prompt configuration file path
       - PROMPT_CONFIG_PATH=${PROMPT_CONFIG_PATH:-./prompt_config.yaml}
+
+      # Spec #099 Phase 3 — autonomous-task management tools registered on
+      # the supervisor (multi_agents/tools/autonomous_tasks.py) call back
+      # to the autonomous-agents FastAPI service. Defaults to the
+      # autonomous-agents container's service name; override only if the
+      # service is reached via a non-default hostname/port.
+      - AUTONOMOUS_AGENTS_URL=${AUTONOMOUS_AGENTS_URL:-http://autonomous-agents:8002}
 
       # Slim dataplane endpoint configuration
       - SLIM_ENDPOINT=${SLIM_ENDPOINT:-http://slim-dataplane:46357}

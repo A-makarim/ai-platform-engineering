@@ -141,7 +141,15 @@ export function ChatContainer() {
           setFetchInProgress(false);
           setFetchDone(true);
 
-          if (storageMode === 'mongodb') {
+          // Spec #099 — autonomous-task chat threads live in chat-store
+          // only (synthesised by ``loadAutonomousConversationsFromService``);
+          // they have no row in the ``conversations`` collection so a
+          // MongoDB sync attempt always 404s and pollutes the dev console
+          // with "[APIClient] Error response: {}" overlays. Skip the sync
+          // for source==='autonomous' — the synthesiser keeps the thread
+          // fresh via its own polling path (see ChatPanel L1078). Other
+          // sources still benefit from the cross-device sync.
+          if (storageMode === 'mongodb' && (localConv as { source?: string }).source !== 'autonomous') {
             loadMessagesFromServer(uuid).catch((err) => {
               console.warn('[ChatContainer] Failed to sync messages from server:', err);
             });
