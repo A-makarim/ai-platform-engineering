@@ -1078,6 +1078,21 @@ export function ChatPanel({ endpoint, conversationId, conversationTitle, readOnl
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeConversationId, consumeInputDraft]);
 
+  // Spec #099 Phase B — when an autonomous-task chat thread is open,
+  // poll the autonomous-agents service every 15 s so newly-fired
+  // scheduled runs (and the rich A2A events Phase B captures for them)
+  // auto-append to the open thread without the operator having to
+  // toggle the sidebar chip or hard-refresh. The merge logic in
+  // ``loadAutonomousConversationsFromService`` preserves any in-progress
+  // user-typed turns + a2aEvents so the poll is non-destructive.
+  useEffect(() => {
+    if (conversation?.source !== 'autonomous') return;
+    const interval = window.setInterval(() => {
+      useChatStore.getState().loadAutonomousConversationsFromService().catch(() => {});
+    }, 15_000);
+    return () => window.clearInterval(interval);
+  }, [conversation?.source]);
+
   const handleStop = useCallback(() => {
     if (activeConversationId) {
       cancelConversationRequest(activeConversationId);
