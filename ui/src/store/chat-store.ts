@@ -983,13 +983,48 @@ const storeImplementation = (set: any, get: any) => ({
         );
 
         set((state) => {
-          // Drop any prior autonomous Conversations so prompt / schedule
-          // edits replace cleanly; preserve everything else.
+          // MERGE rather than replace: when the user has typed messages
+          // into an autonomous chat thread, those live in the existing
+          // Conversation's ``messages`` / ``a2aEvents`` arrays. A naive
+          // replace would wipe them on every 30s sidebar resync.
+          // Strategy: take the freshly-synthesised canonical messages
+          // (creation_intent, preflight_ack, run_request/response,
+          // next_run_marker — all with stable id schemas), then
+          // append any existing messages whose ids are NOT in the
+          // synthesised set (those are necessarily user-typed turns or
+          // streamed assistant replies). Sort by timestamp so the
+          // thread reads chronologically. ``a2aEvents`` and
+          // ``sseEvents`` are preserved from the existing conversation
+          // so the rich timeline / debug panel survive resync.
+          const existingAutonomous = new Map(
+            state.conversations
+              .filter((c) => c.source === 'autonomous')
+              .map((c) => [c.id, c] as const),
+          );
+
+          const merged = synthesized.map((freshConv) => {
+            const existing = existingAutonomous.get(freshConv.id);
+            if (!existing) return freshConv;
+
+            const synthIds = new Set(freshConv.messages.map((m) => m.id));
+            const userTyped = existing.messages.filter((m) => !synthIds.has(m.id));
+            const messages = [...freshConv.messages, ...userTyped].sort(
+              (a, b) => a.timestamp.getTime() - b.timestamp.getTime(),
+            );
+
+            return {
+              ...freshConv,
+              messages,
+              a2aEvents: existing.a2aEvents,
+              sseEvents: existing.sseEvents,
+            };
+          });
+
           const others = state.conversations.filter((c) => c.source !== 'autonomous');
-          const merged = [...others, ...synthesized].sort(
+          const final = [...others, ...merged].sort(
             (a, b) => b.updatedAt.getTime() - a.updatedAt.getTime(),
           );
-          return { conversations: merged };
+          return { conversations: final };
         });
 
         console.log(

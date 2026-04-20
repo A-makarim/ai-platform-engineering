@@ -14,7 +14,6 @@ import asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, Field
 
 from autonomous_agents.models import TaskDefinition, TaskRun, WebhookTrigger
 from autonomous_agents.routes.webhooks import (
@@ -483,62 +482,6 @@ async def trigger_task_manually(task_id: str) -> dict:
     # progresses so the UI can poll /tasks/{id}/runs to see the result.
     asyncio.create_task(execute_task(task))
     return {"status": "triggered", "task_id": task_id}
-
-
-# ---------------------------------------------------------------------------
-# POST /tasks/{id}/message — typed message in an autonomous chat thread
-# (spec #099 Story 2 / Iteration A)
-# ---------------------------------------------------------------------------
-
-
-class TaskMessageRequest(BaseModel):
-    """Inbound shape for ``POST /tasks/{id}/message``.
-
-    The chat input box in an autonomous thread sends the typed text
-    here; the server treats it as a one-off run of the task with the
-    typed text as the prompt instead of ``task.prompt``. The
-    contextId on the wire stays the same UUIDv5 so the supervisor's
-    checkpointer keeps a single conversation thread across typed and
-    scheduled messages — that's the "feels like a real chat" property
-    the operator is after.
-
-    Defined here (rather than in ``models.py``) because it's purely a
-    route DTO with no persistence shape — the typed prompt becomes a
-    TaskRun on write and a chat message on publish; we never store the
-    request as-is.
-    """
-
-    prompt: str = Field(..., min_length=1, description="Free-form ad-hoc message to send to the task's supervisor context.")
-
-
-@router.post("/tasks/{task_id}/message", response_model=dict)
-async def send_task_message(task_id: str, body: TaskMessageRequest) -> dict:
-    """Send an ad-hoc message to an autonomous task's chat thread.
-
-    Acts as the bidirectional bridge between the chat UI and the
-    autonomous-agents service. The supervisor sees a normal A2A
-    message on the task's existing contextId and replies in line with
-    the same checkpointer state that scheduled fires use, so a typed
-    "what about staging too?" follow-up to a previously-fired
-    "list open PRs" run gets answered with the right context — same
-    as a real continuing conversation.
-
-    Errors NEVER leak run-level failure detail into the HTTP response;
-    the run record (success or failure) is written to the run store
-    and surfaced through ``/tasks/{id}/runs`` and the chat thread.
-    """
-    if not body.prompt or not body.prompt.strip():
-        raise HTTPException(status_code=422, detail="prompt is required and must be non-empty")
-
-    task = await get_task_store().get(task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
-
-    # Fire-and-forget so the UI gets a fast 202; the chat thread polls
-    # for the new messages once the supervisor responds. Same pattern
-    # as ``trigger_task_manually``.
-    asyncio.create_task(execute_task(task, prompt_override=body.prompt))
-    return {"status": "queued", "task_id": task_id}
 
 
 @router.get("/runs", response_model=list[TaskRun])

@@ -94,16 +94,4 @@ export const autonomousApi = {
     request(`/tasks/${encodeURIComponent(id)}/run`, { method: 'POST' }),
   listRuns: (id: string): Promise<TaskRun[]> =>
     request(`/tasks/${encodeURIComponent(id)}/runs`),
-  /**
-   * Spec #099 Story 2 / Iteration A — send an ad-hoc typed message to
-   * an autonomous task's chat thread. The server treats it as a one-off
-   * run with the typed text as the prompt, sharing the supervisor
-   * context with the task's scheduled fires so a typed follow-up sees
-   * the same checkpointer state.
-   */
-  sendMessage: (id: string, prompt: string): Promise<{ status: string; task_id: string }> =>
-    request(`/tasks/${encodeURIComponent(id)}/message`, {
-      method: 'POST',
-      body: JSON.stringify({ prompt }),
-    }),
 };

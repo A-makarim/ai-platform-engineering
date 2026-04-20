@@ -111,7 +111,6 @@ async def _publish_safely(
     response: str | None,
     error: str | None,
     agent: str | None,
-    prompt_override: str | None = None,
 ) -> None:
     """Surface the run in the UI chat history -- best effort.
 
@@ -121,11 +120,6 @@ async def _publish_safely(
     out and either abort the task or 500 the webhook that fired it.
     Log loudly, swallow the exception, return.
 
-    ``prompt_override``: ad-hoc messages typed into an autonomous chat
-    thread (POST /tasks/{id}/message — spec #099 Story 2 / Iteration A)
-    pass the typed text here so the chat thread shows what the operator
-    actually said, not the static task prompt.
-
     Note: prompt construction lives *inside* the try block on purpose
     -- a non-JSON-serialisable webhook context would otherwise raise
     out of ``execute_task``'s finally clause, contradicting the "chat
@@ -133,7 +127,7 @@ async def _publish_safely(
     #10).
     """
     try:
-        prompt = _prompt_for_publish(task, context, prompt_override=prompt_override)
+        prompt = _prompt_for_publish(task, context)
         await publisher.publish_run(
             run,
             prompt=prompt,
@@ -149,28 +143,13 @@ async def _publish_safely(
         )
 
 
-async def execute_task(
-    task: TaskDefinition,
-    context: dict[str, Any] | None = None,
-    *,
-    prompt_override: str | None = None,
-) -> TaskRun:
+async def execute_task(task: TaskDefinition, context: dict[str, Any] | None = None) -> TaskRun:
     """Run a single task, record the result, and return the TaskRun.
 
-    Public entry point used by:
-      * APScheduler (cron/interval fires) — uses ``task.prompt`` as-is.
-      * Manual ``POST /tasks/{id}/run`` — same.
-      * Webhook fires — same; webhook payload becomes ``context``.
-      * Per-message chat (spec #099 Story 2 / Iteration A) —
-        ``POST /tasks/{id}/message`` passes the typed text as
-        ``prompt_override`` so the supervisor sees the operator's
-        ad-hoc question instead of the canonical task prompt.
-
-    The contextId on the wire is always the task's deterministic
-    UUIDv5 so the supervisor's checkpointer keeps a single
-    conversation thread regardless of which entry point fired the
-    run. That's what makes the per-task chat thread feel continuous
-    across typed and scheduled messages.
+    Public entry point used both by APScheduler (cron/interval) and by
+    the routes layer (manual trigger, webhook). Keeping this public is
+    intentional — it's part of the contract with the FastAPI handlers
+    that drive ad-hoc execution. Don't add a leading underscore back.
     """
     run_id = str(uuid.uuid4())
     # Pre-compute the deterministic per-task conversation id so it lands
@@ -179,11 +158,6 @@ async def execute_task(
     # as the run appears, even before the terminal state is recorded.
     # Spec #099 FR-006 / AD-002: one chat thread per task, not per run.
     conversation_id = _conversation_id_for_task(task.id)
-    # The prompt actually sent to the supervisor — used for both the
-    # A2A call and the chat-history "run_request" message so the chat
-    # thread shows what the operator typed (not the static task prompt)
-    # for ad-hoc messages.
-    effective_prompt = prompt_override if prompt_override is not None else task.prompt
     run = TaskRun(
         run_id=run_id,
         task_id=task.id,
@@ -198,13 +172,12 @@ async def execute_task(
     # task — see _record_safely.
     await _record_safely(store, run)
 
-    log_prefix = "ad-hoc msg" if prompt_override is not None else "scheduled run"
-    logger.info(f"[{task.id}] Starting {log_prefix} {run_id}")
+    logger.info(f"[{task.id}] Starting run {run_id}")
     response_text: str | None = None
     error_text: str | None = None
     try:
         response = await invoke_agent(
-            prompt=effective_prompt,
+            prompt=task.prompt,
             task_id=task.id,
             agent=task.agent,
             llm_provider=task.llm_provider,
@@ -215,12 +188,12 @@ async def execute_task(
         response_text = response
         run.status = TaskStatus.SUCCESS
         run.response_preview = response[:500]
-        logger.info(f"[{task.id}] {log_prefix.capitalize()} {run_id} succeeded. Preview: {response[:120]}...")
+        logger.info(f"[{task.id}] Run {run_id} succeeded. Preview: {response[:120]}...")
     except Exception as e:
         error_text = str(e)
         run.status = TaskStatus.FAILED
         run.error = error_text
-        logger.error(f"[{task.id}] {log_prefix.capitalize()} {run_id} failed: {e}")
+        logger.error(f"[{task.id}] Run {run_id} failed: {e}")
     finally:
         run.finished_at = datetime.now(timezone.utc)
         # Persist the terminal state — RunStore.record is upsert by
@@ -233,9 +206,6 @@ async def execute_task(
         # delay the authoritative run-history record. The publisher
         # is a no-op when ``CHAT_HISTORY_PUBLISH_ENABLED`` is off so
         # this is essentially free in the default config.
-        # We pass ``effective_prompt`` (not ``task.prompt``) so the
-        # chat thread shows the typed message, not the static task
-        # prompt, for ad-hoc messages.
         await _publish_safely(
             get_chat_history_publisher(),
             run,
@@ -244,7 +214,6 @@ async def execute_task(
             response=response_text,
             error=error_text,
             agent=task.agent,
-            prompt_override=prompt_override,
         )
 
     return run
@@ -253,35 +222,27 @@ async def execute_task(
 def _prompt_for_publish(
     task: TaskDefinition,
     context: dict[str, Any] | None,
-    *,
-    prompt_override: str | None = None,
 ) -> str:
     """Reconstruct the user-visible prompt for chat-history publishing.
 
-    Three modes:
-
-    * **Ad-hoc message** (``prompt_override`` set): the operator typed a
-      free-form message into the autonomous chat thread. Show it as-is
-      — the typed text is what should appear in the user-message
-      bubble, not the static task prompt.
-    * **Scheduled / manual run with no webhook context**: show
-      ``task.prompt`` unmodified.
-    * **Webhook-fired run**: mirror the augmentation that
-      ``services.a2a_client.invoke_agent`` applies before sending to
-      the supervisor — append a ``Context: <redacted>`` marker by
-      default, inline the JSON only when
-      ``CHAT_HISTORY_INCLUDE_CONTEXT=true``.
+    Mirrors the augmentation that ``services.a2a_client.invoke_agent``
+    applies before sending to the supervisor: when a webhook supplies
+    a context payload, the actual prompt the agent saw is
+    ``f"{prompt}\n\nContext:\n{json}"``. Showing the same string in
+    chat keeps the conversation honest — otherwise a webhook-triggered
+    run would look like the bare prompt fired with no context, and
+    debugging "why did the agent do X?" becomes much harder.
 
     Webhook payloads frequently contain internal/customer data
     (incident bodies, PR descriptions, customer ids). The chat
     history is read-accessible to *any* authenticated UI user via
     ``requireConversationAccess`` (PR #10 Codex P1 review), so
-    inlining raw context would be a data-exposure regression.
+    inlining the raw context into the published prompt would be a
+    data-exposure regression. We default to a redacted marker
+    (``Context: <redacted N keys>``) and only inline the payload
+    when the operator explicitly opts in via
+    ``CHAT_HISTORY_INCLUDE_CONTEXT=true``.
     """
-    # Ad-hoc typed message wins outright — it IS the user message.
-    if prompt_override is not None:
-        return prompt_override
-
     if not context:
         return task.prompt
 
