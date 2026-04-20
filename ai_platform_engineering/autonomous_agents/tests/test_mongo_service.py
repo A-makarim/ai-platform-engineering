@@ -229,6 +229,52 @@ async def test_delete_removes_document(service: MongoService):
     assert await service.get_task("t2") is not None
 
 
+async def test_delete_purges_runs_and_chat_history_for_reused_task_id(service: MongoService):
+    task = _task("t1")
+    await service.create_task(task)
+
+    run = _make_run("r1", task_id="t1", status=TaskStatus.SUCCESS)
+    run.response_preview = "old response"
+    await service.record_run(run)
+    await service.publish_creation_intent(task)
+    await service.publish_preflight_ack(
+        task,
+        {
+            "ack_status": "ok",
+            "ack_detail": "ready",
+            "dry_run_summary": "old summary",
+            "ack_at": _spaced(1).isoformat(),
+        },
+    )
+
+    conv_id = _conversation_id_for_task("t1")
+    assert await service._runs().count_documents({"task_id": "t1"}) == 1
+    assert await service._conversations().count_documents({"_id": conv_id}) == 1
+    assert await service._messages().count_documents({"conversation_id": conv_id}) == 2
+
+    await service.delete_task("t1")
+
+    assert await service._runs().count_documents({"task_id": "t1"}) == 0
+    assert await service._conversations().count_documents({"_id": conv_id}) == 0
+    assert await service._messages().count_documents({"conversation_id": conv_id}) == 0
+
+    recreated = _task("t1", name="Replacement task")
+    await service.create_task(recreated)
+    await service.publish_creation_intent(recreated)
+
+    assert await service._runs().count_documents({"task_id": "t1"}) == 0
+    assert await service._conversations().count_documents({"_id": conv_id}) == 1
+    messages = [
+        doc async for doc in service._messages().find(
+            {"conversation_id": conv_id},
+            sort=[("created_at", 1), ("message_id", 1)],
+        )
+    ]
+    assert len(messages) == 1
+    assert messages[0]["message_id"] == "task:t1:creation_intent"
+    assert "Replacement task" in messages[0]["content"]
+
+
 async def test_delete_raises_when_target_missing(service: MongoService):
     with pytest.raises(TaskNotFoundError) as exc:
         await service.delete_task("ghost")

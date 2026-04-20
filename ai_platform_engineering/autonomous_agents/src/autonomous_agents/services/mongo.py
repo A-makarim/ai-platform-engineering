@@ -411,6 +411,7 @@ class MongoService:
         result = await self._tasks().delete_one({"_id": task_id})
         if result.deleted_count == 0:
             raise TaskNotFoundError(task_id)
+        await self._purge_task_history(task_id)
 
     # ==================================================================
     # Run history
@@ -701,6 +702,33 @@ class MongoService:
                 },
             },
             upsert=True,
+        )
+
+    async def _purge_task_history(self, task_id: str) -> None:
+        """Delete persisted history tied to ``task_id`` so the id can be reused.
+
+        Task ids are intentionally user-chosen and can be reused after a delete.
+        Autonomous chat history, however, uses a deterministic conversation id
+        derived from the task id. If we only delete the task definition, reusing
+        the same id reconnects the new task to the old conversation thread and
+        run history. Purge all Mongo-side artifacts so delete semantics match
+        operator expectations: a deleted task is gone.
+        """
+        conv_ids = { _conversation_id_for_task(task_id) }
+
+        cursor = self._conversations().find(
+            {"$or": [{"_id": {"$in": list(conv_ids)}}, {"task_id": task_id}]},
+            {"_id": 1},
+        )
+        async for doc in cursor:
+            conv_id = doc.get("_id")
+            if isinstance(conv_id, str) and conv_id:
+                conv_ids.add(conv_id)
+
+        await self._runs().delete_many({"task_id": task_id})
+        await self._messages().delete_many({"conversation_id": {"$in": list(conv_ids)}})
+        await self._conversations().delete_many(
+            {"$or": [{"_id": {"$in": list(conv_ids)}}, {"task_id": task_id}]}
         )
 
     # ------------------------------------------------------------------
