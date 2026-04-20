@@ -21,7 +21,7 @@
  * adapter.
  */
 
-import type { ChatMessage, Conversation } from "@/types/a2a";
+import type { A2AEvent, ChatMessage, Conversation } from "@/types/a2a";
 
 import type { AutonomousTask, TaskRun } from "./types";
 
@@ -159,8 +159,46 @@ function nextRunMarker(task: AutonomousTask): ChatMessage | null {
 }
 
 /**
+ * Convert raw A2A event dicts (as captured by ``invoke_agent_streaming``
+ * server-side) into the UI's ``A2AEvent`` shape. The captured events are
+ * already plain JSON dicts that mirror the supervisor's wire format —
+ * we just need to give each one a stable id and the type tag the chat
+ * renderer expects.
+ *
+ * Spec #099 Phase B / Story 2 — replaying these events through the
+ * existing message renderer is what makes scheduled-run threads render
+ * the plan + tools + timeline instead of a one-line preview tombstone.
+ */
+function eventsForRun(run: TaskRun): A2AEvent[] {
+  const raw = run.events ?? [];
+  const out: A2AEvent[] = [];
+  raw.forEach((event, idx) => {
+    if (!event || typeof event !== "object") return;
+    // ``kind`` is the discriminator from the supervisor's A2A SDK
+    // (task | artifact-update | status-update | message). The chat
+    // renderer's reducers branch on it, so we surface it both as
+    // ``type`` (legacy shape) and pass through the rest of the payload
+    // verbatim. Payload keys (``artifact``, ``status``, ``parts`` ...)
+    // are already in the shape the renderer expects.
+    const kind = (event as { kind?: string }).kind;
+    out.push({
+      id: `run:${run.run_id}:evt:${idx}`,
+      type: typeof kind === "string" ? kind : "unknown",
+      ...(event as Record<string, unknown>),
+    } as A2AEvent);
+  });
+  return out;
+}
+
+/**
  * Build the (run_request, run_response|run_error) pair for a single run.
  * Earliest run first.
+ *
+ * Spec #099 Phase B: the assistant message carries the FULL supervisor
+ * response (``response_full`` when present, falling back to
+ * ``response_preview`` for legacy runs) and the captured streaming
+ * events so the chat renderer can show the plan + tools + timeline
+ * just like it does for typed messages.
  */
 function messagesForRun(task: AutonomousTask, run: TaskRun): ChatMessage[] {
   const out: ChatMessage[] = [];
@@ -174,11 +212,13 @@ function messagesForRun(task: AutonomousTask, run: TaskRun): ChatMessage[] {
     turnId: `${TURN_PREFIX}-${task.id}-run-${run.run_id}`,
   });
 
+  const events = eventsForRun(run);
+
   let body: string;
   if (run.status === "failed") {
     body = `**Run failed** (${run.run_id}):\n\n${run.error || "_unknown error_"}`;
   } else if (run.status === "success") {
-    body = run.response_preview || "_(empty response)_";
+    body = run.response_full || run.response_preview || "_(empty response)_";
   } else if (run.status === "running") {
     body = "_Run in progress…_";
   } else {
@@ -189,7 +229,7 @@ function messagesForRun(task: AutonomousTask, run: TaskRun): ChatMessage[] {
     role: "assistant",
     content: body,
     timestamp: isoToDate(run.finished_at || run.started_at),
-    events: [],
+    events,
     isFinal: run.status !== "running" && run.status !== "pending",
     turnId: `${TURN_PREFIX}-${task.id}-run-${run.run_id}`,
   });
@@ -240,13 +280,25 @@ export function synthesizeConversationForTask(
   const messages = synthesizeMessagesForTask(task, runs);
   const lastMessage = messages[messages.length - 1];
   const updatedAt = lastMessage?.timestamp ?? new Date();
+
+  // Spec #099 Phase B — aggregate all per-run A2A events onto the
+  // conversation's ``a2aEvents`` list so the right-side A2A debug panel
+  // populates for past scheduled runs the same way it does for an
+  // in-progress typed reply. Order matches chronological run order
+  // (oldest first), then per-run event order, so scrolling the panel
+  // walks the workflow forward in time.
+  const sortedRuns = [...runs].sort(
+    (a, b) => new Date(a.started_at).getTime() - new Date(b.started_at).getTime(),
+  );
+  const allEvents: A2AEvent[] = sortedRuns.flatMap((r) => eventsForRun(r));
+
   return {
     id: conversationId,
     title: `${task.name}`,
     createdAt: messages[0]?.timestamp ?? new Date(),
     updatedAt,
     messages,
-    a2aEvents: [],
+    a2aEvents: allEvents,
     sseEvents: [],
     source: "autonomous",
     task_id: task.id,

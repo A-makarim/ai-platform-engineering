@@ -133,8 +133,8 @@ async def test_successful_run_is_published_with_response(
     task: TaskDefinition,
 ):
     with patch(
-        "autonomous_agents.scheduler.invoke_agent",
-        new=AsyncMock(return_value="here are the PRs"),
+        "autonomous_agents.scheduler.invoke_agent_streaming",
+        new=AsyncMock(return_value=("here are the PRs", [])),
     ):
         run = await execute_task(task)
 
@@ -156,7 +156,7 @@ async def test_failed_run_is_published_with_error(
     task: TaskDefinition,
 ):
     with patch(
-        "autonomous_agents.scheduler.invoke_agent",
+        "autonomous_agents.scheduler.invoke_agent_streaming",
         new=AsyncMock(side_effect=RuntimeError("supervisor down")),
     ):
         run = await execute_task(task)
@@ -184,8 +184,8 @@ async def test_conversation_id_is_set_on_taskrun_and_matches_derivation(
     per-run derivation.
     """
     with patch(
-        "autonomous_agents.scheduler.invoke_agent",
-        new=AsyncMock(return_value="ok"),
+        "autonomous_agents.scheduler.invoke_agent_streaming",
+        new=AsyncMock(return_value=("ok", [])),
     ):
         run = await execute_task(task)
 
@@ -208,8 +208,8 @@ async def test_webhook_context_is_redacted_in_published_prompt_by_default(
     opt in via ``CHAT_HISTORY_INCLUDE_CONTEXT=true`` get the
     inlined payload back -- see the companion test below."""
     with patch(
-        "autonomous_agents.scheduler.invoke_agent",
-        new=AsyncMock(return_value="ok"),
+        "autonomous_agents.scheduler.invoke_agent_streaming",
+        new=AsyncMock(return_value=("ok", [])),
     ):
         await execute_task(task, context={"event": "pull_request.opened", "pr": 42})
 
@@ -238,8 +238,8 @@ async def test_webhook_context_is_inlined_when_opted_in(
     monkeypatch.setenv("CHAT_HISTORY_INCLUDE_CONTEXT", "true")
     try:
         with patch(
-            "autonomous_agents.scheduler.invoke_agent",
-            new=AsyncMock(return_value="ok"),
+            "autonomous_agents.scheduler.invoke_agent_streaming",
+            new=AsyncMock(return_value=("ok", [])),
         ):
             await execute_task(
                 task,
@@ -272,8 +272,8 @@ async def test_unserialisable_context_does_not_abort_task(
         # ``object()`` is a deliberate JSON-hostile sentinel.
         weird_context = {"sentinel": object()}
         with patch(
-            "autonomous_agents.scheduler.invoke_agent",
-            new=AsyncMock(return_value="ok"),
+            "autonomous_agents.scheduler.invoke_agent_streaming",
+            new=AsyncMock(return_value=("ok", [])),
         ):
             run = await execute_task(task, context=weird_context)
         # The task must still complete normally.
@@ -297,8 +297,8 @@ async def test_publisher_failure_does_not_abort_task(
     set_chat_history_publisher(flaky)
 
     with patch(
-        "autonomous_agents.scheduler.invoke_agent",
-        new=AsyncMock(return_value="ok"),
+        "autonomous_agents.scheduler.invoke_agent_streaming",
+        new=AsyncMock(return_value=("ok", [])),
     ):
         run = await execute_task(task)
 
@@ -323,8 +323,8 @@ async def test_publisher_failure_is_logged_at_error_level(
 
     with caplog.at_level("ERROR", logger="autonomous_agents"):
         with patch(
-            "autonomous_agents.scheduler.invoke_agent",
-            new=AsyncMock(return_value="ok"),
+            "autonomous_agents.scheduler.invoke_agent_streaming",
+            new=AsyncMock(return_value=("ok", [])),
         ):
             await execute_task(task)
 
@@ -341,8 +341,8 @@ async def test_default_publisher_is_noop_when_unset(
     # Note: _reset_scheduler_globals nulled the publisher; do NOT
     # set one here.
     with patch(
-        "autonomous_agents.scheduler.invoke_agent",
-        new=AsyncMock(return_value="ok"),
+        "autonomous_agents.scheduler.invoke_agent_streaming",
+        new=AsyncMock(return_value=("ok", [])),
     ):
         run = await execute_task(task)
     assert run.status == TaskStatus.SUCCESS

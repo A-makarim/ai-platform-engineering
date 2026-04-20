@@ -116,6 +116,18 @@ export interface TaskRun {
    * the IMP-13 ship.
    */
   conversation_id?: string | null;
+  /**
+   * Spec #099 Phase B — full supervisor response text and captured A2A
+   * streaming events. The synthesiser replays ``events`` so past
+   * scheduled fires render with the same plan / tools / timeline a
+   * typed chat reply gets, instead of the 500-char ``response_preview``
+   * tombstone. ``response_full`` is the unabridged text from the
+   * supervisor's final_result artifact (kept alongside the events so
+   * non-rich consumers — search, audit logs — don't have to walk the
+   * event list).
+   */
+  response_full?: string | null;
+  events?: Record<string, unknown>[];
 }
 
 /**

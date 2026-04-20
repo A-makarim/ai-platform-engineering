@@ -23,7 +23,7 @@ from autonomous_agents.models import (
     TaskStatus,
     TriggerType,
 )
-from autonomous_agents.services.a2a_client import invoke_agent
+from autonomous_agents.services.a2a_client import invoke_agent_streaming
 from autonomous_agents.services.chat_history import (
     ChatHistoryPublisher,
     NoopChatHistoryPublisher,
@@ -176,19 +176,30 @@ async def execute_task(task: TaskDefinition, context: dict[str, Any] | None = No
     response_text: str | None = None
     error_text: str | None = None
     try:
-        response = await invoke_agent(
+        # Phase B (spec #099 Story 2): use the streaming variant so we
+        # capture every supervisor A2A event (execution_plan_update,
+        # tool_notification_*, final_result, etc.) — persisted on the
+        # TaskRun and replayed by the UI synthesiser so past scheduled
+        # fires render with the same rich plan + tools + timeline a
+        # typed chat reply gets.
+        response, events = await invoke_agent_streaming(
             prompt=task.prompt,
             task_id=task.id,
             agent=task.agent,
             llm_provider=task.llm_provider,
             context=context,
             timeout_seconds=task.timeout_seconds,
-            max_retries=task.max_retries,
         )
         response_text = response
         run.status = TaskStatus.SUCCESS
         run.response_preview = response[:500]
-        logger.info(f"[{task.id}] Run {run_id} succeeded. Preview: {response[:120]}...")
+        run.response_full = response
+        run.events = events
+        logger.info(
+            f"[{task.id}] Run {run_id} succeeded "
+            f"({len(events)} events, {len(response)} chars). "
+            f"Preview: {response[:120]}..."
+        )
     except Exception as e:
         error_text = str(e)
         run.status = TaskStatus.FAILED

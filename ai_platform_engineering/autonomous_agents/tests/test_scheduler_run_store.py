@@ -70,8 +70,8 @@ def test_set_run_store_replaces_active_store():
 
 async def test_execute_task_records_running_then_success(store: InMemoryRunStore, task: TaskDefinition):
     with patch(
-        "autonomous_agents.scheduler.invoke_agent",
-        new=AsyncMock(return_value="hello world"),
+        "autonomous_agents.scheduler.invoke_agent_streaming",
+        new=AsyncMock(return_value=("hello world", [])),
     ):
         run = await execute_task(task)
 
@@ -89,7 +89,7 @@ async def test_execute_task_records_running_then_success(store: InMemoryRunStore
 
 async def test_execute_task_records_failure_with_error_message(store: InMemoryRunStore, task: TaskDefinition):
     with patch(
-        "autonomous_agents.scheduler.invoke_agent",
+        "autonomous_agents.scheduler.invoke_agent_streaming",
         new=AsyncMock(side_effect=RuntimeError("boom")),
     ):
         run = await execute_task(task)
@@ -117,9 +117,10 @@ async def test_running_state_is_visible_before_completion(store: InMemoryRunStor
         rs = await store.list_all()
         if rs:
             snapshot.append(rs[0].status)
-        return "done"
+        # Phase B contract: streaming variant returns (text, events).
+        return ("done", [])
 
-    with patch("autonomous_agents.scheduler.invoke_agent", new=AsyncMock(side_effect=slow_agent)):
+    with patch("autonomous_agents.scheduler.invoke_agent_streaming", new=AsyncMock(side_effect=slow_agent)):
         await execute_task(task)
 
     assert snapshot == [TaskStatus.RUNNING]
@@ -132,8 +133,8 @@ async def test_execute_task_returns_same_run_object_as_persisted(store: InMemory
     — callers (e.g. webhooks router) rely on this for synchronous
     response payloads."""
     with patch(
-        "autonomous_agents.scheduler.invoke_agent",
-        new=AsyncMock(return_value="x"),
+        "autonomous_agents.scheduler.invoke_agent_streaming",
+        new=AsyncMock(return_value=("x", [])),
     ):
         run = await execute_task(task)
 
@@ -175,8 +176,8 @@ async def test_run_store_failure_does_not_abort_task(task: TaskDefinition, caplo
     set_run_store(_FlakyStore())
 
     with patch(
-        "autonomous_agents.scheduler.invoke_agent",
-        new=AsyncMock(return_value="ok"),
+        "autonomous_agents.scheduler.invoke_agent_streaming",
+        new=AsyncMock(return_value=("ok", [])),
     ):
         run = await execute_task(task)
 
@@ -192,8 +193,8 @@ async def test_run_store_failure_is_logged_at_error_level(task: TaskDefinition, 
 
     with caplog.at_level("ERROR", logger="autonomous_agents"):
         with patch(
-            "autonomous_agents.scheduler.invoke_agent",
-            new=AsyncMock(return_value="ok"),
+            "autonomous_agents.scheduler.invoke_agent_streaming",
+            new=AsyncMock(return_value=("ok", [])),
         ):
             await execute_task(task)
 
@@ -213,8 +214,8 @@ async def test_run_store_failure_during_finalization_still_returns_completed_run
     set_run_store(_FlakyStore())
 
     with patch(
-        "autonomous_agents.scheduler.invoke_agent",
-        new=AsyncMock(return_value="hello"),
+        "autonomous_agents.scheduler.invoke_agent_streaming",
+        new=AsyncMock(return_value=("hello", [])),
     ):
         run = await execute_task(task)
 

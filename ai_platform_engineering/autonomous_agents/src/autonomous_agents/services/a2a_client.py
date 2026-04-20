@@ -63,7 +63,12 @@ from autonomous_agents.services.circuit_breaker import (
 
 logger = logging.getLogger("autonomous_agents")
 
-__all__ = ["invoke_agent", "CircuitBreakerOpenError", "build_prompt_with_routing"]
+__all__ = [
+    "invoke_agent",
+    "invoke_agent_streaming",
+    "CircuitBreakerOpenError",
+    "build_prompt_with_routing",
+]
 
 
 # Allow-list of characters permitted in a sub-agent identifier for the
@@ -423,3 +428,190 @@ async def invoke_agent(
 
     logger.warning(f"Unexpected A2A response shape: {result}")
     raise RuntimeError(f"Could not extract text from A2A response: {result}")
+
+
+# ---------------------------------------------------------------------------
+# Streaming variant (Phase B — spec #099 Story 2)
+# ---------------------------------------------------------------------------
+#
+# The blocking ``invoke_agent`` above gives us only the final text. The chat
+# UI's regular flow consumes the supervisor's *streaming* events (artifacts:
+# execution_plan_update, tool_notification_*, streaming_result, final_result)
+# and turns them into the rich plan / tools / timeline a typed-message reply
+# renders with. Until now scheduled fires went through the blocking path and
+# the chat thread showed only a 500-char preview — a one-line tombstone of
+# what was actually a multi-step workflow.
+#
+# ``invoke_agent_streaming`` switches the wire call to ``message/stream``
+# (Server-Sent Events) and:
+#   1. captures every raw A2A event the supervisor emits, AND
+#   2. accumulates the final plain-text response from ``final_result`` /
+#      ``partial_result`` artifacts so the existing run_store + chat
+#      publisher contract (which expects a single string response) keeps
+#      working without a schema change for non-streaming callers.
+#
+# Captured events are returned as a list of plain dicts (already JSON-safe
+# because they came in as JSON over SSE). The scheduler persists them on
+# the TaskRun; the UI synthesizer replays them so past scheduled runs
+# render with the same rich UI a typed message gets.
+
+
+def _extract_text_from_artifact(artifact: dict[str, Any]) -> str:
+    """Pull the text body out of an A2A artifact's parts. Empty string if none."""
+    parts = artifact.get("parts", []) or []
+    texts: list[str] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        # New SDK: {"kind": "text", "text": "..."}
+        if part.get("kind") == "text" and part.get("text"):
+            texts.append(part["text"])
+            continue
+        # Some intermediaries wrap as {"root": {"text": "..."}}
+        root = part.get("root")
+        if isinstance(root, dict) and root.get("text"):
+            texts.append(root["text"])
+    return "".join(texts)
+
+
+async def invoke_agent_streaming(
+    prompt: str,
+    task_id: str,
+    agent: str | None = None,
+    llm_provider: str | None = None,
+    context: dict[str, Any] | None = None,
+    timeout_seconds: float | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Stream from the supervisor; return ``(final_text, events)``.
+
+    Events is the list of raw A2A ``result`` payloads as they arrive over
+    SSE — exactly the shape the UI's a2a-sdk client consumes, just collected
+    server-side so it can be replayed on chat-thread reload. ``final_text``
+    is the concatenation of the most recent ``final_result``/``partial_result``
+    artifact text bodies, so existing single-string consumers (run_store,
+    chat publisher, response_preview) keep working without churn.
+
+    Differences vs. ``invoke_agent``:
+
+    * No tenacity retry loop. SSE streams aren't safely resumable
+      mid-flight; if the connection breaks we surface that immediately
+      and the caller marks the run failed. The next scheduled fire is
+      a fresh attempt.
+    * No circuit breaker. The breaker exists to protect against fan-out
+      against a sick supervisor; a single scheduled run isn't fan-out.
+      We don't want the breaker to also gate streaming.
+    * Same contextId derivation (UUIDv5 per task) so the supervisor's
+      checkpointer keeps a single thread across typed and scheduled
+      messages.
+    """
+    settings = get_settings()
+    message_id = str(uuid.uuid4())
+    effective_timeout = timeout_seconds if timeout_seconds is not None else settings.a2a_timeout_seconds
+
+    full_prompt = build_prompt_with_routing(prompt, agent=agent, context=context)
+    agent_hint = _normalize_agent_hint(agent)
+    metadata: dict[str, Any] = {}
+    if agent_hint:
+        metadata["agent"] = agent_hint
+    effective_llm = llm_provider or settings.llm_provider
+    if effective_llm:
+        metadata["llm_provider"] = effective_llm
+
+    context_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"autonomous-task:{task_id}"))
+    message: dict[str, Any] = {
+        "kind": "message",
+        "role": "user",
+        "parts": [{"kind": "text", "text": full_prompt}],
+        "messageId": message_id,
+        "contextId": context_uuid,
+    }
+    if metadata:
+        message["metadata"] = metadata
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "message/stream",
+        "params": {"message": message},
+    }
+
+    logger.info(
+        f"Streaming supervisor at {settings.supervisor_url} for task '{task_id}' "
+        f"(agent_hint={agent_hint!r}, llm_provider={effective_llm!r}, "
+        f"timeout={effective_timeout}s)"
+    )
+
+    captured_events: list[dict[str, Any]] = []
+    accumulated_text = ""
+
+    # SSE consumption: each event is `data: {jsonrpc envelope}\n\n`. We
+    # parse line-by-line because httpx's aiter_lines already handles the
+    # transport-level line splitting; we just need to skip blanks and
+    # event/id fields, take only the data: lines, parse each as JSON.
+    headers = {"Accept": "text/event-stream"}
+    try:
+        async with httpx.AsyncClient(timeout=effective_timeout) as client:
+            async with client.stream(
+                "POST", settings.supervisor_url, json=payload, headers=headers,
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    raw = line[5:].lstrip()
+                    if not raw or raw == "[DONE]":
+                        continue
+                    try:
+                        envelope = json.loads(raw)
+                    except json.JSONDecodeError:
+                        # Skip malformed SSE chunks rather than abort the
+                        # stream; the supervisor very occasionally emits a
+                        # partial chunk on the wire that's resolved on the
+                        # next event.
+                        continue
+                    if "error" in envelope:
+                        raise RuntimeError(
+                            f"A2A error from supervisor stream: {envelope['error']}"
+                        )
+                    result = envelope.get("result")
+                    if not isinstance(result, dict):
+                        continue
+                    captured_events.append(result)
+                    # Accumulate final text from artifact-update events that
+                    # carry final_result / partial_result. Streaming-only
+                    # artifacts (streaming_result, tool_notification_*) are
+                    # captured for replay but don't update the final text.
+                    if result.get("kind") == "artifact-update":
+                        artifact = result.get("artifact") or {}
+                        artifact_name = artifact.get("name", "")
+                        if artifact_name in ("final_result", "partial_result"):
+                            text = _extract_text_from_artifact(artifact)
+                            if text:
+                                # Successive final_result events with the
+                                # same artifact_id are the SDK's "replace"
+                                # semantics — treat the latest as truth.
+                                accumulated_text = text
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(f"Supervisor returned HTTP {exc.response.status_code}") from exc
+    except httpx.TransportError as exc:
+        raise RuntimeError(f"Supervisor unreachable: {exc}") from exc
+
+    if not accumulated_text:
+        # Stream completed without yielding a final/partial result. Fall
+        # back to scanning the captured events for any text we can show
+        # the operator.
+        for event in reversed(captured_events):
+            artifact = (event.get("artifact") or {}) if event.get("kind") == "artifact-update" else {}
+            text = _extract_text_from_artifact(artifact)
+            if text:
+                accumulated_text = text
+                break
+
+    if not accumulated_text:
+        accumulated_text = "(supervisor returned no text content)"
+
+    logger.info(
+        f"Streaming complete for task '{task_id}': {len(captured_events)} events, "
+        f"{len(accumulated_text)} chars of final text"
+    )
+    return accumulated_text, captured_events

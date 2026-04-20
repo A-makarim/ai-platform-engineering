@@ -155,6 +155,19 @@ class TaskRun(BaseModel):
     # ``run_id`` (UUID5-derived) so the field is safe to leave unset
     # for runs from before publishing was turned on.
     conversation_id: str | None = None
+    # Spec #099 Phase B — full supervisor response and captured A2A
+    # streaming events. Populated when the run uses the streaming code
+    # path (``invoke_agent_streaming``); ``None`` / empty for legacy
+    # blocking calls and for runs persisted before this field existed.
+    # The chat-thread synthesiser in the UI replays ``events`` so past
+    # scheduled fires render with the same plan + tools + timeline a
+    # typed chat reply gets, rather than the 500-char ``response_preview``
+    # tombstone. ``response_full`` is the same text that appears in the
+    # final_result artifact, kept alongside the events as a cheap
+    # convenience for callers (search, downstream formatters, audit
+    # logs) that don't want to walk the events list.
+    response_full: str | None = None
+    events: list[dict[str, Any]] = Field(default_factory=list)
 
 
 # =============================================================================
