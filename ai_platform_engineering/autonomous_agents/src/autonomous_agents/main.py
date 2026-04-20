@@ -1,5 +1,6 @@
 """Autonomous Agents FastAPI Application."""
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from autonomous_agents.log_config import setup_logging
@@ -20,17 +21,28 @@ from autonomous_agents.scheduler import (
     set_chat_history_publisher,
     set_run_store,
 )
-from autonomous_agents.services.chat_history import (
-    MongoChatHistoryPublisher,
-    create_chat_history_publisher,
-)
-from autonomous_agents.services.run_store import MongoRunStore, create_run_store
-from autonomous_agents.services.task_loader import load_tasks
-from autonomous_agents.services.task_store import (
-    MongoTaskStore,
+from autonomous_agents.services.chat_history import NoopChatHistoryPublisher
+from autonomous_agents.services.mongo import (
+    MongoChatHistoryPublisherAdapter,
+    MongoRunStoreAdapter,
+    MongoTaskStoreAdapter,
     TaskAlreadyExistsError,
-    create_task_store,
+    get_mongo_service,
+    reset_mongo_service,
 )
+from autonomous_agents.services.task_loader import load_tasks
+
+
+def fatal_exit(message: str, exit_code: int = 1) -> None:
+    """Log a fatal error and terminate the process with ``exit_code``.
+
+    Mirrors the helper in ``dynamic_agents/main.py``. We SystemExit
+    rather than ``sys.exit`` so that `pytest` / reload loops can catch
+    it without killing their whole harness, while `uvicorn main:app`
+    still terminates normally (SystemExit propagates to the top level).
+    """
+    logger.error("FATAL: %s", message)
+    raise SystemExit(exit_code)
 
 
 @asynccontextmanager
@@ -38,91 +50,82 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     logger.info("Starting Autonomous Agents service...")
 
-    # Build the run history persistence layer. The factory returns a
-    # MongoRunStore when both MONGODB_URI and MONGODB_DATABASE are set;
-    # otherwise an InMemoryRunStore so dev environments need no infra.
-    run_store = create_run_store(
-        mongodb_uri=settings.mongodb_uri,
-        mongodb_database=settings.mongodb_database,
-        mongodb_collection=settings.mongodb_collection,
-        in_memory_maxlen=settings.run_history_maxlen,
-    )
-    if isinstance(run_store, MongoRunStore):
-        await run_store.ensure_indexes()
-        logger.info(
-            "RunStore: MongoDB (database=%s, collection=%s)",
-            settings.mongodb_database,
-            settings.mongodb_collection,
+    # ------------------------------------------------------------------
+    # MongoDB is REQUIRED. No in-memory fallback -- if the operator
+    # mis-configures ``MONGODB_URI`` / ``MONGODB_DATABASE`` or the
+    # cluster is unreachable, we surface the failure loudly at startup
+    # rather than silently running on ephemeral stores that would lose
+    # every task definition and run record on the next restart.
+    # Mirrors the ``dynamic_agents`` supervisor's contract.
+    # ------------------------------------------------------------------
+    if not settings.mongodb_uri or not settings.mongodb_database:
+        fatal_exit(
+            "MONGODB_URI and MONGODB_DATABASE must both be set. "
+            f"(MONGODB_URI={'set' if settings.mongodb_uri else 'UNSET'}, "
+            f"MONGODB_DATABASE={'set' if settings.mongodb_database else 'UNSET'}). "
+            "Configure them in your .env / environment before restarting."
         )
-    else:
-        logger.info(
-            "RunStore: in-memory (maxlen=%d) — set MONGODB_URI and MONGODB_DATABASE to persist run history",
-            settings.run_history_maxlen,
-        )
-    set_run_store(run_store)
 
-    # Build the task definition persistence layer. Same factory
-    # contract as the run store: Mongo when fully configured, in-memory
-    # otherwise. The MongoTaskStore variant survives restarts so
-    # UI-driven CRUD changes are not lost.
-    task_store = create_task_store(
-        mongodb_uri=settings.mongodb_uri,
-        mongodb_database=settings.mongodb_database,
-        mongodb_collection=settings.mongodb_tasks_collection,
-    )
-    if isinstance(task_store, MongoTaskStore):
-        await task_store.ensure_indexes()
-        logger.info(
-            "TaskStore: MongoDB (database=%s, collection=%s)",
-            settings.mongodb_database,
-            settings.mongodb_tasks_collection,
-        )
-    else:
-        logger.info(
-            "TaskStore: in-memory — UI-created tasks will be lost on restart; "
-            "set MONGODB_URI and MONGODB_DATABASE to persist task definitions"
-        )
-    set_task_store(task_store)
-
-    # IMP-13: build the chat-history publisher. No-op when the feature
-    # is disabled (the default) so the chat database stays untouched.
-    # When enabled it shares the run-store's MONGODB_URI but can target
-    # a different logical database via CHAT_HISTORY_DATABASE.
-    chat_publisher = create_chat_history_publisher(
-        enabled=settings.chat_history_publish_enabled,
-        mongodb_uri=settings.mongodb_uri,
-        chat_database=settings.chat_history_database,
-        fallback_database=settings.mongodb_database,
-        owner_email=settings.chat_history_owner_email,
-        conversations_collection=settings.chat_history_conversations_collection,
-        messages_collection=settings.chat_history_messages_collection,
-    )
-    if isinstance(chat_publisher, MongoChatHistoryPublisher):
-        # Best-effort index creation: a transient chat-DB outage or a
-        # missing ``createIndex`` permission must NOT take down the
-        # autonomous service (chat-history publishing is observability,
-        # not source-of-truth -- same contract as ``_publish_safely``
-        # in the scheduler). PR #10 Codex P1 review.
-        try:
-            await chat_publisher.ensure_indexes()
-        except Exception as exc:
-            logger.error(
-                "ChatHistoryPublisher: ensure_indexes() failed (%s) -- "
-                "continuing without dedicated chat-history indexes; "
-                "queries will still work but may be slower until the "
-                "operator creates the indexes manually.",
-                exc,
+    mongo = get_mongo_service()
+    max_attempts = settings.mongodb_connect_max_attempts
+    delay = settings.mongodb_connect_retry_delay_seconds
+    connected = False
+    for attempt in range(1, max_attempts + 1):
+        connected = await mongo.connect()
+        if connected:
+            break
+        if attempt < max_attempts:
+            logger.warning(
+                "MongoDB connect attempt %d/%d failed; retrying in %.1fs",
+                attempt,
+                max_attempts,
+                delay,
             )
+            # Clear partial state and rebuild the singleton so the next
+            # attempt gets a fresh client rather than reusing a broken
+            # one.
+            reset_mongo_service()
+            mongo = get_mongo_service()
+            await asyncio.sleep(delay)
+
+    if not connected:
+        fatal_exit(
+            f"Failed to connect to MongoDB after {max_attempts} attempt(s). "
+            "See prior error logs for the underlying driver exception. "
+            "Verify MONGODB_URI, network reachability, and credentials, "
+            "then restart."
+        )
+
+    task_store = MongoTaskStoreAdapter(mongo)
+    run_store = MongoRunStoreAdapter(mongo)
+    logger.info(
+        "TaskStore + RunStore: MongoDB (db=%s, tasks=%s, runs=%s)",
+        settings.mongodb_database,
+        settings.mongodb_tasks_collection,
+        settings.mongodb_collection,
+    )
+    if settings.chat_history_publish_enabled:
+        chat_publisher = MongoChatHistoryPublisherAdapter(mongo)
         logger.info(
-            "ChatHistoryPublisher: MongoDB (database=%s, owner=%s)",
+            "ChatHistoryPublisher: MongoDB (db=%s, owner=%s)",
             settings.chat_history_database or settings.mongodb_database,
             settings.chat_history_owner_email,
         )
     else:
+        # Chat-history publishing stays opt-in even with Mongo connected:
+        # some deployments route autonomous runs elsewhere (or suppress
+        # them from the chat sidebar entirely) while still persisting
+        # task/run state in Mongo. ``NoopChatHistoryPublisher`` gives the
+        # scheduler a no-op target so it doesn't need a null check.
+        chat_publisher = NoopChatHistoryPublisher()
         logger.info(
-            "ChatHistoryPublisher: disabled (set CHAT_HISTORY_PUBLISH_ENABLED=true "
-            "with MONGODB_URI/MONGODB_DATABASE to surface autonomous runs in the chat sidebar)"
+            "ChatHistoryPublisher: disabled (set "
+            "CHAT_HISTORY_PUBLISH_ENABLED=true to surface autonomous "
+            "runs in the chat sidebar)"
         )
+
+    set_task_store(task_store)
+    set_run_store(run_store)
     set_chat_history_publisher(chat_publisher)
 
     # Load task definitions from YAML and seed the store.
@@ -159,6 +162,10 @@ async def lifespan(app: FastAPI):
     scheduler = get_scheduler()
     if scheduler.running:
         scheduler.shutdown(wait=False)
+    # Tear down the shared Mongo client so nothing leaks between
+    # uvicorn reloads. reset_mongo_service() is idempotent and safe to
+    # call regardless of whether connect() succeeded above.
+    reset_mongo_service()
 
 
 def create_app() -> FastAPI:

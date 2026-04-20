@@ -23,14 +23,36 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from autonomous_agents.models import CronTrigger, TaskDefinition, TaskStatus
+from autonomous_agents.models import CronTrigger, TaskDefinition, TaskRun, TaskStatus
 from autonomous_agents.scheduler import (
     execute_task,
     set_chat_history_publisher,
     set_run_store,
 )
 from autonomous_agents.services.chat_history import _conversation_id_for_task
-from autonomous_agents.services.run_store import InMemoryRunStore
+
+
+class _DictRunStore:
+    """Minimal ``RunStore`` fake -- same shape as the one in
+    ``test_scheduler_run_store``. Duplicated so each test module is
+    self-contained and the Protocol surface used is visible locally.
+    """
+
+    def __init__(self) -> None:
+        self._runs: dict[str, TaskRun] = {}
+
+    async def record(self, run: TaskRun) -> None:
+        self._runs.pop(run.run_id, None)
+        self._runs[run.run_id] = run
+
+    async def list_all(self, limit: int = 500) -> list[TaskRun]:
+        return list(self._runs.values())[-limit:][::-1]
+
+    async def list_by_task(
+        self, task_id: str, limit: int = 100
+    ) -> list[TaskRun]:
+        matching = [r for r in self._runs.values() if r.task_id == task_id]
+        return matching[-limit:][::-1]
 
 
 class _RecordingPublisher:
@@ -98,8 +120,8 @@ def _reset_scheduler_globals():
 
 
 @pytest.fixture
-def store() -> InMemoryRunStore:
-    s = InMemoryRunStore(maxlen=10)
+def store() -> _DictRunStore:
+    s = _DictRunStore()
     set_run_store(s)
     return s
 
@@ -128,7 +150,7 @@ def task() -> TaskDefinition:
 
 
 async def test_successful_run_is_published_with_response(
-    store: InMemoryRunStore,
+    store: _DictRunStore,
     publisher: _RecordingPublisher,
     task: TaskDefinition,
 ):
@@ -151,7 +173,7 @@ async def test_successful_run_is_published_with_response(
 
 
 async def test_failed_run_is_published_with_error(
-    store: InMemoryRunStore,
+    store: _DictRunStore,
     publisher: _RecordingPublisher,
     task: TaskDefinition,
 ):
@@ -170,7 +192,7 @@ async def test_failed_run_is_published_with_error(
 
 
 async def test_conversation_id_is_set_on_taskrun_and_matches_derivation(
-    store: InMemoryRunStore,
+    store: _DictRunStore,
     publisher: _RecordingPublisher,
     task: TaskDefinition,
 ):
@@ -196,7 +218,7 @@ async def test_conversation_id_is_set_on_taskrun_and_matches_derivation(
 
 
 async def test_webhook_context_is_redacted_in_published_prompt_by_default(
-    store: InMemoryRunStore,
+    store: _DictRunStore,
     publisher: _RecordingPublisher,
     task: TaskDefinition,
 ):
@@ -224,7 +246,7 @@ async def test_webhook_context_is_redacted_in_published_prompt_by_default(
 
 
 async def test_webhook_context_is_inlined_when_opted_in(
-    store: InMemoryRunStore,
+    store: _DictRunStore,
     publisher: _RecordingPublisher,
     task: TaskDefinition,
     monkeypatch,
@@ -256,7 +278,7 @@ async def test_webhook_context_is_inlined_when_opted_in(
 
 
 async def test_unserialisable_context_does_not_abort_task(
-    store: InMemoryRunStore,
+    store: _DictRunStore,
     publisher: _RecordingPublisher,
     task: TaskDefinition,
     monkeypatch,
@@ -288,7 +310,7 @@ async def test_unserialisable_context_does_not_abort_task(
 
 
 async def test_publisher_failure_does_not_abort_task(
-    store: InMemoryRunStore,
+    store: _DictRunStore,
     task: TaskDefinition,
 ):
     """A broken chat-history publisher must never bubble out of
@@ -313,7 +335,7 @@ async def test_publisher_failure_does_not_abort_task(
 
 
 async def test_publisher_failure_is_logged_at_error_level(
-    store: InMemoryRunStore,
+    store: _DictRunStore,
     task: TaskDefinition,
     caplog,
 ):
@@ -333,7 +355,7 @@ async def test_publisher_failure_is_logged_at_error_level(
 
 
 async def test_default_publisher_is_noop_when_unset(
-    store: InMemoryRunStore,
+    store: _DictRunStore,
     task: TaskDefinition,
 ):
     """If the lifespan hook never injected a publisher, scheduler

@@ -3,13 +3,22 @@
 
 """Integration tests for the /tasks CRUD endpoints.
 
-These exercise the FastAPI router via ``TestClient`` against a
-freshly-built ``InMemoryTaskStore`` and a paused ``AsyncIOScheduler``,
+These exercise the FastAPI router via ``TestClient`` against an
+in-file ``TaskStore`` fake and a paused ``AsyncIOScheduler``,
 asserting both the HTTP contract (status codes, payload shapes) AND
 the runtime side effects (scheduler/webhook registry are kept in
 sync). The latter is the whole point of the hot-reload helpers --
 without these checks, a regression would only surface when an
 operator noticed that a UI edit "looked saved but never fired".
+
+Why a tiny in-file fake instead of mongomock
+--------------------------------------------
+Production uses :class:`MongoTaskStoreAdapter` (backed by MongoDB).
+These router tests only care about "does the handler delegate to its
+store correctly?" -- so a minimal Protocol-satisfying fake keeps
+failure diagnostics pointing at the router rather than at Mongo
+semantics. Tests that cover Mongo-specific behaviour live in
+``test_mongo_service.py``.
 """
 
 import pytest
@@ -17,10 +26,49 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from autonomous_agents.models import TaskDefinition
 from autonomous_agents.routes import tasks as tasks_route
 from autonomous_agents.routes import webhooks as webhooks_route
 from autonomous_agents.scheduler import get_scheduler
-from autonomous_agents.services.task_store import InMemoryTaskStore
+from autonomous_agents.services.mongo import (
+    TaskAlreadyExistsError,
+    TaskNotFoundError,
+)
+
+
+class _DictTaskStore:
+    """Minimal in-file ``TaskStore`` fake -- same rationale as
+    ``test_tasks_route._DictTaskStore``. Duplicated intentionally so
+    each test module is self-contained and the Protocol surface used
+    is visible in a single glance."""
+
+    def __init__(self) -> None:
+        self._tasks: dict[str, TaskDefinition] = {}
+
+    async def list_all(self) -> list[TaskDefinition]:
+        return list(self._tasks.values())
+
+    async def get(self, task_id: str) -> TaskDefinition | None:
+        return self._tasks.get(task_id)
+
+    async def create(self, task: TaskDefinition) -> TaskDefinition:
+        if task.id in self._tasks:
+            raise TaskAlreadyExistsError(task.id)
+        self._tasks[task.id] = task
+        return task
+
+    async def update(
+        self, task_id: str, task: TaskDefinition
+    ) -> TaskDefinition:
+        if task_id not in self._tasks:
+            raise TaskNotFoundError(task_id)
+        self._tasks[task_id] = task
+        return task
+
+    async def delete(self, task_id: str) -> None:
+        if task_id not in self._tasks:
+            raise TaskNotFoundError(task_id)
+        del self._tasks[task_id]
 
 
 @pytest.fixture
@@ -28,11 +76,11 @@ def client():
     """Assemble a minimal FastAPI app with only the /tasks router.
 
     We deliberately *don't* use the real ``create_app`` lifespan -- it
-    pulls in MongoDB factories and YAML loading we don't need here.
-    Instead we wire fresh in-memory stores by hand and substitute the
-    real ``AsyncIOScheduler`` (which requires a running event loop)
-    with a ``BackgroundScheduler`` started in paused mode. The CRUD
-    handlers only touch the scheduler via ``add_job`` / ``remove_job`` /
+    connects to MongoDB and loads YAML we don't need here. Instead we
+    wire the in-file fake store by hand and substitute the real
+    ``AsyncIOScheduler`` (which requires a running event loop) with a
+    ``BackgroundScheduler`` started in paused mode. The CRUD handlers
+    only touch the scheduler via ``add_job`` / ``remove_job`` /
     ``get_jobs`` / ``get_job``, all of which behave identically across
     APScheduler subclasses, so the swap is transparent to the code
     under test while letting the scheduler actually start (which is
@@ -44,7 +92,7 @@ def client():
     scheduler_mod._scheduler = BackgroundScheduler(timezone="UTC")
     scheduler_mod._scheduler.start(paused=True)
     scheduler_mod._run_store = None
-    tasks_route._task_store = InMemoryTaskStore()
+    tasks_route._task_store = _DictTaskStore()
     webhooks_route._webhook_tasks = {}
 
     app = FastAPI()

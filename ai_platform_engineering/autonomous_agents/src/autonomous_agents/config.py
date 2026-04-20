@@ -120,23 +120,34 @@ class Settings(BaseSettings):
             )
         return v
 
-    # MongoDB persistence for run history (optional).
-    # Both must be set to enable MongoRunStore; otherwise the service
-    # falls back to a bounded in-memory store (legacy behaviour) so
-    # development environments need no external infrastructure.
+    # MongoDB persistence (REQUIRED).
+    # Both ``mongodb_uri`` and ``mongodb_database`` must be set before
+    # the service will start -- the lifespan in ``main.py`` calls
+    # ``fatal_exit`` if either is missing or if the connection retry
+    # loop exhausts ``mongodb_connect_max_attempts`` without success.
+    # There is intentionally no in-memory fallback: silently running
+    # on ephemeral stores would lose every task definition and run
+    # record on the next restart, and production operators reliably
+    # mis-diagnose that as "the scheduler broke".
+    #
+    # These stay as ``str | None`` at the Pydantic level (rather than
+    # required fields) so tests that construct ``Settings()`` directly
+    # -- especially unit tests that never go through the lifespan --
+    # don't need to pass them in.
     mongodb_uri: str | None = None
     mongodb_database: str | None = None
     mongodb_collection: str = "autonomous_runs"
 
     # MongoDB collection that holds task definitions (the source of
-    # truth for CRUD operations). Only used when both ``mongodb_uri``
-    # and ``mongodb_database`` are set; otherwise the in-memory
-    # TaskStore is used and tasks are seeded from YAML on every boot.
+    # truth for CRUD operations).
     mongodb_tasks_collection: str = "autonomous_tasks"
 
-    # Maximum runs retained by the in-memory store when Mongo is not
-    # configured. Ignored when MongoRunStore is in use.
-    run_history_maxlen: int = 500
+    # Connect-retry knobs used by main.py's lifespan. First connect
+    # attempt happens immediately; subsequent attempts wait ``delay``
+    # seconds between tries. ``ge=1`` keeps "never try" from being
+    # silently legal via ``MONGODB_CONNECT_MAX_ATTEMPTS=0``.
+    mongodb_connect_max_attempts: int = Field(default=3, ge=1)
+    mongodb_connect_retry_delay_seconds: float = Field(default=2.0, gt=0)
 
     # IMP-16 — circuit breaker around the supervisor A2A call.
     #

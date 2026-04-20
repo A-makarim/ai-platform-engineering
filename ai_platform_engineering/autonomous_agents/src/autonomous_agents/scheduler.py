@@ -29,7 +29,7 @@ from autonomous_agents.services.chat_history import (
     NoopChatHistoryPublisher,
     _conversation_id_for_task,
 )
-from autonomous_agents.services.run_store import InMemoryRunStore, RunStore
+from autonomous_agents.services.mongo import RunStore
 
 logger = logging.getLogger("autonomous_agents")
 
@@ -48,13 +48,19 @@ def get_scheduler() -> AsyncIOScheduler:
 def get_run_store() -> RunStore:
     """Return the active :class:`RunStore`.
 
-    Lazily falls back to an :class:`InMemoryRunStore` if the lifespan
-    hook hasn't injected one yet (e.g. when scheduler functions are
-    exercised directly from unit tests).
+    The lifespan hook in ``main.py`` injects the MongoDB-backed store
+    before any handler runs. Unit tests that exercise scheduler
+    functions without going through the lifespan MUST inject a fake
+    via :func:`set_run_store` first; we refuse to silently lazy-build
+    an in-memory store because that would hide a real misconfiguration
+    in production (MongoDB required -- see ``main.lifespan``).
     """
-    global _run_store
     if _run_store is None:
-        _run_store = InMemoryRunStore()
+        raise RuntimeError(
+            "RunStore not initialized -- call set_run_store(...) "
+            "(the FastAPI lifespan does this automatically after "
+            "connecting to MongoDB)"
+        )
     return _run_store
 
 

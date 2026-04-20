@@ -10,15 +10,51 @@ by the call.
 
 The A2A side (``invoke_agent``) is mocked so the tests have no network
 dependency and don't need a live supervisor.
+
+Production persistence is MongoDB-only; the tests below use a small
+in-file ``_DictRunStore`` fake that implements just enough of the
+``RunStore`` Protocol to drive ``execute_task``. This keeps the
+assertions focused on scheduler behaviour rather than Mongo
+semantics (which live in ``test_mongo_service.py``).
 """
 
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from autonomous_agents.models import CronTrigger, TaskDefinition, TaskStatus
-from autonomous_agents.scheduler import execute_task, get_run_store, set_run_store
-from autonomous_agents.services.run_store import InMemoryRunStore
+from autonomous_agents.models import CronTrigger, TaskDefinition, TaskRun, TaskStatus
+from autonomous_agents.scheduler import execute_task, set_run_store
+
+
+class _DictRunStore:
+    """Minimal ``RunStore`` fake backed by an ordered dict.
+
+    :meth:`record` is upsert-by-``run_id`` so RUNNING -> SUCCESS
+    replaces the same entry rather than appending -- same contract
+    as :class:`MongoRunStoreAdapter` in production. ``list_all`` /
+    ``list_by_task`` return newest-first (stable over the test suite
+    because every ``execute_task`` invocation records twice and the
+    second write resorts the entry).
+    """
+
+    def __init__(self) -> None:
+        self._runs: dict[str, TaskRun] = {}
+
+    async def record(self, run: TaskRun) -> None:
+        # Upsert by run_id + re-insert so the most-recently-recorded
+        # run sorts first in insertion-order iteration.
+        self._runs.pop(run.run_id, None)
+        self._runs[run.run_id] = run
+
+    async def list_all(self, limit: int = 500) -> list[TaskRun]:
+        # Newest-first mirrors the Mongo ``sort=started_at desc`` query.
+        return list(self._runs.values())[-limit:][::-1]
+
+    async def list_by_task(
+        self, task_id: str, limit: int = 100
+    ) -> list[TaskRun]:
+        matching = [r for r in self._runs.values() if r.task_id == task_id]
+        return matching[-limit:][::-1]
 
 
 @pytest.fixture(autouse=True)
@@ -38,8 +74,8 @@ def _reset_scheduler_run_store():
 
 
 @pytest.fixture
-def store() -> InMemoryRunStore:
-    s = InMemoryRunStore(maxlen=10)
+def store() -> _DictRunStore:
+    s = _DictRunStore()
     set_run_store(s)
     return s
 
@@ -55,20 +91,29 @@ def task() -> TaskDefinition:
     )
 
 
-def test_get_run_store_lazily_creates_in_memory_default():
-    """If the lifespan hook never injected a store, scheduler functions
-    must still work — they fall back to a fresh InMemoryRunStore."""
-    s = get_run_store()
-    assert isinstance(s, InMemoryRunStore)
+def test_get_run_store_raises_when_uninjected():
+    """Post-Mongo-refactor there is no in-memory fallback. Scheduler
+    code must surface a clear error (not an AttributeError / silent
+    in-memory store) if the lifespan never wired a RunStore."""
+    from autonomous_agents.scheduler import get_run_store
+
+    with pytest.raises(RuntimeError, match="RunStore not initialized"):
+        get_run_store()
 
 
 def test_set_run_store_replaces_active_store():
-    custom = InMemoryRunStore(maxlen=7)
-    set_run_store(custom)
-    assert get_run_store() is custom
+    from autonomous_agents.scheduler import get_run_store
+
+    first = _DictRunStore()
+    set_run_store(first)
+    assert get_run_store() is first
+
+    second = _DictRunStore()
+    set_run_store(second)
+    assert get_run_store() is second
 
 
-async def test_execute_task_records_running_then_success(store: InMemoryRunStore, task: TaskDefinition):
+async def test_execute_task_records_running_then_success(store: _DictRunStore, task: TaskDefinition):
     with patch(
         "autonomous_agents.scheduler.invoke_agent_streaming",
         new=AsyncMock(return_value=("hello world", [])),
@@ -87,7 +132,7 @@ async def test_execute_task_records_running_then_success(store: InMemoryRunStore
     assert runs[0].finished_at is not None
 
 
-async def test_execute_task_records_failure_with_error_message(store: InMemoryRunStore, task: TaskDefinition):
+async def test_execute_task_records_failure_with_error_message(store: _DictRunStore, task: TaskDefinition):
     with patch(
         "autonomous_agents.scheduler.invoke_agent_streaming",
         new=AsyncMock(side_effect=RuntimeError("boom")),
@@ -105,7 +150,7 @@ async def test_execute_task_records_failure_with_error_message(store: InMemoryRu
     assert persisted.finished_at is not None
 
 
-async def test_running_state_is_visible_before_completion(store: InMemoryRunStore, task: TaskDefinition):
+async def test_running_state_is_visible_before_completion(store: _DictRunStore, task: TaskDefinition):
     """While invoke_agent is in flight, the RUNNING entry must already
     be queryable from the store. This is the whole point of recording
     twice (start + end) — observers see in-flight work."""
@@ -128,7 +173,7 @@ async def test_running_state_is_visible_before_completion(store: InMemoryRunStor
     assert runs[0].status == TaskStatus.SUCCESS
 
 
-async def test_execute_task_returns_same_run_object_as_persisted(store: InMemoryRunStore, task: TaskDefinition):
+async def test_execute_task_returns_same_run_object_as_persisted(store: _DictRunStore, task: TaskDefinition):
     """The returned TaskRun is the same instance as the one in the store
     — callers (e.g. webhooks router) rely on this for synchronous
     response payloads."""
@@ -145,10 +190,10 @@ async def test_execute_task_returns_same_run_object_as_persisted(store: InMemory
 class _FlakyStore:
     """RunStore that always raises — simulates a Mongo outage.
 
-    Implements the same protocol surface as InMemoryRunStore so the
-    scheduler treats it identically. Counts ``record`` invocations so
-    tests can assert both start- and end-of-run persistence attempts
-    were made.
+    Implements the same Protocol surface as ``_DictRunStore`` /
+    ``MongoRunStoreAdapter`` so the scheduler treats it identically.
+    Counts ``record`` invocations so tests can assert both start-
+    and end-of-run persistence attempts were made.
     """
 
     def __init__(self) -> None:

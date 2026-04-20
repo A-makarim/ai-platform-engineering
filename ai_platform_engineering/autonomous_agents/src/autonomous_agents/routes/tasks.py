@@ -3,11 +3,11 @@
 
 """Task management endpoints -- CRUD, run history, manual trigger.
 
-The :class:`TaskStore` (in-memory or MongoDB-backed) is the single
-source of truth for task definitions. Every mutation here goes through
-the store first, then immediately re-syncs the APScheduler job and the
-webhook registry via the hot-reload helpers so changes take effect
-without a service restart.
+The :class:`TaskStore` (MongoDB-backed in production, small in-file
+fakes in tests) is the single source of truth for task definitions.
+Every mutation here goes through the store first, then immediately
+re-syncs the APScheduler job and the webhook registry via the
+hot-reload helpers so changes take effect without a service restart.
 """
 
 import asyncio
@@ -29,13 +29,12 @@ from autonomous_agents.scheduler import (
     unregister_task,
 )
 from autonomous_agents.services.chat_history import _conversation_id_for_task
-from autonomous_agents.services.preflight import Acknowledgement, preflight
-from autonomous_agents.services.task_store import (
-    InMemoryTaskStore,
+from autonomous_agents.services.mongo import (
     TaskAlreadyExistsError,
     TaskNotFoundError,
     TaskStore,
 )
+from autonomous_agents.services.preflight import Acknowledgement, preflight
 
 logger = logging.getLogger("autonomous_agents")
 
@@ -48,21 +47,27 @@ router = APIRouter(tags=["tasks"])
 _MAX_TASK_RUNS = 500
 
 # Module-level TaskStore singleton. Injected by the FastAPI lifespan
-# in ``main.py``; falls back to an in-memory store when accessed before
-# injection (e.g. from unit tests that don't spin up the full app).
+# in ``main.py`` once the MongoDB connection is established. Tests that
+# exercise the routes without running the lifespan MUST inject a tiny
+# in-file fake via :func:`set_task_store` before calling handlers --
+# we refuse to silently lazy-build a fallback so production
+# mis-configuration (MongoDB required) cannot hide behind a noop.
 _task_store: TaskStore | None = None
 
 
 def get_task_store() -> TaskStore:
     """Return the active :class:`TaskStore`.
 
-    Lazy fallback to :class:`InMemoryTaskStore` mirrors the
-    ``get_run_store`` pattern so route-level tests can exercise the
-    handlers without running the FastAPI lifespan.
+    Raises :class:`RuntimeError` if no store has been injected yet.
+    The lifespan hook in ``main.py`` always runs first in production;
+    tests must call :func:`set_task_store` explicitly.
     """
-    global _task_store
     if _task_store is None:
-        _task_store = InMemoryTaskStore()
+        raise RuntimeError(
+            "TaskStore not initialized -- call set_task_store(...) "
+            "(the FastAPI lifespan does this automatically after "
+            "connecting to MongoDB)"
+        )
     return _task_store
 
 

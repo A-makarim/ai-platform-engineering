@@ -7,8 +7,18 @@ These tests focus on the contract between the router and the
 ``RunStore`` abstraction -- specifically, the ``limit`` arguments the
 router passes through. We don't need a FastAPI ``TestClient`` here:
 the router functions are plain ``async def`` callables, so we can
-``await`` them directly with a stub store and a fresh
-``InMemoryTaskStore``.
+``await`` them directly with tiny in-file fakes that satisfy the
+``TaskStore`` / ``RunStore`` Protocols in ``services/mongo.py``.
+
+Why in-file fakes rather than mongomock
+---------------------------------------
+Production persistence is MongoDB-only (the in-memory fallback was
+removed when the Mongo stack consolidated into ``services/mongo.py``).
+Running every router unit test against ``mongomock_motor`` would pull
+that dependency into hot paths and make the assertions read as
+"does Mongo do the right thing?" rather than "does the router hand
+its store the right call shape?". The fakes here are deliberately
+minimal -- they implement only the Protocol methods the router uses.
 """
 
 from datetime import datetime, timezone
@@ -23,7 +33,49 @@ from autonomous_agents.routes.tasks import (
     list_all_runs,
     set_task_store,
 )
-from autonomous_agents.services.task_store import InMemoryTaskStore
+from autonomous_agents.services.mongo import (
+    TaskAlreadyExistsError,
+    TaskNotFoundError,
+)
+
+
+class _DictTaskStore:
+    """Minimal in-file ``TaskStore`` fake for route tests.
+
+    Satisfies the Protocol surface used by the /tasks handlers
+    (``list_all`` / ``get`` / ``create`` / ``update`` / ``delete``)
+    via a plain dict. Production code goes through
+    :class:`MongoTaskStoreAdapter` instead; this fake exists only so
+    route tests can assert handler behaviour without a live Mongo.
+    """
+
+    def __init__(self) -> None:
+        self._tasks: dict[str, TaskDefinition] = {}
+
+    async def list_all(self) -> list[TaskDefinition]:
+        return list(self._tasks.values())
+
+    async def get(self, task_id: str) -> TaskDefinition | None:
+        return self._tasks.get(task_id)
+
+    async def create(self, task: TaskDefinition) -> TaskDefinition:
+        if task.id in self._tasks:
+            raise TaskAlreadyExistsError(task.id)
+        self._tasks[task.id] = task
+        return task
+
+    async def update(
+        self, task_id: str, task: TaskDefinition
+    ) -> TaskDefinition:
+        if task_id not in self._tasks:
+            raise TaskNotFoundError(task_id)
+        self._tasks[task_id] = task
+        return task
+
+    async def delete(self, task_id: str) -> None:
+        if task_id not in self._tasks:
+            raise TaskNotFoundError(task_id)
+        del self._tasks[task_id]
 
 
 class _RecordingStore:
@@ -93,10 +145,10 @@ def _swap_run_store(monkeypatch):
 
 
 async def _seed_tasks(tasks: list[TaskDefinition]) -> None:
-    """Replace the router's TaskStore with a fresh in-memory one
-    pre-populated with ``tasks``. Each test calls this with the exact
-    set it expects so ordering / leakage between tests is impossible."""
-    store = InMemoryTaskStore()
+    """Replace the router's TaskStore with a fresh fake pre-populated
+    with ``tasks``. Each test calls this with the exact set it expects
+    so ordering / leakage between tests is impossible."""
+    store = _DictTaskStore()
     for t in tasks:
         await store.create(t)
     set_task_store(store)
