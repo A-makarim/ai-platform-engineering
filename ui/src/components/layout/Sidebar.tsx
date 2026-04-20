@@ -436,16 +436,20 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
             <div className="px-2 space-y-1 pb-4">
               <AnimatePresence mode="popLayout">
                 {conversations
-                  // Client-side mirror of the server filter. The server
-                  // returns the right slice when ?source=autonomous is set,
-                  // but the store preserves locally-streaming / active
-                  // conversations across reloads, so we filter again here
-                  // to keep the chip's intent visually consistent.
+                  // Spec #099 — visibility model:
+                  //   "All" view shows EVERYTHING (regular human chats AND
+                  //     autonomous task threads). Autonomous rows are
+                  //     differentiated by the purple Bot icon + AUTO badge
+                  //     (see ``isAutonomous`` block below).
+                  //   "Autonomous" view filters down to source === 'autonomous'.
+                  // Pre-Spec-099 behaviour hid autonomous from "All" entirely
+                  // which made operator-created tasks invisible from the
+                  // default sidebar view; explicitly restored here.
                   .filter((conv) => {
                     if (conversationView === 'autonomous') {
                       return conv.source === 'autonomous';
                     }
-                    return conv.source !== 'autonomous';
+                    return true;
                   })
                   .map((conv, index) => {
                   // Check if conversation is shared
@@ -555,6 +559,18 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
                             <p className="text-sm font-medium truncate flex-1" title={conv.title}>
                               {truncateText(conv.title, sidebarWidth > 350 ? 40 : sidebarWidth > 320 ? 25 : 20)}
                             </p>
+                            {/* Spec #099 Story 2 — explicit AUTO badge so
+                                autonomous-task threads are unmistakable in
+                                the All view (purple Bot icon alone is easy
+                                to miss when scanning a long sidebar). */}
+                            {isAutonomous && (
+                              <span
+                                className="shrink-0 px-1 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wider bg-purple-500/15 text-purple-600 dark:text-purple-400 border border-purple-500/30"
+                                title="This is an autonomous task with a schedule. Typing here sends to the supervisor on the same context the cron uses."
+                              >
+                                auto
+                              </span>
+                            )}
                             {isShared && (
                               <TooltipProvider>
                                 <Tooltip>
