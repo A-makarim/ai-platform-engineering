@@ -199,16 +199,25 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
   };
 
   const handleNewChat = async (agentId?: string) => {
-    // Spec #099 Story 4 (deferred Phase 3) — until the chat-driven
-    // task author bot ships, "+ New Chat" while the Autonomous chip is
-    // active should NOT create a regular chat (it would immediately
-    // disappear from the sidebar because the chip filters by source).
-    // Instead, send the operator to /autonomous?new=1 where the form
-    // dialog opens automatically. Same destination either chip path
-    // (form vs chat author bot) once the bot exists.
+    // Spec #099 Phase 3 — when the operator clicks "+ New Chat" while
+    // the Autonomous chip is active, open a regular chat with the
+    // textbox pre-filled with a task-creation starter. The supervisor
+    // now has create_autonomous_task / list_autonomous_tasks /
+    // validate_cron_expression tools (commit e6a84220), so the operator
+    // can describe what they want, the supervisor walks them through
+    // any clarifying questions, and the task gets persisted on
+    // confirmation — no form required. The chat itself is a regular
+    // chat (not an autonomous-task thread) because we're CREATING a
+    // task, not running one. Once it exists, switching to the
+    // Autonomous chip surfaces the new task as its own thread.
     if (conversationView === 'autonomous') {
-      router.push('/autonomous?new=1');
-      return;
+      useChatStore.getState().setInputDraft(
+        "I'd like to set up an autonomous task. " +
+        "Help me describe it — what should it do, when should it run, " +
+        "and which sub-agent (if any) should handle it. " +
+        "Once we have the details, please create the task."
+      );
+      // Fall through to the regular create-conversation path below.
     }
 
     try {

@@ -24,6 +24,7 @@ interface ChatState {
   streamingConversations: Map<string, StreamingState>;
   a2aEvents: A2AEvent[];
   pendingMessage: string | null; // Message to auto-submit when ChatPanel mounts
+  inputDraft: string | null; // One-shot input pre-fill (spec #099 Phase 3) — fills the textbox without sending
 
   // Per-turn event tracking: selectedTurnId per conversation
   selectedTurnIds: Map<string, string>; // conversationId -> turnId
@@ -70,6 +71,16 @@ interface ChatState {
    * preflight_ack, run_request/response, next_run_marker).
    */
   loadAutonomousConversationsFromService: () => Promise<void>;
+  /**
+   * Spec #099 Phase 3 — one-shot input pre-fill for the next chat
+   * mount. Distinct from ``pendingMessage`` (which auto-SENDS) — this
+   * just populates the textbox so the operator can edit and decide
+   * when to hit Send. Used by "+ New Chat" on the Autonomous tab to
+   * nudge the operator toward asking the supervisor to create a task.
+   */
+  inputDraft: string | null;
+  setInputDraft: (draft: string | null) => void;
+  consumeInputDraft: () => string | null;
   saveMessagesToServer: (conversationId: string) => Promise<void>; // Save messages to MongoDB after streaming
   recoverInterruptedTask: (conversationId: string, messageId: string, endpoint: string, accessToken?: string) => Promise<boolean>; // Level 2: Poll tasks/get for interrupted messages
   loadMessagesFromServer: (conversationId: string, options?: { force?: boolean }) => Promise<void>; // Load messages from MongoDB when opening conversation
@@ -184,6 +195,7 @@ const storeImplementation = (set: any, get: any) => ({
       streamingConversations: new Map<string, StreamingState>(),
       a2aEvents: [],
       pendingMessage: null,
+      inputDraft: null,
       selectedTurnIds: new Map<string, string>(),
       unviewedConversations: new Set<string>(),
       inputRequiredConversations: new Set<string>(),
@@ -743,6 +755,19 @@ const storeImplementation = (set: any, get: any) => ({
 
       setPendingMessage: (message) => {
         set({ pendingMessage: message });
+      },
+
+      setInputDraft: (draft) => {
+        set({ inputDraft: draft });
+      },
+
+      consumeInputDraft: () => {
+        const state = get();
+        const draft = state.inputDraft;
+        if (draft) {
+          set({ inputDraft: null });
+        }
+        return draft;
       },
 
       consumePendingMessage: () => {

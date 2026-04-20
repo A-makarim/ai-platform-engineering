@@ -13,7 +13,10 @@ A running record of what has been built, what's in flight, what we learned along
 | 0     | Spec — conversational UX for autonomous tasks                         | ✅ Merged (PR #15)            |
 | 1     | Per-task chat thread + supervisor pre-flight ack                      | ✅ Done on umbrella           |
 | 2     | UI rendering of per-task thread with upcoming-run indicator           | ✅ Done on umbrella           |
-| 3     | Chat-driven task author sub-agent (second creation door)              | ⏳ Deferred until testing      |
+| 2.5   | Bidirectional autonomous chat (typed messages share supervisor context) | ✅ Done on umbrella         |
+| 2.6   | "All" sidebar view shows autonomous chats with AUTO badge             | ✅ Done on umbrella           |
+| B     | Scheduled fires render full A2A timeline (streaming events captured)  | ✅ Done on umbrella           |
+| 3     | Supervisor-side autonomous-task management tools (chat-create flow)    | ✅ Done on umbrella           |
 
 Per-#099-PR-as-PR was abandoned in favour of direct-to-umbrella commits with one batch sign-off at end-of-batch (operator preference for speed). EXPERIENCE.md is the running log; bots review the umbrella push at the end.
 
@@ -28,6 +31,13 @@ Per-#099-PR-as-PR was abandoned in favour of direct-to-umbrella commits with one
 | `ff6c9617` | feat(autonomous-agents): per-task chat threads with typed message kinds            |
 | `3468c7de` | test(autonomous-agents): unit tests for preflight + per-task chat threads          |
 | `07b0f739` | feat(ui+autonomous-agents): pre-flight badge, per-task chat link, live next-run    |
+| `f7cf2ca3` | fix(autonomous-agents+ui): runs failed with 'str' has no get; agent now optional   |
+| `400dfea3` | feat(ui): autonomous tab as real chat conversations (no Mongo required)            |
+| `91a28285` | feat(autonomous-agents+ui): bidirectional autonomous chat (typed messages share contextId) |
+| `c1d8294e` | refactor(autonomous-agents+ui): autonomous chat IS regular chat (one A2A pipeline) |
+| `6c6a789e` | fix(ui): "All" sidebar view shows autonomous chats with AUTO badge                  |
+| `d590ffac` | feat(autonomous-agents+ui): scheduled fires render full A2A timeline (Phase B)     |
+| `e6a84220` | feat(supervisor): autonomous-task management tools (Phase 3)                       |
 
 ---
 

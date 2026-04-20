@@ -106,6 +106,7 @@ export function ChatPanel({ endpoint, conversationId, conversationTitle, readOnl
     cancelConversationRequest,
     updateMessageFeedback,
     consumePendingMessage,
+    consumeInputDraft,
     recoverInterruptedTask,
     evictOldMessageContent,
     loadMessagesFromServer,
@@ -1062,6 +1063,20 @@ export function ChatPanel({ endpoint, conversationId, conversationTitle, readOnl
       submitMessage(pendingMessage);
     }
   }, [activeConversationId, consumePendingMessage, submitMessage]);
+
+  // Spec #099 Phase 3 — one-shot input draft pre-fill (does NOT auto-send,
+  // distinct from pendingMessage above). Used by "+ New Chat" on the
+  // Autonomous tab to seed the textbox with a starter prompt the operator
+  // can edit and decide when to submit.
+  useEffect(() => {
+    const draft = consumeInputDraft();
+    if (draft && !input) {
+      setInput(draft);
+    }
+    // Run once per conversation activation. Intentionally exclude
+    // ``input`` from deps so we don't re-trigger when the user starts typing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConversationId, consumeInputDraft]);
 
   const handleStop = useCallback(() => {
     if (activeConversationId) {
