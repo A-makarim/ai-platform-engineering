@@ -22,6 +22,7 @@
  */
 
 import type { A2AEvent, ChatMessage, Conversation } from "@/types/a2a";
+import { buildTimelineSegmentsFromEvents } from "@/lib/replay-timeline";
 
 import type { AutonomousTask, TaskRun } from "./types";
 
@@ -213,6 +214,15 @@ function messagesForRun(task: AutonomousTask, run: TaskRun): ChatMessage[] {
   });
 
   const events = eventsForRun(run);
+  // Spec #099 Phase B follow-up — replay the captured A2A events
+  // through the same TimelineManager logic the streaming chat path
+  // uses, so scheduled-run assistant messages render with the SAME
+  // collapsible Plan + Tools + Thinking + FinalAnswer affordances a
+  // typed message gets. Without this the message body was a flat
+  // markdown bubble even though the events were populated correctly.
+  const timelineSegments = buildTimelineSegmentsFromEvents(
+    (run.events ?? []) as ReadonlyArray<Record<string, unknown>>,
+  );
 
   let body: string;
   if (run.status === "failed") {
@@ -230,6 +240,7 @@ function messagesForRun(task: AutonomousTask, run: TaskRun): ChatMessage[] {
     content: body,
     timestamp: isoToDate(run.finished_at || run.started_at),
     events,
+    timelineSegments,
     isFinal: run.status !== "running" && run.status !== "pending",
     turnId: `${TURN_PREFIX}-${task.id}-run-${run.run_id}`,
   });
