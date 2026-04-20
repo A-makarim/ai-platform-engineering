@@ -51,6 +51,11 @@ CHECKPOINT_TYPE_MONGODB = "mongodb"
 _DEFAULT_CHECKPOINT_COLLECTION = "checkpoints"
 _DEFAULT_WRITES_COLLECTION = "checkpoint_writes"
 
+# Truncate ToolMessage content above this threshold before MongoDB checkpoint.
+# GitHub/Jira agents can return 100s of KB of raw text (PR lists, issue lists)
+# which pushes the checkpoint document over MongoDB's 16 MB BSON limit.
+_MAX_TOOL_MESSAGE_CHARS = 50_000  # 50 KB per tool message
+
 
 def _detect_collection_prefix() -> str:
     """Auto-detect a collection name prefix from the running module.
@@ -470,6 +475,209 @@ def _create_mongodb_checkpointer(
         return _create_memory_checkpointer()
 
 
+def _truncate_large_messages(checkpoint: Checkpoint) -> Checkpoint:
+    """Return a copy of checkpoint with oversized ToolMessage content truncated.
+
+    Large tool responses (GitHub PR lists, Jira issue dumps, etc.) can exceed
+    MongoDB's 16 MB BSON document limit.  We truncate in the checkpoint copy
+    only — the in-memory graph state is unchanged, so the LLM's context window
+    already has the full content for the current turn.
+    """
+    try:
+        from langchain_core.messages import ToolMessage
+    except ImportError:
+        return checkpoint
+
+    channel_values = checkpoint.get("channel_values", {})
+    messages = channel_values.get("messages", [])
+    if not messages:
+        return checkpoint
+
+    new_messages = []
+    any_truncated = False
+    for msg in messages:
+        if (
+            isinstance(msg, ToolMessage)
+            and isinstance(msg.content, str)
+            and len(msg.content) > _MAX_TOOL_MESSAGE_CHARS
+        ):
+            original_len = len(msg.content)
+            truncated_content = (
+                msg.content[:_MAX_TOOL_MESSAGE_CHARS]
+                + f"\n[... {original_len - _MAX_TOOL_MESSAGE_CHARS} chars truncated for checkpoint ...]"
+            )
+            msg = msg.model_copy(update={"content": truncated_content})
+            any_truncated = True
+            logger.warning(
+                f"MongoDB checkpoint: truncated ToolMessage "
+                f"(tool={msg.name or 'unknown'}) from {original_len} → "
+                f"{_MAX_TOOL_MESSAGE_CHARS} chars"
+            )
+        new_messages.append(msg)
+
+    if not any_truncated:
+        return checkpoint
+
+    new_checkpoint = dict(checkpoint)
+    new_checkpoint["channel_values"] = dict(channel_values)
+    new_checkpoint["channel_values"]["messages"] = new_messages
+    return new_checkpoint  # type: ignore[return-value]
+
+
+def _truncate_large_writes(
+    writes: "Sequence[Tuple[str, Any]]",
+) -> "Sequence[Tuple[str, Any]]":
+    """Return a copy of writes with oversized ToolMessage content truncated.
+
+    aput_writes stores individual node outputs; large ToolMessages here can
+    also blow past the MongoDB BSON limit for the writes collection.
+    """
+    try:
+        from langchain_core.messages import ToolMessage
+    except ImportError:
+        return writes
+
+    new_writes = []
+    any_truncated = False
+    for channel, value in writes:
+        if (
+            isinstance(value, ToolMessage)
+            and isinstance(value.content, str)
+            and len(value.content) > _MAX_TOOL_MESSAGE_CHARS
+        ):
+            original_len = len(value.content)
+            truncated_content = (
+                value.content[:_MAX_TOOL_MESSAGE_CHARS]
+                + f"\n[... {original_len - _MAX_TOOL_MESSAGE_CHARS} chars truncated for checkpoint ...]"
+            )
+            value = value.model_copy(update={"content": truncated_content})
+            any_truncated = True
+            logger.warning(
+                f"MongoDB checkpoint: truncated ToolMessage write "
+                f"(tool={value.name or 'unknown'}) from {original_len} → "
+                f"{_MAX_TOOL_MESSAGE_CHARS} chars"
+            )
+        new_writes.append((channel, value))
+
+    return new_writes if any_truncated else writes
+
+
+# Path prefix used by skills_middleware.backend_sync.build_skills_files()
+# to store skill SKILL.md content in the LangGraph `files` state channel.
+# Any `files` entry whose key starts with this prefix is an ephemeral skill
+# file that is re-injected from the in-process _skills_files cache at the
+# start of every graph invocation (see agent.py:stream() and
+# deep_agent.py:serve()/serve_stream()).  Persisting these to MongoDB is
+# wasteful: 56 skills × ~422 files can add 1–3 MB to every checkpoint
+# document and, when combined with growing conversation state (messages,
+# todos, tasks, skills_metadata), pushes the BSON document past MongoDB's
+# hard 16 MB limit causing the supervisor to crash.
+_SKILLS_FILES_PREFIX = "/skills/"
+# assisted-by claude code claude-sonnet-4-6
+
+
+def _strip_skills_from_checkpoint(checkpoint: Checkpoint) -> Checkpoint:
+    """Return a copy of checkpoint with ephemeral skills state removed.
+
+    Strips two channels that are always re-populated at the start of each
+    graph invocation and therefore must never be persisted to MongoDB:
+
+    * ``files["/skills/*"]``  — raw SKILL.md content injected by
+      ``skills_middleware.backend_sync.build_skills_files()``.  User-created
+      files (paths that do NOT start with ``/skills/``) are preserved so that
+      sub-agent file-passing (write_file / read_file) continues to work across
+      turns.
+
+    * ``skills_metadata``  — processed skill catalogue built by
+      ``deepagents.middleware.skills.SkillsMiddleware.before_model()`` from
+      the ``files`` channel on every graph step.  It is always rebuilt from
+      the in-memory skill cache; storing it in MongoDB adds size with no
+      benefit.
+
+    Like ``_truncate_large_messages``, this function only modifies the copy
+    that is written to MongoDB.  The live in-memory LangGraph state is
+    unaffected, so ``SkillsMiddleware`` continues to see the full skill
+    catalogue for the duration of the current turn.
+
+    Why this is safe:
+    -----------------
+    ``agent.py:AIPlatformEngineerA2ABinding.stream()`` (and the equivalent
+    ``deep_agent.py:serve()`` / ``serve_stream()`` paths) inject
+    ``state_dict["files"] = dict(self._mas_instance._skills_files)`` on
+    EVERY call before ``graph.astream()``.  LangGraph reads the checkpoint
+    ONCE at the start of an invocation and then merges the ``inputs`` dict
+    into the recovered state via ``file_reducer`` (which does
+    ``{**checkpoint_files, **input_files}``).  Skills are therefore always
+    present in the in-memory state for the entire turn even though they are
+    absent from the persisted checkpoint.  Between turns (pod restarts, HITL
+    resumes) the next ``stream()`` call re-injects them again.
+    """
+    channel_values = checkpoint.get("channel_values", {})
+    modified = False
+
+    # --- Strip /skills/* entries from the `files` channel ---
+    files = channel_values.get("files")
+    if isinstance(files, dict):
+        skill_keys = [k for k in files if k.startswith(_SKILLS_FILES_PREFIX)]
+        if skill_keys:
+            new_files = {k: v for k, v in files.items() if not k.startswith(_SKILLS_FILES_PREFIX)}
+            logger.debug(
+                f"MongoDB checkpoint: stripped {len(skill_keys)} skill file entries "
+                f"from 'files' channel ({len(new_files)} user files retained)"
+            )
+            modified = True
+
+    # --- Strip the `skills_metadata` channel entirely ---
+    skills_metadata = channel_values.get("skills_metadata")
+    if skills_metadata is not None:
+        logger.debug("MongoDB checkpoint: stripped 'skills_metadata' channel")
+        modified = True
+
+    if not modified:
+        return checkpoint
+
+    new_checkpoint = dict(checkpoint)
+    new_checkpoint["channel_values"] = dict(channel_values)
+    if isinstance(files, dict) and skill_keys:
+        new_checkpoint["channel_values"]["files"] = new_files
+    if skills_metadata is not None:
+        new_checkpoint["channel_values"].pop("skills_metadata", None)
+    return new_checkpoint  # type: ignore[return-value]
+
+
+def _strip_skills_from_writes(
+    writes: "Sequence[Tuple[str, Any]]",
+) -> "Sequence[Tuple[str, Any]]":
+    """Return a copy of writes with ephemeral skills entries removed.
+
+    ``aput_writes`` persists individual node outputs.  A write of the entire
+    ``files`` channel (channel == "files", value == {"/skills/...": ...}) or
+    the ``skills_metadata`` channel triggers the same BSON size issue as a
+    full checkpoint write.  This function strips those entries for the same
+    reasons as ``_strip_skills_from_checkpoint``.
+    """
+    new_writes = []
+    modified = False
+    for channel, value in writes:
+        if channel == "skills_metadata":
+            # Drop the entire skills_metadata write
+            modified = True
+            logger.debug("MongoDB checkpoint: dropped 'skills_metadata' write entry")
+            continue
+        if channel == "files" and isinstance(value, dict):
+            skill_keys = [k for k in value if k.startswith(_SKILLS_FILES_PREFIX)]
+            if skill_keys:
+                value = {k: v for k, v in value.items() if not k.startswith(_SKILLS_FILES_PREFIX)}
+                modified = True
+                logger.debug(
+                    f"MongoDB checkpoint: stripped {len(skill_keys)} skill file entries "
+                    f"from 'files' write"
+                )
+        new_writes.append((channel, value))
+
+    return new_writes if modified else writes
+
+
 class _LazyAsyncMongoDBSaver(BaseCheckpointSaver):
     """Lazy wrapper for MongoDBSaver that initializes on first async use."""
 
@@ -522,12 +730,16 @@ class _LazyAsyncMongoDBSaver(BaseCheckpointSaver):
         new_versions: ChannelVersions,
     ) -> dict:
         await self._ensure_initialized()
+        checkpoint = _truncate_large_messages(checkpoint)
+        checkpoint = _strip_skills_from_checkpoint(checkpoint)
         return await self._saver.aput(config, checkpoint, metadata, new_versions)
 
     async def aput_writes(
         self, config: dict, writes: Sequence[Tuple[str, Any]], task_id: str
     ) -> None:
         await self._ensure_initialized()
+        writes = _truncate_large_writes(writes)
+        writes = _strip_skills_from_writes(writes)
         return await self._saver.aput_writes(config, writes, task_id)
 
     async def alist(
