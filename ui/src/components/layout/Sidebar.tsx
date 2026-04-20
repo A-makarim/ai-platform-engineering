@@ -56,6 +56,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
     createConversation,
     deleteConversation,
     loadConversationsFromServer,
+    loadAutonomousConversationsFromService,
     loadMessagesFromServer,
     isConversationStreaming,
     hasUnviewedMessages,
@@ -80,38 +81,59 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
   // Agent name lookup for dynamic agent conversations
   const [agentNameMap, setAgentNameMap] = useState<Record<string, string>>({});
 
-  // Load conversations from server when sidebar mounts (MongoDB mode only)
+  // Load conversations from server when sidebar mounts.
+  // Two sources:
+  //   1. MongoDB (regular human-typed chats) — only in MongoDB storage mode.
+  //   2. autonomous-agents service — always available; spec #099 Story 2
+  //      makes the Autonomous tab work without Mongo by synthesising
+  //      conversations from the live task list + run history.
   // Also re-sync when tab becomes visible (user switches back from another browser/tab)
   useEffect(() => {
-    if (activeTab === "chat" && storageMode === 'mongodb') {
-      // Always load from server - the loadConversationsFromServer function
-      // will merge server data with local cache intelligently. When the user
-      // has flipped the chip to "Autonomous only", request the server-side
-      // source filter so we get autonomous-agent runs that the user does not
-      // own (those would be hidden by the default per-user ownership filter).
-      loadConversationsFromServer(
-        conversationView === 'autonomous' ? { source: 'autonomous' } : undefined
-      ).catch((error) => {
-        console.error('[Sidebar] Failed to load conversations:', error);
-      });
-    }
+    if (activeTab !== "chat") return;
 
-    // Re-sync when user returns to this tab (catches cross-browser deletes)
+    const loadAll = async () => {
+      // Mongo source — kept gated on storageMode because that's where
+      // human-typed conversations actually live. Autonomous Conversations
+      // are written to Mongo too (when CHAT_HISTORY_PUBLISH_ENABLED is on)
+      // but we synthesise them from the autonomous-agents service below
+      // so the Autonomous tab works in localStorage mode AND in Mongo
+      // mode without the publisher.
+      if (storageMode === 'mongodb') {
+        try {
+          await loadConversationsFromServer(
+            conversationView === 'autonomous' ? { source: 'autonomous' } : undefined
+          );
+        } catch (error) {
+          console.error('[Sidebar] Failed to load conversations:', error);
+        }
+      }
+      // Always (re)load the autonomous task list when on the Autonomous
+      // chip so prompt edits / new runs / new acks land in the sidebar.
+      // Cheap: the autonomous-agents service is local + the synthesis
+      // is in-memory only (no Mongo writes).
+      if (conversationView === 'autonomous') {
+        try {
+          await loadAutonomousConversationsFromService();
+        } catch (error) {
+          console.error('[Sidebar] Failed to sync autonomous tasks:', error);
+        }
+      }
+    };
+
+    loadAll();
+
+    // Re-sync when user returns to this tab (catches cross-browser deletes
+    // for Mongo conversations, and new runs/acks for autonomous tasks).
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible' && activeTab === "chat" && storageMode === 'mongodb') {
-        console.log('[Sidebar] Tab became visible, re-syncing conversations');
-        loadConversationsFromServer(
-          conversationView === 'autonomous' ? { source: 'autonomous' } : undefined
-        ).catch((error) => {
-          console.error('[Sidebar] Failed to re-sync conversations:', error);
-        });
+      if (document.visibilityState === 'visible' && activeTab === "chat") {
+        loadAll();
       }
     };
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, storageMode, conversationView]); // Intentionally exclude loadConversationsFromServer to prevent re-runs
+  }, [activeTab, storageMode, conversationView]); // Intentionally exclude loaders to prevent re-runs
 
   // Fetch dynamic agents for name lookup in conversation list
   useEffect(() => {
@@ -357,13 +379,15 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
           )}
 
           {/*
-            Autonomous-runs filter chip. Only meaningful in MongoDB mode
-            because autonomous conversations are produced server-side by
-            the autonomous_agents service and persisted to MongoDB. In
-            localStorage mode there is nothing to filter so we hide the
-            control entirely.
+            Autonomous-runs filter chip. Spec #099 Story 2: the Autonomous
+            tab now sources its conversations from the autonomous-agents
+            service via ``loadAutonomousConversationsFromService`` so the
+            chip works in localStorage mode too (no Mongo required). Mongo
+            is still the source of truth when CHAT_HISTORY_PUBLISH_ENABLED
+            is on; in that case both sources merge and the synthesis just
+            keeps the sidebar fresh between Mongo writes.
           */}
-          {!collapsed && storageMode === 'mongodb' && (
+          {!collapsed && (
             <div className="px-3 pb-2 flex items-center gap-1.5 shrink-0">
               <button
                 type="button"

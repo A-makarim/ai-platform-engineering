@@ -61,6 +61,15 @@ interface ChatState {
   setPendingMessage: (message: string | null) => void;
   consumePendingMessage: () => string | null;
   loadConversationsFromServer: (options?: { source?: 'autonomous' | 'web' }) => Promise<void>; // Load conversations from server (MongoDB mode only)
+  /**
+   * Spec #099 Story 2 — synthesise autonomous-task conversations from
+   * the autonomous-agents service so the chat sidebar's Autonomous tab
+   * works regardless of storage mode (no Mongo needed). Each task
+   * becomes one Conversation; messages mirror the metadata.kind
+   * enumeration the Mongo publisher emits (creation_intent,
+   * preflight_ack, run_request/response, next_run_marker).
+   */
+  loadAutonomousConversationsFromService: () => Promise<void>;
   saveMessagesToServer: (conversationId: string) => Promise<void>; // Save messages to MongoDB after streaming
   recoverInterruptedTask: (conversationId: string, messageId: string, endpoint: string, accessToken?: string) => Promise<boolean>; // Level 2: Poll tasks/get for interrupted messages
   loadMessagesFromServer: (conversationId: string, options?: { force?: boolean }) => Promise<void>; // Load messages from MongoDB when opening conversation
@@ -916,6 +925,76 @@ const storeImplementation = (set: any, get: any) => ({
         } finally {
           isLoadingConversations = false;
         }
+      },
+
+      /**
+       * Spec #099 Story 2 — autonomous-task-as-conversation adapter.
+       *
+       * Fetches every task from the autonomous-agents service and, in
+       * parallel, its run history; synthesises a Conversation per task
+       * using ``synthesizeConversationForTask`` and merges them into the
+       * store. Existing autonomous Conversations are *replaced* by the
+       * fresh synthesis (so prompt edits / new runs / new acks land
+       * immediately); non-autonomous Conversations are preserved.
+       *
+       * Errors are swallowed and logged: a flaky autonomous-agents
+       * service must never blank the chat sidebar. Preserves existing
+       * autonomous conversations from the previous successful sync if
+       * the new fetch fails -- consistent with
+       * ``loadConversationsFromServer``'s contract.
+       */
+      loadAutonomousConversationsFromService: async () => {
+        // Lazy import keeps the autonomous-only deps out of the chat
+        // store's main module load, and avoids a circular import
+        // between chat-store -> autonomous-api at startup.
+        const [{ autonomousApi }, { synthesizeConversationForTask }] = await Promise.all([
+          import('@/components/autonomous/api'),
+          import('@/components/autonomous/synthesize-conversation'),
+        ]);
+
+        let tasks;
+        try {
+          tasks = await autonomousApi.listTasks();
+        } catch (err) {
+          console.warn(
+            '[ChatStore] Failed to load autonomous tasks for sidebar:', err,
+          );
+          return;
+        }
+
+        // Pull runs per task in parallel. Each task's runs is best-effort
+        // -- a 404 / 5xx for one task should not break the rest.
+        const runsPerTask = await Promise.all(
+          tasks.map(async (task) => {
+            try {
+              const runs = await autonomousApi.listRuns(task.id);
+              return { task, runs };
+            } catch (err) {
+              console.warn(
+                `[ChatStore] Failed to load runs for autonomous task ${task.id}:`, err,
+              );
+              return { task, runs: [] };
+            }
+          }),
+        );
+
+        const synthesized = runsPerTask.map(({ task, runs }) =>
+          synthesizeConversationForTask(task, runs),
+        );
+
+        set((state) => {
+          // Drop any prior autonomous Conversations so prompt / schedule
+          // edits replace cleanly; preserve everything else.
+          const others = state.conversations.filter((c) => c.source !== 'autonomous');
+          const merged = [...others, ...synthesized].sort(
+            (a, b) => b.updatedAt.getTime() - a.updatedAt.getTime(),
+          );
+          return { conversations: merged };
+        });
+
+        console.log(
+          `[ChatStore] Synthesised ${synthesized.length} autonomous-task conversations`,
+        );
       },
 
       // Save messages to MongoDB via upsert (idempotent).
