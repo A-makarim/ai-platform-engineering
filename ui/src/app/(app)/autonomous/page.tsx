@@ -4,6 +4,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { Plus, RefreshCw, Bot, Eye } from "lucide-react";
 
 import { AuthGuard } from "@/components/auth-guard";
@@ -31,6 +32,8 @@ export default function AutonomousAgentsPage() {
 
 function AutonomousAgentsView() {
   const { toast } = useToast();
+  const router = useRouter();
+  const searchParams = useSearchParams();
   // IMP-19: gate writes behind the OIDC admin role. ``canViewAdmin``
   // covers ops/on-call who need to see what's scheduled and inspect
   // run history; only ``isAdmin`` is allowed to create / edit /
@@ -150,6 +153,20 @@ function AutonomousAgentsView() {
     }, 30_000);
     return () => window.clearInterval(interval);
   }, [fetchTasks, roleLoading, hasViewAccess]);
+
+  // Spec #099 Iteration A — when the chat sidebar's "+ New Chat" is
+  // clicked while the Autonomous chip is active, that handler routes
+  // here with ?new=1. Auto-open the create dialog so the operator
+  // doesn't have to find and click the page-level "New task" button.
+  // Strip the query param immediately so a refresh doesn't re-open
+  // the dialog if the operator dismissed it.
+  useEffect(() => {
+    if (!isAdmin) return;
+    if (searchParams.get('new') !== '1') return;
+    setEditingTask(null);
+    setDialogOpen(true);
+    router.replace('/autonomous');
+  }, [searchParams, isAdmin, router]);
 
   const markBusy = (id: string, busy: boolean) => {
     setBusyIds((prev) => {

@@ -199,6 +199,18 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
   };
 
   const handleNewChat = async (agentId?: string) => {
+    // Spec #099 Story 4 (deferred Phase 3) — until the chat-driven
+    // task author bot ships, "+ New Chat" while the Autonomous chip is
+    // active should NOT create a regular chat (it would immediately
+    // disappear from the sidebar because the chip filters by source).
+    // Instead, send the operator to /autonomous?new=1 where the form
+    // dialog opens automatically. Same destination either chip path
+    // (form vs chat author bot) once the bot exists.
+    if (conversationView === 'autonomous') {
+      router.push('/autonomous?new=1');
+      return;
+    }
+
     try {
       if (storageMode === 'mongodb') {
         // MongoDB mode: Create conversation on server

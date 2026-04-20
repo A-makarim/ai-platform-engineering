@@ -365,6 +365,41 @@ export function ChatPanel({ endpoint, conversationId, conversationTitle, readOnl
       convId = createConversation();
     }
 
+    // Spec #099 Story 2 / Iteration A — autonomous-task chat thread.
+    // Typed messages in an autonomous thread route through the
+    // autonomous-agents service so they share the task's contextId
+    // (deterministic UUIDv5) with scheduled fires. The supervisor's
+    // checkpointer keeps a single conversation, and the run record
+    // (success / failure / response) is persisted via the same
+    // chat-history publisher path scheduled fires use — so the new
+    // message + its eventual reply auto-appear in the open thread on
+    // the next sidebar poll (every ~30s) or sooner via an explicit
+    // resync below. Bypass the streaming path entirely; this thread
+    // doesn't speak A2A streaming.
+    const activeConv = conversation;
+    if (activeConv?.source === 'autonomous' && activeConv.task_id) {
+      const taskId = activeConv.task_id;
+      const text = messageToSend;
+      // Lazy import keeps the autonomous deps off the main chat bundle.
+      const { autonomousApi } = await import('@/components/autonomous/api');
+      const { loadAutonomousConversationsFromService } = useChatStore.getState();
+      try {
+        await autonomousApi.sendMessage(taskId, text);
+        // Resync immediately so the user sees their message land; the
+        // supervisor's reply will land on the next resync once the run
+        // completes (typically a few seconds later).
+        await loadAutonomousConversationsFromService();
+        // Schedule a follow-up resync ~12s later to pick up the reply.
+        // Cheap, single timer, idempotent.
+        window.setTimeout(() => {
+          loadAutonomousConversationsFromService().catch(() => {});
+        }, 12_000);
+      } catch (err) {
+        console.error('[ChatPanel] Failed to send autonomous message:', err);
+      }
+      return;
+    }
+
     // Clear previous turn's events (tasks, tool completions, stream events)
     // Dynamic agents use SSE events, default supervisor uses A2A events
     const isDynamicAgent = !!selectedAgentId;
@@ -865,7 +900,7 @@ export function ChatPanel({ endpoint, conversationId, conversationTitle, readOnl
       appendToMessage(convId, assistantMsgId, `\n\n**Error:** ${(error as Error).message || "Failed to connect to A2A endpoint"}`);
       setConversationStreaming(convId, null);
     }
-  }, [isThisConversationStreaming, activeConversationId, endpoint, accessToken, selectedAgentId, createConversation, clearA2AEvents, clearSSEEvents, addMessage, appendToMessage, updateMessage, addEventToMessage, addA2AEvent, addSSEEvent, setConversationStreaming]);
+  }, [isThisConversationStreaming, activeConversationId, endpoint, accessToken, selectedAgentId, createConversation, clearA2AEvents, clearSSEEvents, addMessage, appendToMessage, updateMessage, addEventToMessage, addA2AEvent, addSSEEvent, setConversationStreaming, conversation?.source, conversation?.task_id]);
 
   // Handle queued messages after streaming completes
   useEffect(() => {
