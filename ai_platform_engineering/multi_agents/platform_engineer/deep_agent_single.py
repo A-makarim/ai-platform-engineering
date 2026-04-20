@@ -93,9 +93,15 @@ from ai_platform_engineering.utils.prompt_config import (
 )
 
 from ai_platform_engineering.multi_agents.tools import (
+    create_autonomous_task,
+    delete_autonomous_task,
     fetch_url,
     get_current_date,
     jq,
+    list_autonomous_tasks,
+    trigger_autonomous_task_now,
+    update_autonomous_task,
+    validate_cron_expression,
     yq,
 )
 from ai_platform_engineering.multi_agents.platform_engineer.response_format import PlatformEngineerResponse
@@ -1190,6 +1196,19 @@ class PlatformEngineerDeepAgent:
             tool_result_to_file,
             # Wait tool for polling and async operations
             wait,
+            # Spec #099 Phase 3 — autonomous-task management. Lets the
+            # supervisor's main agent honour requests like "create a
+            # task that does X every weekday at 9 AM" by walking the
+            # operator through any clarifying questions and finally
+            # calling create_autonomous_task. Same wire contract as
+            # the form dialog (POST /api/v1/tasks); the operator no
+            # longer has to know the form fields to schedule work.
+            list_autonomous_tasks,
+            create_autonomous_task,
+            update_autonomous_task,
+            delete_autonomous_task,
+            trigger_autonomous_task_now,
+            validate_cron_expression,
         ]
 
         # Self-service task tools
