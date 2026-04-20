@@ -19,7 +19,12 @@
 
 ## Commit Style -- Conventional Commits + DCO
 
-Every commit must use [Conventional Commits](https://www.conventionalcommits.org/) format and include a **DCO sign-off** (`git commit -s`):
+Every commit must use [Conventional Commits](https://www.conventionalcommits.org/) format and include a **DCO sign-off** (`git commit -s`).
+
+For AI-assisted commits, follow the [dco-ai-attribution](./skills/dco-ai-attribution/SKILL.md) skill:
+- AI must **never** add `Signed-off-by` — only the human author can certify the DCO
+- Always append `Assisted-by: Claude:<model-version>` when code was materially AI-assisted
+- See `agents.md` for the canonical policy reference used by AI coding agents
 
 ```
 <type>(<scope>): <short description>
@@ -98,10 +103,21 @@ PYTHONPATH=. uv run pytest tests/<test_file>.py -v
 PYTHONPATH=. uv run pytest tests/<test_file>.py::<TestClass> -v
 ```
 
+## Container & Helm Security Standards
+
+These standards apply to every new agent Dockerfile and every new Helm chart subchart.
+
+### Dockerfiles
+
+All agent and MCP server images should run as a non-root user at **UID 1001 / GID 1001**.
+
+If a Dockerfile does not have a `USER` directive, `runAsNonRoot: true` in the Helm chart will cause the pod to fail at startup. Check `docker inspect <image> --format '{{.Config.User}}'` to confirm before setting that value in a chart.
+
 ## Reusable Skills
 
 The `skills/` directory contains reusable tools organized by category:
 
+- **dco-ai-attribution**: DCO compliance and AI attribution rules for AI-assisted commits (see [skills/dco-ai-attribution/SKILL.md](./skills/dco-ai-attribution/SKILL.md))
 - **persistence**: Test LangGraph backends (Redis, PostgreSQL, MongoDB) and fact extraction
 - **debugging**: (future) Debugging and troubleshooting tools
 - **monitoring**: (future) Observability and metrics helpers

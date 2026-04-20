@@ -5,20 +5,26 @@
 Unit tests for streaming behaviour in the A2A executor.
 
 The supervisor always emits a final_result artifact before sending the
-completion status, for both single and multi-agent scenarios.
+completion status, for both single and multi-agent scenarios (when there
+is content to send).
 
 Key invariants:
-  1. Streaming chunks emitted AFTER a sub-agent sends complete_result are
-     suppressed (accumulated silently in state.supervisor_content, not
-     forwarded as streaming_result artifacts).
+  1. All streaming chunks are forwarded as streaming_result artifacts,
+     including after a sub-agent completes (sub_agents_completed == 1).
+     Supervisor text still accumulates in state.supervisor_content for
+     final_result selection when appropriate.
   2. Tool notifications are ALWAYS forwarded regardless of sub-agent state.
-  3. _get_final_content prefers supervisor_content over sub_agent_content
-     so the supervisor's synthesis is used when available.
-  4. final_result is always sent before the completion status event — there
-     is NO special case that skips it for single sub-agent scenarios.
+  3. _get_final_content: DataPart first; for multi-agent (sub_agents_completed
+     > 1) prefers supervisor_content; for single sub-agent (== 1) prefers
+     sub_agent_content over supervisor_content. _handle_stream_end /
+     _handle_task_complete prefer state.final_model_content when set (clean
+     last model summary).
+  4. final_result is sent before the completion status when there is final
+     content; DataPart and empty-edge cases follow executor rules.
   5. DataPart (structured data) bypasses all text content rules.
 
-Expected SSE event flow for single sub-agent:
+Expected SSE event flow for single sub-agent (post complete_result chunks
+still forwarded as streaming_result):
 
   1.  task (submitted)
   2.  streaming_result chunks (supervisor intro)
@@ -34,8 +40,9 @@ Expected SSE event flow for single sub-agent:
   12. tool_notification_end (supervisor agent done)
   13. tool_notification_start/end (write_todos update)
   14. execution_plan_status_update
-  15. final_result (supervisor synthesis or sub-agent content)  <-- always sent
-  16. status-update (completed, final=true)                     <-- isFinal
+  15. streaming_result chunks (supervisor may continue; all forwarded)
+  16. final_result (final_model_content or _get_final_content selection)
+  17. status-update (completed, final=true)                     <-- isFinal
 """
 
 import unittest
@@ -113,8 +120,8 @@ def _extract_status_events(executor):
 class TestStreamingChunkSuppression(unittest.IsolatedAsyncioTestCase):
     """
     After a single sub-agent sends complete_result (sub_agents_completed == 1),
-    non-notification streaming chunks from the supervisor must be suppressed
-    (accumulated silently in supervisor_content, not forwarded to client).
+    non-notification streaming chunks from the supervisor are still forwarded
+    as streaming_result; they also accumulate in supervisor_content.
     """
 
     async def test_chunks_before_subagent_completion_are_forwarded(self):
@@ -134,7 +141,7 @@ class TestStreamingChunkSuppression(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(artifacts[1].append)    # Second chunk: append
 
     async def test_chunks_after_single_subagent_completion_are_suppressed(self):
-        """After 1 sub-agent completes, streaming chunks must be silently accumulated."""
+        """After 1 sub-agent completes, streaming chunks are suppressed (dedup guard)."""
         executor = _make_executor()
         state = StreamState()
         state.sub_agents_completed = 1  # Sub-agent already sent complete_result
@@ -144,11 +151,10 @@ class TestStreamingChunkSuppression(unittest.IsolatedAsyncioTestCase):
         await executor._handle_streaming_chunk({}, state, "Here is the result:", task, eq)
         await executor._handle_streaming_chunk({}, state, " ArgoCD v2.9.3", task, eq)
 
-        # No artifacts should have been forwarded
         artifacts = _extract_artifacts(executor)
         self.assertEqual(len(artifacts), 0)
 
-        # Content is accumulated in supervisor_content for later use as final_result
+        # Content is still accumulated in supervisor_content for later use as final_result
         self.assertIn("Here is the result:", state.supervisor_content)
         self.assertIn(" ArgoCD v2.9.3", state.supervisor_content)
 
@@ -229,17 +235,16 @@ class TestStreamingChunkSuppression(unittest.IsolatedAsyncioTestCase):
         await executor._handle_streaming_chunk({}, state, '', task, eq)
         self.assertEqual(len(_extract_sent_events(executor)), 0)
 
-    async def test_suppressed_chunks_do_not_create_streaming_artifact_id(self):
-        """Suppressed chunks should not set streaming_artifact_id."""
+    async def test_chunks_after_subagent_completion_do_not_create_streaming_artifact(self):
+        """Suppressed chunks after sub-agent completion do not set streaming_artifact_id."""
         executor = _make_executor()
         state = StreamState()
         state.sub_agents_completed = 1
         task = _make_task()
         eq = _make_event_queue()
 
-        await executor._handle_streaming_chunk({}, state, "Suppressed content", task, eq)
+        await executor._handle_streaming_chunk({}, state, "Post-completion content", task, eq)
 
-        # streaming_artifact_id should remain None since no artifact was created
         self.assertIsNone(state.streaming_artifact_id)
 
     async def test_suppressed_chunks_accumulate_in_supervisor_content(self):
@@ -264,9 +269,9 @@ class TestStreamingChunkSuppression(unittest.IsolatedAsyncioTestCase):
 
 class TestGetFinalContent(unittest.IsolatedAsyncioTestCase):
     """
-    _get_final_content must prefer supervisor_content for all scenarios
-    (single and multi-agent), falling back to sub_agent_content when
-    no supervisor synthesis is available.
+    _get_final_content: DataPart first; single sub-agent (==1) prefers
+    sub_agent_content over supervisor_content; multi-agent (>1) prefers
+    supervisor_content when both exist.
     """
 
     async def test_datapart_has_highest_priority(self):
@@ -281,11 +286,24 @@ class TestGetFinalContent(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_datapart)
         self.assertEqual(content, {'chart_type': 'bar', 'data': [1, 2, 3]})
 
-    async def test_supervisor_content_preferred_over_sub_agent_content(self):
-        """Supervisor synthesis is returned when both supervisor and sub-agent content exist."""
+    async def test_sub_agent_content_preferred_for_single_agent(self):
+        """Single sub-agent: sub_agent_content wins when both are present."""
         executor = _make_executor()
         state = StreamState()
         state.sub_agents_completed = 1
+        state.supervisor_content = ['Supervisor synthesis answer.']
+        state.sub_agent_content = ['Raw sub-agent output']
+
+        content, is_datapart = executor._get_final_content(state)
+        self.assertFalse(is_datapart)
+        self.assertIn('Raw sub-agent', content)
+        self.assertNotIn('Supervisor synthesis', content)
+
+    async def test_supervisor_content_preferred_for_multi_agent_when_both_present(self):
+        """Multi-agent: supervisor_content wins when both supervisor and sub-agent exist."""
+        executor = _make_executor()
+        state = StreamState()
+        state.sub_agents_completed = 2
         state.supervisor_content = ['Supervisor synthesis answer.']
         state.sub_agent_content = ['Raw sub-agent output']
 
@@ -375,7 +393,7 @@ class TestStreamEnd(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(status_events[0].final)
 
     async def test_single_agent_sends_supervisor_synthesis_when_available(self):
-        """Single sub-agent with supervisor_content: supervisor synthesis used as final_result."""
+        """Single sub-agent: sub_agent_content preferred over supervisor synthesis for final_result."""
         executor = _make_executor()
         state = StreamState()
         state.sub_agents_completed = 1
@@ -394,8 +412,8 @@ class TestStreamEnd(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(artifacts), 1)
         self.assertEqual(artifacts[0].artifact.name, 'final_result')
         text = artifacts[0].artifact.parts[0].root.text
-        self.assertIn('synthesized answer', text)
-        self.assertNotIn('[FINAL ANSWER]', text)
+        self.assertIn('Raw sub-agent output', text)
+        self.assertNotIn('synthesized answer', text)
 
         status_events = _extract_status_events(executor)
         self.assertEqual(len(status_events), 1)
@@ -529,7 +547,7 @@ class TestTaskComplete(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(status_events[0].final)
 
     async def test_single_agent_prefers_supervisor_synthesis(self):
-        """Single sub-agent with supervisor_content: supervisor synthesis used as final_result."""
+        """Single sub-agent: sub_agent_content used as final_result when both are present."""
         executor = _make_executor()
         state = StreamState()
         state.sub_agents_completed = 1
@@ -545,8 +563,8 @@ class TestTaskComplete(unittest.IsolatedAsyncioTestCase):
         artifacts = _extract_artifacts(executor)
         self.assertEqual(len(artifacts), 1)
         text = artifacts[0].artifact.parts[0].root.text
-        self.assertIn('Supervisor synthesized answer', text)
-        self.assertNotIn('[FINAL ANSWER]', text)
+        self.assertIn('Raw sub-agent output', text)
+        self.assertNotIn('Supervisor synthesized answer', text)
 
     async def test_multi_agent_sends_final_result(self):
         """Multi-agent: final_result IS sent with synthesized content."""
@@ -648,8 +666,9 @@ class TestEndToEndGitHubProfilePattern(unittest.IsolatedAsyncioTestCase):
     Expected pattern (sanitized):
       supervisor streams intro → write_todos → sub-agent streams → tools →
       sub-agent streams answer → complete_result (forwarded) →
-      [supervisor chunks suppressed, accumulated in supervisor_content] →
-      final_result (supervisor synthesis) →
+      supervisor post-complete chunks (forwarded as streaming_result and
+      accumulated in supervisor_content) →
+      final_result (sub_agent_content preferred for single sub-agent) →
       status: completed (final=true)
     """
 
@@ -709,8 +728,8 @@ class TestEndToEndGitHubProfilePattern(unittest.IsolatedAsyncioTestCase):
         await executor._handle_sub_agent_artifact(complete_event, state, task, eq)
         self.assertEqual(state.sub_agents_completed, 1)
 
-        # Phase 6: Supervisor re-streams content (SUPPRESSED as streaming_result,
-        # but accumulated in supervisor_content for use as final_result)
+        # Phase 6: Supervisor re-streams content (forwarded as streaming_result
+        # and accumulated in supervisor_content)
         await executor._handle_streaming_chunk({}, state, "Here's the GitHub profile", task, eq)
         await executor._handle_streaming_chunk({}, state, " for **testuser**:", task, eq)
         await executor._handle_streaming_chunk({}, state, " They have 42 repos.", task, eq)
@@ -741,13 +760,12 @@ class TestEndToEndGitHubProfilePattern(unittest.IsolatedAsyncioTestCase):
         # Exactly 1 complete_result (from sub-agent)
         self.assertEqual(complete_count, 1, "Exactly 1 complete_result expected")
 
-        # Always 1 final_result (supervisor synthesis from suppressed chunks)
+        # Always 1 final_result (sub_agent_content preferred for single sub-agent)
         self.assertEqual(final_count, 1, "final_result must always be sent")
 
-        # Streaming chunks: 3 before sub-agent (suppressed post-subagent chunks
-        # go to supervisor_content, not forwarded as streaming_result)
+        # Streaming: 3 pre-subagent only; post-subagent suppressed by dedup guard
         self.assertEqual(streaming_count, 3,
-                         "Only pre-subagent streaming chunks forwarded")
+                         "Pre-subagent streaming chunks forwarded, post-subagent suppressed")
 
         # Tool notifications always forwarded (3 total: write_todos, github, write_todos)
         self.assertEqual(notif_start_count, 3,
@@ -820,7 +838,7 @@ class TestEndToEndArgocdVersionPattern(unittest.IsolatedAsyncioTestCase):
         await executor._handle_sub_agent_artifact(complete_event, state, task, eq)
         self.assertEqual(state.sub_agents_completed, 1)
 
-        # Supervisor re-streams (SUPPRESSED, accumulated in supervisor_content)
+        # Supervisor re-streams (forwarded and accumulated in supervisor_content)
         await executor._handle_streaming_chunk({}, state, "Here's the ArgoCD version", task, eq)
         await executor._handle_streaming_chunk({}, state, " v2.9.3 running on linux.", task, eq)
 
@@ -847,7 +865,7 @@ class TestEndToEndArgocdVersionPattern(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(artifact_names.count('final_result'), 1,
                          "final_result must always be sent")
 
-        # Pre-subagent streaming only (3 chunks — post-subagent chunks suppressed)
+        # 3 pre-subagent only; post-subagent suppressed by dedup guard
         self.assertEqual(artifact_names.count('streaming_result'), 3)
 
         # Completion
@@ -990,7 +1008,7 @@ class TestEdgeCases(unittest.IsolatedAsyncioTestCase):
         """Multiple supervisor_content chunks are joined before extraction."""
         executor = _make_executor()
         state = StreamState()
-        state.sub_agents_completed = 1
+        state.sub_agents_completed = 2
         state.sub_agent_content = ['raw']
         state.supervisor_content = [
             'Chunk one. ',
