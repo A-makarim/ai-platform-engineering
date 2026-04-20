@@ -1234,6 +1234,10 @@ services:
       # visible/usable in the dev compose stack since admin gating depends on either an OIDC
       # admin claim or this flag (see ui/src/hooks/use-admin-role.ts).
       - ALLOW_DEV_ADMIN_WHEN_SSO_DISABLED=${ALLOW_DEV_ADMIN_WHEN_SSO_DISABLED:-true}
+      # Server-side companion to the UI dev-admin fallback above. Without this,
+      # `/api/autonomous` still treats anonymous sessions as non-admin and returns
+      # 403 "Admin view access required" even though the tab is visible.
+      - ALLOW_ANONYMOUS_ADMIN=${ALLOW_ANONYMOUS_ADMIN:-true}
       # MongoDB (when running with profile caipe-ui; mongodb service is in same profile)
       # (changeme default is for local dev only; for production use Helm chart and External Secrets)
       - MONGODB_URI=${MONGODB_URI:-mongodb://admin:changeme@caipe-mongodb:27017/caipe?authSource=admin}
