@@ -62,6 +62,30 @@ function AutonomousAgentsView() {
     [tasks, selectedId],
   );
 
+  // Spec #099 FR-010 visibility — surface upcoming-task stats prominently
+  // in the header so the operator can answer "what's about to fire?" at a
+  // glance without scanning every row. Recomputed on each tasks update;
+  // cheap (O(N) over typically <50 tasks).
+  const taskStats = useMemo(() => {
+    const enabled = tasks.filter((t) => t.enabled);
+    const withNext = enabled.filter((t) => t.next_run);
+    // Sort ascending by next_run timestamp; first entry is the soonest.
+    const upcoming = withNext
+      .slice()
+      .sort((a, b) => {
+        const ta = a.next_run ? new Date(a.next_run).getTime() : Number.POSITIVE_INFINITY;
+        const tb = b.next_run ? new Date(b.next_run).getTime() : Number.POSITIVE_INFINITY;
+        return ta - tb;
+      });
+    return {
+      total: tasks.length,
+      enabledCount: enabled.length,
+      scheduledCount: withNext.length,
+      nextUp: upcoming[0] ?? null,
+      upcoming: upcoming.slice(0, 3),
+    };
+  }, [tasks]);
+
   // Internal worker that fetches and merges task list. ``silent`` skips
   // the spinner so the polling loop (spec #099 FR-011) doesn't flicker
   // the UI every 30 seconds.
@@ -274,6 +298,60 @@ function AutonomousAgentsView() {
         </div>
       )}
 
+      {hasViewAccess && tasks.length > 0 && (
+        // Spec #099 — compact "what's about to fire?" stats bar so the
+        // operator can answer the upcoming-runs question without scanning
+        // every row. Hidden when no tasks exist (the empty-state below
+        // is more useful in that case).
+        <div
+          className="mx-6 mt-4 flex flex-wrap items-center gap-x-6 gap-y-2 rounded-md border border-border bg-card px-4 py-2 text-xs"
+          data-testid="autonomous-stats"
+        >
+          <span className="text-muted-foreground">
+            Tasks: <span className="font-mono text-foreground">{taskStats.total}</span>
+          </span>
+          <span className="text-muted-foreground">
+            Enabled: <span className="font-mono text-foreground">{taskStats.enabledCount}</span>
+          </span>
+          <span className="text-muted-foreground">
+            Scheduled: <span className="font-mono text-foreground">{taskStats.scheduledCount}</span>
+          </span>
+          {taskStats.nextUp ? (
+            <span className="text-muted-foreground">
+              Next up:{" "}
+              <button
+                type="button"
+                onClick={() => setSelectedId(taskStats.nextUp!.id)}
+                className="font-medium text-foreground underline-offset-2 hover:underline"
+                data-testid="autonomous-stats-next-up"
+              >
+                {taskStats.nextUp.name}
+              </button>
+              {taskStats.nextUp.next_run && (
+                <span className="ml-1 text-muted-foreground/80">
+                  ({(() => {
+                    const t = new Date(taskStats.nextUp.next_run).getTime();
+                    const deltaSec = Math.round((t - Date.now()) / 1000);
+                    const abs = Math.abs(deltaSec);
+                    const future = deltaSec >= 0;
+                    let unit: string; let n: number;
+                    if (abs < 60) { unit = "s"; n = abs; }
+                    else if (abs < 3600) { unit = "m"; n = Math.round(abs / 60); }
+                    else if (abs < 86400) { unit = "h"; n = Math.round(abs / 3600); }
+                    else { unit = "d"; n = Math.round(abs / 86400); }
+                    return future ? `in ${n}${unit}` : `${n}${unit} ago`;
+                  })()})
+                </span>
+              )}
+            </span>
+          ) : (
+            <span className="text-muted-foreground italic">
+              No upcoming runs scheduled.
+            </span>
+          )}
+        </div>
+      )}
+
       {hasViewAccess && (
       <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-4 px-6 py-4 overflow-hidden">
         <section className="overflow-y-auto">
@@ -310,7 +388,13 @@ function AutonomousAgentsView() {
               </div>
               <dl className="grid grid-cols-2 gap-y-1 text-xs">
                 <dt className="text-muted-foreground">Agent</dt>
-                <dd className="font-mono text-foreground">{selectedTask.agent}</dd>
+                <dd className="font-mono text-foreground">
+                  {selectedTask.agent || (
+                    <span className="italic text-muted-foreground">
+                      (LLM router will choose)
+                    </span>
+                  )}
+                </dd>
                 <dt className="text-muted-foreground">Trigger</dt>
                 <dd className="font-mono text-foreground">{selectedTask.trigger.type}</dd>
                 {selectedTask.timeout_seconds != null && (

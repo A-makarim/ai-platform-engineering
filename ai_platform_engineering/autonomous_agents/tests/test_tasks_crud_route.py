@@ -180,10 +180,28 @@ def test_create_task_returns_422_for_unknown_trigger_type(client: TestClient):
 
 
 def test_create_task_returns_422_for_missing_required_field(client: TestClient):
+    """Spec #099 FR-001: ``agent`` is now optional (it's a routing hint,
+    not a required field). The remaining truly-required fields are
+    still validated -- this test now asserts on ``prompt`` which is
+    still mandatory for any meaningful task definition.
+    """
     bad = _cron_task("t1")
-    del bad["agent"]  # required field
+    del bad["prompt"]  # still required
     response = client.post("/api/v1/tasks", json=bad)
     assert response.status_code == 422
+
+
+def test_create_task_succeeds_when_agent_omitted(client: TestClient):
+    """Spec #099 FR-001 / OQ-1: omitting ``agent`` must succeed and
+    persist as null. The supervisor's LLM router will pick a sub-agent
+    from the prompt at run time.
+    """
+    body = _cron_task("t-no-agent")
+    del body["agent"]
+    response = client.post("/api/v1/tasks", json=body)
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["agent"] is None
 
 
 # --- update -------------------------------------------------------------

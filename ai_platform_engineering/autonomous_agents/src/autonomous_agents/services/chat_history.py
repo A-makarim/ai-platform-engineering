@@ -284,7 +284,7 @@ class MongoChatHistoryPublisher:
 
         body_lines = [
             f"Created task '{task.name}' (id: {task.id}).",
-            f"Target sub-agent: {task.agent}",
+            f"Target sub-agent: {task.agent or '(LLM router will choose)'}",
             f"Trigger: {task.trigger.type}",
         ]
         if getattr(task.trigger, "schedule", None):

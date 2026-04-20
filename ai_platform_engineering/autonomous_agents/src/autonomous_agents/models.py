@@ -65,7 +65,22 @@ class TaskDefinition(BaseModel):
     id: str = Field(..., description="Unique task identifier")
     name: str = Field(..., description="Human-readable task name")
     description: str | None = None
-    agent: str = Field(..., description="Target agent name (must match CAIPE agent id)")
+    # Spec #099 FR-001 / OQ-1: ``agent`` is a *hint*, not a hard requirement.
+    # When absent, the supervisor's LLM router picks a sub-agent from the
+    # prompt at run time. Made optional in this revision so operators can
+    # author tasks without knowing CAIPE's internal agent ids.
+    # Empty-string and whitespace-only values are normalised to None by
+    # ``a2a_client._normalize_agent_hint`` so they behave the same as a
+    # missing field on the wire.
+    agent: str | None = Field(
+        default=None,
+        description=(
+            "Optional routing hint — sub-agent id (e.g. 'github', 'argocd'). "
+            "When set, supervisor skips LLM routing and dispatches directly. "
+            "When omitted, the supervisor's LLM picks a sub-agent based on "
+            "the prompt."
+        ),
+    )
     prompt: str = Field(..., description="Prompt sent to the agent when this task fires")
     trigger: CronTrigger | IntervalTrigger | WebhookTrigger = Field(..., discriminator="type")
     llm_provider: str | None = Field(None, description="Override global LLM provider for this task")

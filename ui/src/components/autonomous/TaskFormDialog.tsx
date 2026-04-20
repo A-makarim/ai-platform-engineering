@@ -93,8 +93,12 @@ function fromFormState(form: TaskFormState): { task: AutonomousTask } | { error:
 
   if (!id) return { error: "ID is required." };
   if (!name) return { error: "Name is required." };
-  if (!agent) return { error: "Agent is required." };
   if (!prompt) return { error: "Prompt is required." };
+  // Spec #099 FR-001: agent is a HINT, not a hard requirement. When
+  // omitted, the supervisor's LLM router picks a sub-agent from the
+  // prompt at run time. Empty / whitespace-only values become null on
+  // the wire so the backend treats them as "no hint" rather than as a
+  // literal sub-agent id named "" (which would always preflight-fail).
   // Lock down to the same character set the FastAPI side accepts in
   // path parameters: letters, digits, dash, underscore. Catches a
   // common foot-gun (spaces) before the request even leaves the
@@ -164,7 +168,8 @@ function fromFormState(form: TaskFormState): { task: AutonomousTask } | { error:
     id,
     name,
     description: form.description.trim() || null,
-    agent,
+    // Empty agent => null on the wire (FR-001: agent is optional hint).
+    agent: agent || null,
     prompt,
     llm_provider: form.llm_provider.trim() || null,
     trigger,
@@ -274,16 +279,17 @@ export function TaskFormDialog({ open, onOpenChange, task, onSubmit }: TaskFormD
 
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-1">
-              <Label htmlFor="task-agent">Agent</Label>
+              <Label htmlFor="task-agent">Agent (optional)</Label>
               <Input
                 id="task-agent"
                 value={form.agent}
                 onChange={(e) => update("agent", e.target.value)}
-                placeholder="supervisor"
-                required
+                placeholder="leave blank to let the LLM router decide"
               />
               <p className="text-[11px] text-muted-foreground">
-                Must match a CAIPE supervisor agent id.
+                Optional routing hint (e.g. <code>github</code>). Leave blank
+                and the supervisor&apos;s LLM picks an agent from the prompt
+                at run time.
               </p>
             </div>
             <div className="space-y-1">
