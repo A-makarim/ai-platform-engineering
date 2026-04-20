@@ -1467,10 +1467,12 @@ services:
       # blank in dev; set to a strong random value in production.
       - WEBHOOK_SECRET=${WEBHOOK_SECRET:-}
       # CORS -- the UI talks to this service via the Next.js server-side proxy
-      # so browsers never call us directly; leaving cors_origins empty is the
-      # safe default. Set AUTONOMOUS_CORS_ORIGINS in .env if you ever expose
-      # the port to a browser (NOT recommended -- the proxy enforces auth).
-      - CORS_ORIGINS=${AUTONOMOUS_CORS_ORIGINS:-}
+      # so browsers never call us directly. Default to a valid empty JSON list
+      # rather than a blank string so pydantic-settings can parse list[str]
+      # without needing the operator to export AUTONOMOUS_CORS_ORIGINS='[]'.
+      # Set AUTONOMOUS_CORS_ORIGINS in .env if you ever expose the port to a
+      # browser (NOT recommended -- the proxy enforces auth).
+      - CORS_ORIGINS=${AUTONOMOUS_CORS_ORIGINS:-[]}
     depends_on:
       caipe-mongodb:
         condition: service_healthy

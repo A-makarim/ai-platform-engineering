@@ -874,8 +874,9 @@ services:
       - CHAT_HISTORY_OWNER_EMAIL=${CHAT_HISTORY_OWNER_EMAIL:-autonomous@system}
       # Webhook HMAC fallback secret (set to a strong random value in production).
       - WEBHOOK_SECRET=${WEBHOOK_SECRET:-}
-      # CORS -- empty by default (UI talks via server-side proxy, browsers don't hit us).
-      - CORS_ORIGINS=${AUTONOMOUS_CORS_ORIGINS:-}
+      # CORS -- default to a valid empty JSON list instead of a blank string
+      # so pydantic-settings can parse list[str] without extra shell env.
+      - CORS_ORIGINS=${AUTONOMOUS_CORS_ORIGINS:-[]}
     depends_on:
       # Mongo IS effectively required (we default MONGODB_URI to it
       # above) so wait for the healthcheck. ``required: false`` is the
