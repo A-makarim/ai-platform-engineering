@@ -71,14 +71,6 @@ interface ChatState {
    * preflight_ack, run_request/response, next_run_marker).
    */
   loadAutonomousConversationsFromService: () => Promise<void>;
-  /**
-   * Spec #099 Phase 3 — one-shot input pre-fill for the next chat
-   * mount. Distinct from ``pendingMessage`` (which auto-SENDS) — this
-   * just populates the textbox so the operator can edit and decide
-   * when to hit Send. Used by "+ New Chat" on the Autonomous tab to
-   * nudge the operator toward asking the supervisor to create a task.
-   */
-  inputDraft: string | null;
   setInputDraft: (draft: string | null) => void;
   consumeInputDraft: () => string | null;
   saveMessagesToServer: (conversationId: string) => Promise<void>; // Save messages to MongoDB after streaming
@@ -1021,7 +1013,7 @@ const storeImplementation = (set: any, get: any) => ({
           // thread reads chronologically. ``a2aEvents`` and
           // ``sseEvents`` are preserved from the existing conversation
           // so the rich timeline / debug panel survive resync.
-          const existingAutonomous = new Map(
+          const existingAutonomous = new Map<string, Conversation>(
             state.conversations
               .filter((c) => c.source === 'autonomous')
               .map((c) => [c.id, c] as const),
