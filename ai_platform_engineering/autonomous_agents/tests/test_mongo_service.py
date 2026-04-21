@@ -258,18 +258,6 @@ async def test_delete_purges_runs_and_chat_history_for_reused_task_id(service: M
     assert await service._runs().count_documents({"task_id": "t1"}) == 0
     assert await service._conversations().count_documents({"_id": conv_id}) == 0
     assert await service._messages().count_documents({"conversation_id": conv_id}) == 0
-    assert await service.is_task_deleted("t1") is True
-
-
-async def test_clear_deleted_task_allows_explicit_recreate(service: MongoService):
-    await service.create_task(_task("t1"))
-    await service.delete_task("t1")
-    conv_id = _conversation_id_for_task("t1")
-
-    assert await service.is_task_deleted("t1") is True
-
-    await service.clear_deleted_task("t1")
-    assert await service.is_task_deleted("t1") is False
 
     recreated = _task("t1", name="Replacement task")
     await service.create_task(recreated)

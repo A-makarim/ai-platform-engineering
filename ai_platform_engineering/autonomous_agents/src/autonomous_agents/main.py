@@ -26,11 +26,9 @@ from autonomous_agents.services.mongo import (
     MongoChatHistoryPublisherAdapter,
     MongoRunStoreAdapter,
     MongoTaskStoreAdapter,
-    TaskAlreadyExistsError,
     get_mongo_service,
     reset_mongo_service,
 )
-from autonomous_agents.services.task_loader import load_tasks
 
 
 def fatal_exit(message: str, exit_code: int = 1) -> None:
@@ -128,35 +126,11 @@ async def lifespan(app: FastAPI):
     set_run_store(run_store)
     set_chat_history_publisher(chat_publisher)
 
-    # Load task definitions from YAML and seed the store.
-    # ``create()`` raises TaskAlreadyExistsError for ids already present
-    # in the store -- we treat that as "operator has already taken
-    # ownership of this id via the UI" and skip silently. This makes
-    # the YAML file act as a *default* set of tasks for fresh installs
-    # while leaving live MongoDB-backed deployments alone.
-    yaml_tasks = load_tasks(settings.task_config_path)
-    seeded = 0
-    skipped_deleted = 0
-    for task in yaml_tasks:
-        if await task_store.is_task_deleted(task.id):
-            skipped_deleted += 1
-            continue
-        try:
-            await task_store.create(task)
-            seeded += 1
-        except TaskAlreadyExistsError:
-            continue
-    logger.info(
-        "Seeded %d task(s) from %s (skipped %d already-present, %d deleted)",
-        seeded,
-        settings.task_config_path,
-        len(yaml_tasks) - seeded - skipped_deleted,
-        skipped_deleted,
-    )
-
-    # Read the canonical task list back from the store (which now
-    # includes both YAML defaults and any persisted CRUD edits).
+    # MongoDB is the single source of truth for task definitions.
+    # At startup we read the persisted task set and register it with
+    # the scheduler + webhook router; there is no YAML bootstrap path.
     runtime_tasks = await task_store.list_all()
+    logger.info("Loaded %d persisted task(s) from MongoDB", len(runtime_tasks))
     register_webhook_tasks(runtime_tasks)
     register_tasks(runtime_tasks)
 

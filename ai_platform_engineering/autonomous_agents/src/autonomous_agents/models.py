@@ -107,7 +107,7 @@ class TaskDefinition(BaseModel):
     @classmethod
     def _timeout_must_be_finite(cls, v: float | None) -> float | None:
         # Pydantic's ``gt=0`` constraint accepts ``float('inf')`` and ``nan``,
-        # and PyYAML happily parses ``.inf`` / ``.nan`` from config.yaml.
+        # and YAML/env parsing can happily produce those values too.
         # Either would silently break the httpx timeout at runtime, so reject
         # both at load time. ``Settings`` has the same guard for the global
         # default — keep them in lockstep.

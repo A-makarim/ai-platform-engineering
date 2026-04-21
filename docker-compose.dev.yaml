@@ -1327,9 +1327,8 @@ services:
   # /api/autonomous proxy (admin-gated); this service is the upstream the proxy targets.
   #
   # Configuration:
-  #   - Reads task seed from ai_platform_engineering/autonomous_agents/config.yaml
-  #     (only used when MongoDB is not configured; otherwise the source of truth
-  #     is the autonomous_tasks collection populated via the UI).
+  #   - Task definitions are loaded from MongoDB (autonomous_tasks collection);
+  #     there is no YAML seed/bootstrap path anymore.
   #   - Talks to the supervisor via SUPERVISOR_URL (default http://caipe-supervisor:8000).
   #     Single-node and distributed mode now share the same caipe-supervisor service
   #     (PR #1151 unified the bindings); start the caipe-supervisor profile alongside
@@ -1348,10 +1347,6 @@ services:
     image: ghcr.io/cnoe-io/caipe-autonomous-agents:${IMAGE_TAG:-localtag}
     container_name: autonomous-agents
     ports: ["8002:8002"]
-    volumes:
-      # Mount the seed config read-only -- the running container should never
-      # mutate its own config layer (Dockerfile keeps source root-owned anyway).
-      - ./ai_platform_engineering/autonomous_agents/config.yaml:/app/config.yaml:ro
     env_file: [.env]
     environment:
       # Supervisor A2A endpoint -- defaults to the unified caipe-supervisor service

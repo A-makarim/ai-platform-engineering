@@ -43,10 +43,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     uv sync --locked --no-install-project --no-dev
 
-# Now bring in the source + config and finalise the install.
+# Now bring in the source and finalise the install.
 COPY pyproject.toml uv.lock ./
 COPY src/ src/
-COPY config.yaml ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev
 
@@ -70,12 +69,11 @@ RUN groupadd --system --gid "${APP_GID}" app \
 
 WORKDIR /app
 
-# Source, config, and pyproject metadata stay root-owned with default
+# Source and pyproject metadata stay root-owned with default
 # 644 perms. ``app`` can read them (world-readable) but can't modify
 # them, even when the container is run without ``--read-only``.
 COPY --from=builder /app/pyproject.toml /app/uv.lock ./
 COPY --from=builder /app/src/ ./src/
-COPY --from=builder /app/config.yaml ./
 
 # Only the venv is owned by ``app`` -- it's the one tree the runtime
 # is expected to read+execute from. (Even then it's not modified

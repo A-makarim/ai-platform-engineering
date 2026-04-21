@@ -145,7 +145,6 @@ class RunStore(Protocol):
 # share one canonical string rather than passing it around literally.
 DEFAULT_TASKS_COLLECTION = "autonomous_tasks"
 DEFAULT_RUNS_COLLECTION = "autonomous_runs"
-DEFAULT_DELETED_TASKS_COLLECTION = "autonomous_deleted_tasks"
 DEFAULT_CONVERSATIONS_COLLECTION = "conversations"
 DEFAULT_MESSAGES_COLLECTION = "messages"
 
@@ -304,9 +303,6 @@ class MongoService:
     def _runs(self) -> Any:
         return self._require_primary()[self.settings.mongodb_collection]
 
-    def _deleted_tasks(self) -> Any:
-        return self._require_primary()[DEFAULT_DELETED_TASKS_COLLECTION]
-
     def _conversations(self) -> Any:
         return self._require_chat()[
             self.settings.chat_history_conversations_collection
@@ -342,9 +338,6 @@ class MongoService:
             # ---- Tasks: only the automatic _id_ index is needed.
             #      We pin _id = task.id in create_task so Mongo's
             #      built-in unique index covers lookups already.
-            # ---- Deleted task tombstones: _id == task_id, default
-            #      _id_ index is enough for existence checks.
-
             # ---- Conversations: filter chip (source + recency).
             await self._conversations().create_index(
                 [("source", 1), ("updated_at", -1)]
@@ -399,19 +392,6 @@ class MongoService:
             raise
         return task
 
-    async def is_task_deleted(self, task_id: str) -> bool:
-        """Return True if ``task_id`` was explicitly deleted by an operator.
-
-        Tombstones stop startup seeding from silently recreating a task that
-        still exists in ``config.yaml`` but was deliberately removed from the
-        UI/API. The tombstone is cleared only on explicit re-create.
-        """
-        return await self._deleted_tasks().count_documents({"_id": task_id}, limit=1) > 0
-
-    async def clear_deleted_task(self, task_id: str) -> None:
-        """Remove the delete tombstone for ``task_id`` if it exists."""
-        await self._deleted_tasks().delete_one({"_id": task_id})
-
     async def update_task(
         self, task_id: str, task: TaskDefinition
     ) -> TaskDefinition:
@@ -431,14 +411,6 @@ class MongoService:
         if result.deleted_count == 0:
             raise TaskNotFoundError(task_id)
         await self._purge_task_history(task_id)
-        await self._deleted_tasks().replace_one(
-            {"_id": task_id},
-            {
-                "_id": task_id,
-                "deleted_at": datetime.now(timezone.utc),
-            },
-            upsert=True,
-        )
 
     # ==================================================================
     # Run history
@@ -806,12 +778,6 @@ class MongoTaskStoreAdapter:
 
     async def create(self, task: TaskDefinition) -> TaskDefinition:
         return await self._mongo.create_task(task)
-
-    async def is_task_deleted(self, task_id: str) -> bool:
-        return await self._mongo.is_task_deleted(task_id)
-
-    async def clear_deleted_task(self, task_id: str) -> None:
-        await self._mongo.clear_deleted_task(task_id)
 
     async def update(
         self, task_id: str, task: TaskDefinition

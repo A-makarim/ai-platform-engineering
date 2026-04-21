@@ -322,9 +322,6 @@ async def create_task(task: TaskDefinition) -> dict:
         created = await store.create(task)
     except TaskAlreadyExistsError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    clear_deleted_task = getattr(store, "clear_deleted_task", None)
-    if callable(clear_deleted_task):
-        await clear_deleted_task(created.id)
 
     try:
         await _sync_task_to_runtime(created)
@@ -473,7 +470,7 @@ async def get_task_runs(task_id: str) -> list[TaskRun]:
         return history
     # Only 404 when there is BOTH no history AND no current task
     # definition. This keeps the endpoint useful for inspecting runs
-    # of tasks whose definition was deleted from config.yaml.
+    # of tasks whose definition has since been deleted.
     if await get_task_store().get(task_id) is None:
         raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
     return history

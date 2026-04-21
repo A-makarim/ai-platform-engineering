@@ -63,9 +63,6 @@ class Settings(BaseSettings):
             raise ValueError("must be a finite number")
         return v
 
-    # Path to the YAML file that defines scheduled tasks
-    task_config_path: str = "config.yaml"
-
     # Global fallback HMAC secret for incoming webhooks. When a webhook
     # task has no per-task ``secret`` configured the router falls back
     # to this value so operators can rotate or supply secrets via a
