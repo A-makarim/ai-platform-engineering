@@ -25,7 +25,7 @@ class TaskStatus(str, Enum):
 
 
 # =============================================================================
-# Trigger definitions
+# Trigger definitions -
 # =============================================================================
 
 class CronTrigger(BaseModel):
