@@ -322,6 +322,9 @@ async def create_task(task: TaskDefinition) -> dict:
         created = await store.create(task)
     except TaskAlreadyExistsError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    clear_deleted_task = getattr(store, "clear_deleted_task", None)
+    if callable(clear_deleted_task):
+        await clear_deleted_task(created.id)
 
     try:
         await _sync_task_to_runtime(created)

@@ -222,7 +222,12 @@ export function TaskList({
                         <TriggerIcon type={task.trigger.type} />
                         {describeTrigger(task.trigger)}
                       </span>
-                      <span>agent: <code className="text-[11px]">{task.agent}</code></span>
+                      <span>
+                        agent:{" "}
+                        <code className="text-[11px]">
+                          {task.agent ?? "auto"}
+                        </code>
+                      </span>
                       {/* Spec #099 FR-010 / FR-012: absolute + relative next-run
                           rendering so "will it run soon?" is answerable at a glance. */}
                       <span title={task.next_run ? new Date(task.next_run).toISOString() : ""}>

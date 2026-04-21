@@ -54,7 +54,7 @@ function toFormState(task: AutonomousTask | null | undefined): TaskFormState {
     id: task.id,
     name: task.name,
     description: task.description ?? "",
-    agent: task.agent,
+    agent: task.agent ?? "",
     prompt: task.prompt,
     llm_provider: task.llm_provider ?? "",
     enabled: task.enabled,

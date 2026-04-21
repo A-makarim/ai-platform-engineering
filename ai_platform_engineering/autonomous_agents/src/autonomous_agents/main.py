@@ -136,17 +136,22 @@ async def lifespan(app: FastAPI):
     # while leaving live MongoDB-backed deployments alone.
     yaml_tasks = load_tasks(settings.task_config_path)
     seeded = 0
+    skipped_deleted = 0
     for task in yaml_tasks:
+        if await task_store.is_task_deleted(task.id):
+            skipped_deleted += 1
+            continue
         try:
             await task_store.create(task)
             seeded += 1
         except TaskAlreadyExistsError:
             continue
     logger.info(
-        "Seeded %d task(s) from %s (skipped %d already-present)",
+        "Seeded %d task(s) from %s (skipped %d already-present, %d deleted)",
         seeded,
         settings.task_config_path,
-        len(yaml_tasks) - seeded,
+        len(yaml_tasks) - seeded - skipped_deleted,
+        skipped_deleted,
     )
 
     # Read the canonical task list back from the store (which now

@@ -75,7 +75,7 @@ export interface AutonomousTask {
   id: string;
   name: string;
   description?: string | null;
-  agent: string;
+  agent: string | null;
   prompt: string;
   llm_provider?: string | null;
   trigger: Trigger;
