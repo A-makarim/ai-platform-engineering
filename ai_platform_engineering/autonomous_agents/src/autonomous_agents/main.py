@@ -3,14 +3,10 @@
 import asyncio
 from contextlib import asynccontextmanager
 
-from autonomous_agents.log_config import setup_logging
-
-logger = setup_logging()
-
-# ruff: noqa: E402
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from autonomous_agents.log_config import setup_logging
 from autonomous_agents.config import get_settings
 from autonomous_agents.routes import health, tasks, webhooks
 from autonomous_agents.routes.tasks import set_task_store
@@ -30,123 +26,118 @@ from autonomous_agents.services.mongo import (
     reset_mongo_service,
 )
 
+logger = setup_logging()
 
+
+# -----------------------------
+# FATAL EXIT
+# -----------------------------
 def fatal_exit(message: str, exit_code: int = 1) -> None:
-    """Log a fatal error and terminate the process with ``exit_code``.
-
-    Mirrors the helper in ``dynamic_agents/main.py``. We SystemExit
-    rather than ``sys.exit`` so that `pytest` / reload loops can catch
-    it without killing their whole harness, while `uvicorn main:app`
-    still terminates normally (SystemExit propagates to the top level).
-    """
     logger.error("FATAL: %s", message)
     raise SystemExit(exit_code)
 
 
+# -----------------------------
+# MONGO CONNECTION LOGIC
+# -----------------------------
+async def connect_mongo_with_retry(settings):
+    """Connect to MongoDB with retry logic. Returns connected client or exits."""
+    mongo = get_mongo_service()
+
+    for attempt in range(1, settings.mongodb_connect_max_attempts + 1):
+        if await mongo.connect():
+            return mongo
+
+        logger.warning(
+            "MongoDB connect attempt %d/%d failed; retrying in %.1fs",
+            attempt,
+            settings.mongodb_connect_max_attempts,
+            settings.mongodb_connect_retry_delay_seconds,
+        )
+
+        reset_mongo_service()
+        mongo = get_mongo_service()
+
+        if attempt < settings.mongodb_connect_max_attempts:
+            await asyncio.sleep(settings.mongodb_connect_retry_delay_seconds)
+
+    fatal_exit(
+        f"Failed to connect to MongoDB after "
+        f"{settings.mongodb_connect_max_attempts} attempt(s). "
+        "Check URI, network, and credentials."
+    )
+
+
+# -----------------------------
+# LIFESPAN
+# -----------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
     logger.info("Starting Autonomous Agents service...")
 
-    # ------------------------------------------------------------------
-    # MongoDB is REQUIRED. No in-memory fallback -- if the operator
-    # mis-configures ``MONGODB_URI`` / ``MONGODB_DATABASE`` or the
-    # cluster is unreachable, we surface the failure loudly at startup
-    # rather than silently running on ephemeral stores that would lose
-    # every task definition and run record on the next restart.
-    # Mirrors the ``dynamic_agents`` supervisor's contract.
-    # ------------------------------------------------------------------
+    # ---- Validate config ----
     if not settings.mongodb_uri or not settings.mongodb_database:
         fatal_exit(
             "MONGODB_URI and MONGODB_DATABASE must both be set. "
-            f"(MONGODB_URI={'set' if settings.mongodb_uri else 'UNSET'}, "
-            f"MONGODB_DATABASE={'set' if settings.mongodb_database else 'UNSET'}). "
-            "Configure them in your .env / environment before restarting."
+            f"(URI={'set' if settings.mongodb_uri else 'UNSET'}, "
+            f"DB={'set' if settings.mongodb_database else 'UNSET'})"
         )
 
-    mongo = get_mongo_service()
-    max_attempts = settings.mongodb_connect_max_attempts
-    delay = settings.mongodb_connect_retry_delay_seconds
-    connected = False
-    for attempt in range(1, max_attempts + 1):
-        connected = await mongo.connect()
-        if connected:
-            break
-        if attempt < max_attempts:
-            logger.warning(
-                "MongoDB connect attempt %d/%d failed; retrying in %.1fs",
-                attempt,
-                max_attempts,
-                delay,
-            )
-            # Clear partial state and rebuild the singleton so the next
-            # attempt gets a fresh client rather than reusing a broken
-            # one.
-            reset_mongo_service()
-            mongo = get_mongo_service()
-            await asyncio.sleep(delay)
+    # ---- Mongo connect ----
+    mongo = await connect_mongo_with_retry(settings)
 
-    if not connected:
-        fatal_exit(
-            f"Failed to connect to MongoDB after {max_attempts} attempt(s). "
-            "See prior error logs for the underlying driver exception. "
-            "Verify MONGODB_URI, network reachability, and credentials, "
-            "then restart."
-        )
-
+    # ---- Adapters ----
     task_store = MongoTaskStoreAdapter(mongo)
     run_store = MongoRunStoreAdapter(mongo)
+
     logger.info(
-        "TaskStore + RunStore: MongoDB (db=%s, tasks=%s, runs=%s)",
+        "Mongo stores initialized (db=%s, tasks=%s, runs=%s)",
         settings.mongodb_database,
         settings.mongodb_tasks_collection,
         settings.mongodb_collection,
     )
+
+    # ---- Chat history publisher ----
     if settings.chat_history_publish_enabled:
         chat_publisher = MongoChatHistoryPublisherAdapter(mongo)
         logger.info(
-            "ChatHistoryPublisher: MongoDB (db=%s, owner=%s)",
+            "ChatHistoryPublisher enabled (db=%s)",
             settings.chat_history_database or settings.mongodb_database,
-            settings.chat_history_owner_email,
         )
     else:
-        # Chat-history publishing stays opt-in even with Mongo connected:
-        # some deployments route autonomous runs elsewhere (or suppress
-        # them from the chat sidebar entirely) while still persisting
-        # task/run state in Mongo. ``NoopChatHistoryPublisher`` gives the
-        # scheduler a no-op target so it doesn't need a null check.
         chat_publisher = NoopChatHistoryPublisher()
-        logger.info(
-            "ChatHistoryPublisher: disabled (set "
-            "CHAT_HISTORY_PUBLISH_ENABLED=true to surface autonomous "
-            "runs in the chat sidebar)"
-        )
+        logger.info("ChatHistoryPublisher disabled")
 
+    # ---- Wire dependencies ----
     set_task_store(task_store)
     set_run_store(run_store)
     set_chat_history_publisher(chat_publisher)
 
-    # MongoDB is the single source of truth for task definitions.
-    # At startup we read the persisted task set and register it with
-    # the scheduler + webhook router; there is no YAML bootstrap path.
+    # ---- Load persisted tasks ----
     runtime_tasks = await task_store.list_all()
-    logger.info("Loaded %d persisted task(s) from MongoDB", len(runtime_tasks))
+    logger.info("Loaded %d task(s) from MongoDB", len(runtime_tasks))
+
     register_webhook_tasks(runtime_tasks)
     register_tasks(runtime_tasks)
 
     yield
 
-    # Shutdown
+    # -----------------------------
+    # SHUTDOWN
+    # -----------------------------
     logger.info("Shutting down Autonomous Agents service...")
+
     scheduler = get_scheduler()
     if scheduler.running:
         scheduler.shutdown(wait=False)
-    # Tear down the shared Mongo client so nothing leaks between
-    # uvicorn reloads. reset_mongo_service() is idempotent and safe to
-    # call regardless of whether connect() succeeded above.
+
     reset_mongo_service()
 
 
+# -----------------------------
+# APP FACTORY
+# -----------------------------
 def create_app() -> FastAPI:
     settings = get_settings()
 
@@ -182,6 +173,10 @@ def create_app() -> FastAPI:
 
 app = create_app()
 
+
+# -----------------------------
+# DEV ENTRYPOINT
+# -----------------------------
 if __name__ == "__main__":
     import uvicorn
 
