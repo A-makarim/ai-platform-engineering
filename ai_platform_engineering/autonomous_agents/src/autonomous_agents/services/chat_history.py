@@ -1,56 +1,39 @@
 # Copyright CNOE Contributors (https://cnoe.io)
 # SPDX-License-Identifier: Apache-2.0
 
-"""Chat history publisher -- surfaces autonomous runs in the UI's chat history.
+"""Chat history publisher contracts for autonomous task events.
 
-IMP-13 + spec #099. Operations folks live in the chat sidebar; autonomous
-task runs that never appear there are effectively invisible. The Mongo
-implementation writes each task's lifecycle events as a tagged
-conversation (``source: "autonomous"``) into the existing
-``conversations`` + ``messages`` collections used by the Next.js UI, so
-a single ``?source=autonomous`` filter shows "what did the autonomous
-agent do today?" alongside human chats.
+Purpose
+-------
+Autonomous task runs should appear in the existing chat UI so operators
+can inspect activity via a ``source=autonomous`` filter.
 
-This module defines the Protocol + no-op fallback only; the Mongo
-implementation lives on
-:class:`autonomous_agents.services.mongo.MongoService` and is exposed to
-callers via :class:`~autonomous_agents.services.mongo.MongoChatHistoryPublisherAdapter`.
-Keeping the Protocol here means scheduler / routes / tests depend on a
-driver-free module, and the Mongo path is opt-in at lifespan wiring
-time (``CHAT_HISTORY_PUBLISH_ENABLED`` must be True *and* the Mongo
-connection must succeed).
+Scope
+-----
+This module is intentionally driver-free. It defines:
+- typed message kinds
+- deterministic conversation id helpers
+- ``ChatHistoryPublisher`` protocol
+- ``NoopChatHistoryPublisher`` fallback
 
-Design
-------
-* **Opt-in.** ``CHAT_HISTORY_PUBLISH_ENABLED`` defaults to ``False``.
-  We never touch UI collections unless an operator explicitly enables
-  the feature, because the UI Mongo schema is owned by another package.
-* **Same Mongo cluster, optionally different database.** Defaults to
-  the same ``MONGODB_URI`` / ``MONGODB_DATABASE`` used by the run
-  store; ``CHAT_HISTORY_DATABASE`` overrides only the database name
-  when CAIPE puts chat data on a separate logical DB. Both databases
-  are served from the *same* ``AsyncIOMotorClient`` that ``MongoService``
-  owns -- no second connection pool.
-* **Deterministic ids.** Conversation ``_id`` is
-  ``uuid5(_AUTONOMOUS_NS, f"task:{task_id}")`` -- one conversation per
-  task, stable across runs. Messages are keyed on ``message_id`` with
-  per-run prefixes (``run:<run_id>:request`` / ``:response``) so
-  multiple runs append rather than overwriting.
-* **Best-effort.** The publisher is observability, not source of truth:
-  a flaky chat database must never abort a scheduled task. Callers
-  wrap every publish call in ``scheduler._publish_safely`` or the
-  route-level equivalent so failures are logged and swallowed.
+Mongo persistence is implemented in ``services.mongo.MongoService`` and
+exposed via ``MongoChatHistoryPublisherAdapter``.
+
+Design notes
+------------
+- Feature is opt-in (``CHAT_HISTORY_PUBLISH_ENABLED``).
+- Conversation id is deterministic per task:
+  ``uuid5(_AUTONOMOUS_NS, f"task:{task_id}")``.
+- Message ids are per-run (e.g. ``run:<run_id>:request``), so runs append.
+- Publishing is best-effort observability; callers handle failures safely.
 """
 
 from __future__ import annotations
 
-import logging
 import uuid
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from autonomous_agents.models import TaskDefinition, TaskRun
-
-logger = logging.getLogger("autonomous_agents")
 
 # Module-level UUID5 namespace for deriving conversation ids.
 #
