@@ -713,7 +713,7 @@ class MongoService:
         run history. Purge all Mongo-side artifacts so delete semantics match
         operator expectations: a deleted task is gone.
         """
-        conv_ids = { _conversation_id_for_task(task_id) }
+        conv_ids = {_conversation_id_for_task(task_id) }
 
         cursor = self._conversations().find(
             {"$or": [{"_id": {"$in": list(conv_ids)}}, {"task_id": task_id}]},
