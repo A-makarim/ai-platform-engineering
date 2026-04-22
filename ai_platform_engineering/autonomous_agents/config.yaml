@@ -1,0 +1,55 @@
+# Autonomous Agents Task Configuration
+#
+# Each task defines:
+#   id:          Unique identifier
+#   name:        Human-readable label
+#   description: Optional description
+#   agent:       Target CAIPE agent (matches agent id in supervisor)
+#   prompt:      Prompt sent to the agent when this task fires
+#   trigger:     When/how the task fires (cron | interval | webhook)
+#   llm_provider: Optional override (anthropic-claude | openai | aws-bedrock | azure-openai)
+#   enabled:     Set false to disable without deleting
+#
+# Cron schedule format: minute hour day-of-month month day-of-week (UTC)
+
+tasks:
+  # --- Example: Daily security scan via GitHub agent ---
+  - id: "daily-security-scan"
+    name: "Daily GitHub Security Scan"
+    description: "Scans repos for new vulnerability alerts and open security issues each morning"
+    agent: "github"
+    prompt: >
+      Scan all repositories for new Dependabot vulnerability alerts and open security issues.
+      Summarise findings grouped by severity (critical, high, medium).
+      If any critical alerts are found, flag them clearly.
+    trigger:
+      type: cron
+      schedule: "0 9 * * 1-5"   # 09:00 UTC, Monday–Friday
+    llm_provider: "aws-bedrock"
+    enabled: false               # set true once GitHub agent is configured
+
+  # --- Example: Interval health check ---
+  - id: "platform-health-check"
+    name: "Platform Health Check"
+    description: "Checks ArgoCD app health every 30 minutes"
+    agent: "argocd"
+    prompt: >
+      Check the health of all ArgoCD applications.
+      List any that are Degraded or OutOfSync and explain why.
+    trigger:
+      type: interval
+      minutes: 30
+    enabled: false               # set true once ArgoCD agent is configured
+
+  # --- Example: Webhook trigger from GitHub PR events ---
+  - id: "pr-review"
+    name: "Automated PR Review"
+    description: "Triggered by GitHub webhook when a PR is opened"
+    agent: "github"
+    prompt: >
+      A new pull request has been opened. Review the PR described in the webhook context.
+      Check for: missing tests, security concerns, breaking changes.
+      Post a summary comment on the PR.
+    trigger:
+      type: webhook
+    enabled: false

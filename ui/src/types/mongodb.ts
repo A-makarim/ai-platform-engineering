@@ -58,6 +58,17 @@ export interface Conversation {
   is_archived: boolean;
   is_pinned: boolean;
   deleted_at?: Date | null; // Soft-delete timestamp; null = not deleted; auto-purged after 7 days
+  // Origin marker. The chat sidebar already filters out 'slack' from the
+  // default listing; the autonomous_agents service writes conversations
+  // with `source: 'autonomous'` so operators can pivot the sidebar to
+  // "what did the autonomous agent do today?" via the Autonomous filter
+  // chip. Undefined = legacy human-typed conversation.
+  source?: 'web' | 'slack' | 'autonomous';
+  // Set when `source === 'autonomous'`: the upstream autonomous task
+  // and the specific run that produced this conversation. Lets the
+  // run-history UI deep-link from a run row into the chat thread.
+  task_id?: string;
+  run_id?: string;
 }
 
 // ============================================================================

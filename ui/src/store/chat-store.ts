@@ -24,6 +24,7 @@ interface ChatState {
   streamingConversations: Map<string, StreamingState>;
   a2aEvents: A2AEvent[];
   pendingMessage: string | null; // Message to auto-submit when ChatPanel mounts
+  inputDraft: string | null; // One-shot input pre-fill (spec #099 Phase 3) — fills the textbox without sending
 
   // Per-turn event tracking: selectedTurnId per conversation
   selectedTurnIds: Map<string, string>; // conversationId -> turnId
@@ -60,7 +61,26 @@ interface ChatState {
   updateConversationTitle: (conversationId: string, title: string) => Promise<void>;
   setPendingMessage: (message: string | null) => void;
   consumePendingMessage: () => string | null;
-  loadConversationsFromServer: () => Promise<void>; // Load conversations from server (MongoDB mode only)
+  loadConversationsFromServer: (options?: { source?: 'autonomous' | 'web' }) => Promise<void>; // Load conversations from server (MongoDB mode only)
+  /**
+   * Spec #099 Story 2 — synthesise autonomous-task conversations from
+   * the autonomous-agents service so the chat sidebar's Autonomous tab
+   * works regardless of storage mode (no Mongo needed). Each task
+   * becomes one Conversation; messages mirror the metadata.kind
+   * enumeration the Mongo publisher emits (creation_intent,
+   * preflight_ack, run_request/response, next_run_marker).
+   */
+  loadAutonomousConversationsFromService: () => Promise<void>;
+  /**
+   * Spec #099 Phase 3 — one-shot input pre-fill for the next chat
+   * mount. Distinct from ``pendingMessage`` (which auto-SENDS) — this
+   * just populates the textbox so the operator can edit and decide
+   * when to hit Send. Used by "+ New Chat" on the Autonomous tab to
+   * nudge the operator toward asking the supervisor to create a task.
+   */
+  inputDraft: string | null;
+  setInputDraft: (draft: string | null) => void;
+  consumeInputDraft: () => string | null;
   saveMessagesToServer: (conversationId: string) => Promise<void>; // Save messages to MongoDB after streaming
   recoverInterruptedTask: (conversationId: string, messageId: string, endpoint: string, accessToken?: string) => Promise<boolean>; // Level 2: Poll tasks/get for interrupted messages
   loadMessagesFromServer: (conversationId: string, options?: { force?: boolean }) => Promise<void>; // Load messages from MongoDB when opening conversation
@@ -175,6 +195,7 @@ const storeImplementation = (set: any, get: any) => ({
       streamingConversations: new Map<string, StreamingState>(),
       a2aEvents: [],
       pendingMessage: null,
+      inputDraft: null,
       selectedTurnIds: new Map<string, string>(),
       unviewedConversations: new Set<string>(),
       inputRequiredConversations: new Set<string>(),
@@ -736,6 +757,19 @@ const storeImplementation = (set: any, get: any) => ({
         set({ pendingMessage: message });
       },
 
+      setInputDraft: (draft) => {
+        set({ inputDraft: draft });
+      },
+
+      consumeInputDraft: () => {
+        const state = get();
+        const draft = state.inputDraft;
+        if (draft) {
+          set({ inputDraft: null });
+        }
+        return draft;
+      },
+
       consumePendingMessage: () => {
         const state = get();
         const message = state.pendingMessage;
@@ -745,7 +779,7 @@ const storeImplementation = (set: any, get: any) => ({
         return message;
       },
 
-      loadConversationsFromServer: async () => {
+      loadConversationsFromServer: async (options?: { source?: 'autonomous' | 'web' }) => {
         const storageMode = getStorageMode();
 
         // Only load from server in MongoDB mode
@@ -763,10 +797,10 @@ const storeImplementation = (set: any, get: any) => ({
         isLoadingConversations = true;
 
         try {
-          console.log('[ChatStore] Loading conversations from MongoDB...');
+          console.log('[ChatStore] Loading conversations from MongoDB...', options);
           let response;
           try {
-            response = await apiClient.getConversations({ page_size: 100 });
+            response = await apiClient.getConversations({ page_size: 100, source: options?.source });
           } catch (apiError) {
             // Check if it's an auth error (expected when not logged in)
             const errorMessage = apiError instanceof Error ? apiError.message : String(apiError);
@@ -858,6 +892,9 @@ const storeImplementation = (set: any, get: any) => ({
               agent_id: conv.agent_id, // Dynamic agent ID; undefined = Platform Engineer
               owner_id: conv.owner_id,
               sharing: conv.sharing,
+              source: (conv as { source?: 'web' | 'slack' | 'autonomous' }).source,
+              task_id: (conv as { task_id?: string }).task_id,
+              run_id: (conv as { run_id?: string }).run_id,
             };
           });
 
@@ -913,6 +950,111 @@ const storeImplementation = (set: any, get: any) => ({
         } finally {
           isLoadingConversations = false;
         }
+      },
+
+      /**
+       * Spec #099 Story 2 — autonomous-task-as-conversation adapter.
+       *
+       * Fetches every task from the autonomous-agents service and, in
+       * parallel, its run history; synthesises a Conversation per task
+       * using ``synthesizeConversationForTask`` and merges them into the
+       * store. Existing autonomous Conversations are *replaced* by the
+       * fresh synthesis (so prompt edits / new runs / new acks land
+       * immediately); non-autonomous Conversations are preserved.
+       *
+       * Errors are swallowed and logged: a flaky autonomous-agents
+       * service must never blank the chat sidebar. Preserves existing
+       * autonomous conversations from the previous successful sync if
+       * the new fetch fails -- consistent with
+       * ``loadConversationsFromServer``'s contract.
+       */
+      loadAutonomousConversationsFromService: async () => {
+        // Lazy import keeps the autonomous-only deps out of the chat
+        // store's main module load, and avoids a circular import
+        // between chat-store -> autonomous-api at startup.
+        const [{ autonomousApi }, { synthesizeConversationForTask }] = await Promise.all([
+          import('@/components/autonomous/api'),
+          import('@/components/autonomous/synthesize-conversation'),
+        ]);
+
+        let tasks;
+        try {
+          tasks = await autonomousApi.listTasks();
+        } catch (err) {
+          console.warn(
+            '[ChatStore] Failed to load autonomous tasks for sidebar:', err,
+          );
+          return;
+        }
+
+        // Pull runs per task in parallel. Each task's runs is best-effort
+        // -- a 404 / 5xx for one task should not break the rest.
+        const runsPerTask = await Promise.all(
+          tasks.map(async (task) => {
+            try {
+              const runs = await autonomousApi.listRuns(task.id);
+              return { task, runs };
+            } catch (err) {
+              console.warn(
+                `[ChatStore] Failed to load runs for autonomous task ${task.id}:`, err,
+              );
+              return { task, runs: [] };
+            }
+          }),
+        );
+
+        const synthesized = runsPerTask.map(({ task, runs }) =>
+          synthesizeConversationForTask(task, runs),
+        );
+
+        set((state) => {
+          // MERGE rather than replace: when the user has typed messages
+          // into an autonomous chat thread, those live in the existing
+          // Conversation's ``messages`` / ``a2aEvents`` arrays. A naive
+          // replace would wipe them on every 30s sidebar resync.
+          // Strategy: take the freshly-synthesised canonical messages
+          // (creation_intent, preflight_ack, run_request/response,
+          // next_run_marker — all with stable id schemas), then
+          // append any existing messages whose ids are NOT in the
+          // synthesised set (those are necessarily user-typed turns or
+          // streamed assistant replies). Sort by timestamp so the
+          // thread reads chronologically. ``a2aEvents`` and
+          // ``sseEvents`` are preserved from the existing conversation
+          // so the rich timeline / debug panel survive resync.
+          const existingAutonomous = new Map(
+            state.conversations
+              .filter((c) => c.source === 'autonomous')
+              .map((c) => [c.id, c] as const),
+          );
+
+          const merged = synthesized.map((freshConv) => {
+            const existing = existingAutonomous.get(freshConv.id);
+            if (!existing) return freshConv;
+
+            const synthIds = new Set(freshConv.messages.map((m) => m.id));
+            const userTyped = existing.messages.filter((m) => !synthIds.has(m.id));
+            const messages = [...freshConv.messages, ...userTyped].sort(
+              (a, b) => a.timestamp.getTime() - b.timestamp.getTime(),
+            );
+
+            return {
+              ...freshConv,
+              messages,
+              a2aEvents: existing.a2aEvents,
+              sseEvents: existing.sseEvents,
+            };
+          });
+
+          const others = state.conversations.filter((c) => c.source !== 'autonomous');
+          const final = [...others, ...merged].sort(
+            (a, b) => b.updatedAt.getTime() - a.updatedAt.getTime(),
+          );
+          return { conversations: final };
+        });
+
+        console.log(
+          `[ChatStore] Synthesised ${synthesized.length} autonomous-task conversations`,
+        );
       },
 
       // Save messages to MongoDB via upsert (idempotent).

@@ -1,0 +1,181 @@
+"""Pydantic models for Autonomous Agents service."""
+
+from datetime import datetime, timezone
+from enum import Enum
+from typing import TYPE_CHECKING, Any, Literal
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+if TYPE_CHECKING:  # pragma: no cover - import-cycle break
+    from autonomous_agents.services.preflight import Acknowledgement
+
+
+class TriggerType(str, Enum):
+    CRON = "cron"
+    WEBHOOK = "webhook"
+    INTERVAL = "interval"
+
+
+class TaskStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+# =============================================================================
+# Trigger definitions
+# =============================================================================
+
+class CronTrigger(BaseModel):
+    type: Literal[TriggerType.CRON] = TriggerType.CRON
+    schedule: str = Field(..., description="Cron expression e.g. '0 9 * * *'")
+
+
+class IntervalTrigger(BaseModel):
+    type: Literal[TriggerType.INTERVAL] = TriggerType.INTERVAL
+    seconds: int | None = None
+    minutes: int | None = None
+    hours: int | None = None
+
+    @model_validator(mode="after")
+    def require_positive_interval(self) -> "IntervalTrigger":
+        invalid = [name for name, val in [("seconds", self.seconds), ("minutes", self.minutes), ("hours", self.hours)] if val is not None and val <= 0]
+        if invalid:
+            raise ValueError(f"IntervalTrigger fields must be positive integers: {', '.join(invalid)}")
+        if not any([self.seconds, self.minutes, self.hours]):
+            raise ValueError("IntervalTrigger requires at least one of seconds, minutes, or hours to be a positive integer")
+        return self
+
+
+class WebhookTrigger(BaseModel):
+    type: Literal[TriggerType.WEBHOOK] = TriggerType.WEBHOOK
+    secret: str | None = Field(None, description="Optional HMAC secret for payload validation")
+
+
+Trigger = CronTrigger | IntervalTrigger | WebhookTrigger
+
+
+# =============================================================================
+# Task definition (loaded from YAML)
+# =============================================================================
+
+class TaskDefinition(BaseModel):
+    id: str = Field(..., description="Unique task identifier")
+    name: str = Field(..., description="Human-readable task name")
+    description: str | None = None
+    # Spec #099 FR-001 / OQ-1: ``agent`` is a *hint*, not a hard requirement.
+    # When absent, the supervisor's LLM router picks a sub-agent from the
+    # prompt at run time. Made optional in this revision so operators can
+    # author tasks without knowing CAIPE's internal agent ids.
+    # Empty-string and whitespace-only values are normalised to None by
+    # ``a2a_client._normalize_agent_hint`` so they behave the same as a
+    # missing field on the wire.
+    agent: str | None = Field(
+        default=None,
+        description=(
+            "Optional routing hint — sub-agent id (e.g. 'github', 'argocd'). "
+            "When set, supervisor skips LLM routing and dispatches directly. "
+            "When omitted, the supervisor's LLM picks a sub-agent based on "
+            "the prompt."
+        ),
+    )
+    prompt: str = Field(..., description="Prompt sent to the agent when this task fires")
+    trigger: CronTrigger | IntervalTrigger | WebhookTrigger = Field(..., discriminator="type")
+    llm_provider: str | None = Field(None, description="Override global LLM provider for this task")
+    enabled: bool = True
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    # Optional per-task overrides for the supervisor A2A call. When None,
+    # the service-wide defaults from Settings (A2A_TIMEOUT_SECONDS /
+    # A2A_MAX_RETRIES) apply. Useful for slow-running synthesis prompts
+    # (raise the timeout) or for "best-effort, don't burn quota" tasks
+    # (force max_retries=0).
+    timeout_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        description="Override A2A_TIMEOUT_SECONDS for this task (seconds, > 0).",
+    )
+    max_retries: int | None = Field(
+        default=None,
+        ge=0,
+        description="Override A2A_MAX_RETRIES for this task (>= 0; 0 disables retries).",
+    )
+
+    @field_validator("timeout_seconds")
+    @classmethod
+    def _timeout_must_be_finite(cls, v: float | None) -> float | None:
+        # Pydantic's ``gt=0`` constraint accepts ``float('inf')`` and ``nan``,
+        # and PyYAML happily parses ``.inf`` / ``.nan`` from config.yaml.
+        # Either would silently break the httpx timeout at runtime, so reject
+        # both at load time. ``Settings`` has the same guard for the global
+        # default — keep them in lockstep.
+        if v is None:
+            return v
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("timeout_seconds must be a finite number")
+        return v
+
+    # ------------------------------------------------------------------
+    # Pre-flight acknowledgement (spec #099, FR-002)
+    # ------------------------------------------------------------------
+    # Server-managed: the create/update routes scrub any client-supplied
+    # value and overwrite this field with the result of the actual
+    # preflight call to the supervisor. We declare the field as ``Any``
+    # rather than typing it as ``Acknowledgement`` to avoid a circular
+    # import (``services.preflight`` imports ``Settings``, which imports
+    # this module). The TYPE_CHECKING import above gives editors the
+    # real type for hover/auto-complete without paying the runtime cost.
+    last_ack: Any | None = Field(
+        default=None,
+        description=(
+            "Most recent supervisor pre-flight acknowledgement for this task. "
+            "Server-managed; client-supplied values are ignored on POST/PUT."
+        ),
+    )
+
+
+# =============================================================================
+# Task run records (in-memory, can be backed by DB later)
+# =============================================================================
+
+class TaskRun(BaseModel):
+    run_id: str
+    task_id: str
+    task_name: str
+    status: TaskStatus
+    started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    finished_at: datetime | None = None
+    response_preview: str | None = None
+    error: str | None = None
+    # IMP-13: id of the chat-history conversation that mirrors this
+    # run, when publishing is enabled. Lets the UI deep-link from a
+    # run row to ``/chat/<conversation_id>``. Optional and stable per
+    # ``run_id`` (UUID5-derived) so the field is safe to leave unset
+    # for runs from before publishing was turned on.
+    conversation_id: str | None = None
+    # Spec #099 Phase B — full supervisor response and captured A2A
+    # streaming events. Populated when the run uses the streaming code
+    # path (``invoke_agent_streaming``); ``None`` / empty for legacy
+    # blocking calls and for runs persisted before this field existed.
+    # The chat-thread synthesiser in the UI replays ``events`` so past
+    # scheduled fires render with the same plan + tools + timeline a
+    # typed chat reply gets, rather than the 500-char ``response_preview``
+    # tombstone. ``response_full`` is the same text that appears in the
+    # final_result artifact, kept alongside the events as a cheap
+    # convenience for callers (search, downstream formatters, audit
+    # logs) that don't want to walk the events list.
+    response_full: str | None = None
+    events: list[dict[str, Any]] = Field(default_factory=list)
+
+
+# =============================================================================
+# Webhook payload
+# =============================================================================
+
+class WebhookPayload(BaseModel):
+    """Generic webhook payload — passed as context to the agent prompt."""
+    source: str | None = None
+    event: str | None = None
+    data: dict[str, Any] = Field(default_factory=dict)

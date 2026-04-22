@@ -23,6 +23,17 @@ from ai_platform_engineering.multi_agents.tools.workspace_ops import (
     list_workspace_files,
     clear_workspace
 )
+# Spec #099 Phase 3 — autonomous-task management tools so the supervisor's
+# main agent can chat-create / update / delete / trigger autonomous tasks
+# without forcing the operator into the form dialog.
+from ai_platform_engineering.multi_agents.tools.autonomous_tasks import (
+    list_autonomous_tasks,
+    create_autonomous_task,
+    update_autonomous_task,
+    delete_autonomous_task,
+    trigger_autonomous_task_now,
+    validate_cron_expression,
+)
 
 # Command-line tools from utils/agent_tools/ (available to all agents)
 from ai_platform_engineering.utils.agent_tools import (
@@ -49,6 +60,14 @@ __all__ = [
     'read_workspace_file',
     'list_workspace_files',
     'clear_workspace',
+
+    # Autonomous-task management (spec #099 Phase 3)
+    'list_autonomous_tasks',
+    'create_autonomous_task',
+    'update_autonomous_task',
+    'delete_autonomous_task',
+    'trigger_autonomous_task_now',
+    'validate_cron_expression',
 
     # Command-line tools (pass full shell command)
     'git',          # git("git clone https://github.com/org/repo")
