@@ -81,6 +81,22 @@ class TaskDefinition(BaseModel):
             "the prompt."
         ),
     )
+    # When set, scheduler + preflight target the dynamic-agents service
+    # instead of the supervisor so the prompt actually executes through
+    # the user's custom agent (its tools / system prompt / middleware).
+    # Semantically mutually exclusive with `agent` (which names a CAIPE
+    # MAS sub-agent). If both are set, ``dynamic_agent_id`` wins -- see
+    # the validator below -- because the supervisor has no awareness of
+    # dynamic-agent ids and would always preflight-fail them.
+    dynamic_agent_id: str | None = Field(
+        default=None,
+        description=(
+            "Dynamic-agents service agent id. When set, scheduler and "
+            "preflight target the dynamic-agents service instead of the "
+            "supervisor so the prompt runs through that custom agent's "
+            "tools / system prompt / middleware."
+        ),
+    )
     prompt: str = Field(..., description="Prompt sent to the agent when this task fires")
     trigger: CronTrigger | IntervalTrigger | WebhookTrigger = Field(..., discriminator="type")
     llm_provider: str | None = Field(None, description="Override global LLM provider for this task")
@@ -116,6 +132,26 @@ class TaskDefinition(BaseModel):
         if v != v or v in (float("inf"), float("-inf")):
             raise ValueError("timeout_seconds must be a finite number")
         return v
+
+    @model_validator(mode="after")
+    def _reconcile_agent_routing(self) -> "TaskDefinition":
+        # ``agent`` (CAIPE MAS sub-agent hint -> supervisor) and
+        # ``dynamic_agent_id`` (custom agent -> dynamic-agents service) are
+        # semantically mutually exclusive: the supervisor can't honour a
+        # dynamic-agent id, and the dynamic-agents service has no notion
+        # of MAS sub-agent hints. If both arrive (e.g. a draft created
+        # before this field existed and then re-stamped by the editor),
+        # prefer the explicit dynamic-agent route and clear the legacy
+        # hint so downstream branches stay unambiguous.
+        if self.dynamic_agent_id and self.agent:
+            import logging
+            logging.getLogger("autonomous_agents").warning(
+                "task %s has both agent=%r and dynamic_agent_id=%r; "
+                "preferring dynamic_agent_id and dropping agent hint.",
+                self.id, self.agent, self.dynamic_agent_id,
+            )
+            object.__setattr__(self, "agent", None)
+        return self
 
     # ------------------------------------------------------------------
     # Pre-flight acknowledgement (spec #099, FR-002)

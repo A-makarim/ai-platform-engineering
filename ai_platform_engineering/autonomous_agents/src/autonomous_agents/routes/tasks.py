@@ -34,6 +34,7 @@ from autonomous_agents.services.mongo import (
     TaskNotFoundError,
     TaskStore,
 )
+from autonomous_agents.services.dynamic_agents_client import preflight_dynamic_agent
 from autonomous_agents.services.preflight import Acknowledgement, preflight
 
 logger = logging.getLogger("autonomous_agents")
@@ -145,6 +146,12 @@ def _serialize_task(task: TaskDefinition, next_run_iso: str | None) -> dict:
         "name": task.name,
         "description": task.description,
         "agent": task.agent,
+        # When set, scheduler + preflight route this task through the
+        # dynamic-agents service instead of the supervisor (so the
+        # prompt actually executes inside the user's custom agent).
+        # Round-trip on the wire so the UI can render a distinct
+        # routing label and so unchanged-task PUTs preserve the value.
+        "dynamic_agent_id": getattr(task, "dynamic_agent_id", None),
         "prompt": task.prompt,
         "llm_provider": task.llm_provider,
         "trigger": _serialize_trigger(task),
@@ -168,17 +175,20 @@ def _serialize_task(task: TaskDefinition, next_run_iso: str | None) -> dict:
 def _ack_relevant_changed(old: TaskDefinition | None, new: TaskDefinition) -> bool:
     """Return True if a re-ack is warranted for a task update.
 
-    Re-ack on prompt / agent / llm_provider changes — those affect what
-    the supervisor would do at run time. Trigger / enabled / metadata
-    changes don't change routing or tool availability so we keep the
-    existing ack to avoid an unnecessary supervisor round-trip on every
-    enable/disable toggle.
+    Re-ack on prompt / agent / dynamic_agent_id / llm_provider changes —
+    those affect what the supervisor (or the dynamic-agents service)
+    would do at run time, including the routing target itself.
+    Trigger / enabled / metadata changes don't change routing or tool
+    availability so we keep the existing ack to avoid an unnecessary
+    backend round-trip on every enable/disable toggle.
     """
     if old is None:
         return True
     return (
         old.prompt != new.prompt
         or old.agent != new.agent
+        or getattr(old, "dynamic_agent_id", None)
+        != getattr(new, "dynamic_agent_id", None)
         or old.llm_provider != new.llm_provider
     )
 
@@ -199,12 +209,23 @@ async def _run_preflight_and_persist(task_id: str) -> None:
         # Nothing to persist; nothing to log loudly.
         return
     try:
-        ack = await preflight(
-            task_id=task.id,
-            prompt=task.prompt,
-            agent=task.agent,
-            llm_provider=task.llm_provider,
-        )
+        if task.dynamic_agent_id:
+            # Custom (dynamic) agent path: probe the dynamic-agents
+            # service for agent reachability instead of asking the
+            # supervisor to look the id up in its MAS sub-agent
+            # registry (which would always return ack_status="failed"
+            # because the supervisor has zero awareness of dynamic
+            # agents).
+            ack = await preflight_dynamic_agent(
+                agent_id=task.dynamic_agent_id,
+            )
+        else:
+            ack = await preflight(
+                task_id=task.id,
+                prompt=task.prompt,
+                agent=task.agent,
+                llm_provider=task.llm_provider,
+            )
     except Exception:
         # Defensive: preflight() is contractually no-raise but if a future
         # code change regresses that we still don't want to nuke the task.

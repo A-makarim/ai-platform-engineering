@@ -173,6 +173,41 @@ async def test_running_state_is_visible_before_completion(store: _DictRunStore, 
     assert runs[0].status == TaskStatus.SUCCESS
 
 
+async def test_execute_task_routes_dynamic_agent_to_dynamic_client(store: _DictRunStore):
+    """When ``dynamic_agent_id`` is set, ``execute_task`` MUST call the
+    dynamic-agents client and MUST NOT touch ``invoke_agent_streaming``.
+
+    This is the behaviour the user picked over the cosmetic-only ack
+    fix: the prompt has to actually execute through the user's custom
+    agent (its tools / system prompt / middleware), not be silently
+    answered by the supervisor's LLM.
+    """
+    da_task = TaskDefinition(
+        id="custom-task",
+        name="Custom Task",
+        dynamic_agent_id="agent-x",
+        prompt="run the custom thing",
+        trigger=CronTrigger(schedule="0 9 * * *"),
+    )
+
+    invoke_da = AsyncMock(return_value=("custom agent answer", []))
+    invoke_supervisor = AsyncMock(return_value=("supervisor answer", []))
+
+    with (
+        patch("autonomous_agents.scheduler.invoke_dynamic_agent", new=invoke_da),
+        patch("autonomous_agents.scheduler.invoke_agent_streaming", new=invoke_supervisor),
+    ):
+        run = await execute_task(da_task)
+
+    assert run.status == TaskStatus.SUCCESS
+    assert run.response_full == "custom agent answer"
+    invoke_da.assert_awaited_once()
+    invoke_supervisor.assert_not_awaited()
+    # The agent_id forwarded to the dynamic-agents client must match
+    # the field on the task -- catch accidental swaps with task.agent.
+    assert invoke_da.await_args.kwargs["agent_id"] == "agent-x"
+
+
 async def test_execute_task_returns_same_run_object_as_persisted(store: _DictRunStore, task: TaskDefinition):
     """The returned TaskRun is the same instance as the one in the store
     — callers (e.g. webhooks router) rely on this for synchronous

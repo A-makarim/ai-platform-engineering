@@ -877,6 +877,12 @@ services:
     environment:
       # Supervisor A2A endpoint (multi-agent / distributed default)
       - SUPERVISOR_URL=${AUTONOMOUS_SUPERVISOR_URL:-http://caipe-supervisor:8000}
+      # Dynamic-agents service endpoint -- enables routing of autonomous
+      # tasks whose ``dynamic_agent_id`` is set through the user's
+      # custom agent (its tools / system prompt / middleware). Without
+      # this URL, dynamic-agent tasks surface a clear ack failure.
+      # Only effective when the dynamic-agents profile is also active.
+      - DYNAMIC_AGENTS_URL=${DYNAMIC_AGENTS_URL:-http://dynamic-agents:8001}
       # MongoDB persistence -- shared with the UI so the Autonomous tab's
       # task list and run history come from the same source of truth.
       # The caipe-ui-mongodb service is auto-included via the

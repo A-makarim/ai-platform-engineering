@@ -43,6 +43,10 @@ function tasksEqual(a: AutonomousTask, b: AutonomousTask): boolean {
   if (a.name !== b.name) return false;
   if ((a.description ?? null) !== (b.description ?? null)) return false;
   if ((a.agent ?? null) !== (b.agent ?? null)) return false;
+  // dynamic_agent_id is the routing target for custom agent tasks
+  // and changing it changes which backend (supervisor vs dynamic-
+  // agents service) receives the prompt -- definitely a diff.
+  if ((a.dynamic_agent_id ?? null) !== (b.dynamic_agent_id ?? null)) return false;
   if (a.prompt !== b.prompt) return false;
   if ((a.llm_provider ?? null) !== (b.llm_provider ?? null)) return false;
   if (a.enabled !== b.enabled) return false;
@@ -83,10 +87,17 @@ export interface SyncInput {
  * on the server, updates drafts whose fields differ, and deletes
  * server tasks missing from the draft list.
  *
- * Each draft is stamped with ``agent: agentId`` before dispatch so
- * callers never have to remember. A per-entry result list is always
- * returned — failures are captured, never thrown — so the caller can
- * surface partial success (e.g. 2 of 3 created, 1 failed).
+ * Each draft is stamped with ``dynamic_agent_id: agentId`` before
+ * dispatch (and ``agent`` is cleared) so the autonomous-agents
+ * service routes the task through the dynamic-agents service
+ * instead of the supervisor. Without this, the supervisor's
+ * preflight would always fail (it has no awareness of dynamic-
+ * agent ids) and the task body would be silently answered by the
+ * supervisor's own LLM rather than the user's custom agent.
+ *
+ * A per-entry result list is always returned — failures are
+ * captured, never thrown — so the caller can surface partial success
+ * (e.g. 2 of 3 created, 1 failed).
  */
 export async function syncAutonomousTasks({
   agentId,
@@ -101,7 +112,11 @@ export async function syncAutonomousTasks({
 
   // Creates + updates
   for (const draft of drafts) {
-    const stamped: AutonomousTask = { ...draft, agent: agentId };
+    const stamped: AutonomousTask = {
+      ...draft,
+      dynamic_agent_id: agentId,
+      agent: null,
+    };
     const existing = serverById.get(draft.id);
     if (!existing) {
       try {

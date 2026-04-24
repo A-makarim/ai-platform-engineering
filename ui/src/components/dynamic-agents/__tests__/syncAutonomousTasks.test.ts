@@ -7,12 +7,17 @@ import {
   type AutonomousTasksApi,
 } from "../syncAutonomousTasks";
 
+// All fixtures are pre-stamped with the new dynamic-agent routing
+// convention (``dynamic_agent_id: "my_agent"``, ``agent: null``) so
+// "no diff" tests don't accidentally fail on the routing-field change
+// rather than the field they're actually exercising.
 function cronTask(id: string, overrides: Partial<AutonomousTask> = {}): AutonomousTask {
   return {
     id,
     name: `Task ${id}`,
     description: null,
-    agent: "my_agent",
+    agent: null,
+    dynamic_agent_id: "my_agent",
     prompt: "hello",
     llm_provider: null,
     trigger: { type: "cron", schedule: "0 9 * * *" },
@@ -32,9 +37,14 @@ function makeApi(): jest.Mocked<AutonomousTasksApi> {
 }
 
 describe("syncAutonomousTasks", () => {
-  it("stamps agent id onto created tasks", async () => {
+  it("stamps dynamic_agent_id onto created tasks and clears agent", async () => {
+    // Drafts come out of the editor with both routing fields blank --
+    // syncAutonomousTasks is the seam that decides this is a custom-
+    // agent task and stamps ``dynamic_agent_id`` (not ``agent``) so
+    // the autonomous-agents service routes the run through the
+    // dynamic-agents path rather than the supervisor.
     const api = makeApi();
-    const draft = cronTask("t1", { agent: null });
+    const draft = cronTask("t1", { agent: null, dynamic_agent_id: null });
 
     const results = await syncAutonomousTasks({
       agentId: "my_agent",
@@ -45,8 +55,32 @@ describe("syncAutonomousTasks", () => {
 
     expect(api.createTask).toHaveBeenCalledTimes(1);
     const submitted = api.createTask.mock.calls[0][0];
-    expect(submitted.agent).toBe("my_agent");
+    expect(submitted.dynamic_agent_id).toBe("my_agent");
+    expect(submitted.agent).toBeNull();
     expect(results).toEqual([{ op: "create", taskId: "t1", ok: true }]);
+  });
+
+  it("clears a legacy agent hint when stamping dynamic_agent_id", async () => {
+    // Backfill scenario: a task created before this change still has
+    // ``agent: <dynamic-agent-id>`` from the old stamping. Re-saving
+    // the agent must migrate it to ``dynamic_agent_id`` AND null out
+    // ``agent`` so the supervisor branch can never fire on it again.
+    const api = makeApi();
+    const draft = cronTask("t1", {
+      agent: "my_agent",
+      dynamic_agent_id: null,
+    });
+
+    await syncAutonomousTasks({
+      agentId: "my_agent",
+      drafts: [draft],
+      serverTasks: [],
+      api,
+    });
+
+    const submitted = api.createTask.mock.calls[0][0];
+    expect(submitted.dynamic_agent_id).toBe("my_agent");
+    expect(submitted.agent).toBeNull();
   });
 
   it("updates tasks whose editable fields changed", async () => {
@@ -64,7 +98,11 @@ describe("syncAutonomousTasks", () => {
     expect(api.updateTask).toHaveBeenCalledTimes(1);
     expect(api.updateTask).toHaveBeenCalledWith(
       "t1",
-      expect.objectContaining({ prompt: "new", agent: "my_agent" }),
+      expect.objectContaining({
+        prompt: "new",
+        dynamic_agent_id: "my_agent",
+        agent: null,
+      }),
     );
     expect(results).toEqual([{ op: "update", taskId: "t1", ok: true }]);
   });
@@ -135,6 +173,29 @@ describe("syncAutonomousTasks", () => {
       ]),
     );
     expect(results).toHaveLength(3);
+  });
+
+  it("re-syncs when dynamic_agent_id changes (re-targeting)", async () => {
+    // Sanity: changing the dynamic_agent_id (e.g. re-pointing an
+    // autonomous task at a different custom agent) must trigger an
+    // update -- otherwise the routing target on the server would
+    // silently drift behind the editor.
+    const api = makeApi();
+    const server = cronTask("t1", { dynamic_agent_id: "old_agent" });
+    const draft = cronTask("t1", { dynamic_agent_id: "old_agent" });
+
+    await syncAutonomousTasks({
+      agentId: "my_agent",
+      drafts: [draft],
+      serverTasks: [server],
+      api,
+    });
+
+    expect(api.updateTask).toHaveBeenCalledTimes(1);
+    expect(api.updateTask).toHaveBeenCalledWith(
+      "t1",
+      expect.objectContaining({ dynamic_agent_id: "my_agent" }),
+    );
   });
 
   it("captures per-operation failures without throwing", async () => {

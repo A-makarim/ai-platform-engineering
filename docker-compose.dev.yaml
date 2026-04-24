@@ -1366,6 +1366,16 @@ services:
       # (PR #1151 merged the all-in-one and multi-agent variants into one service).
       # Override AUTONOMOUS_SUPERVISOR_URL for non-default hostnames or external supervisors.
       - SUPERVISOR_URL=${AUTONOMOUS_SUPERVISOR_URL:-http://caipe-supervisor:8000}
+      # Dynamic-agents service endpoint -- when a TaskDefinition has
+      # ``dynamic_agent_id`` set, the autonomous-agents scheduler and
+      # preflight bypass the supervisor and call the dynamic-agents
+      # service so the prompt actually executes through the user's
+      # custom agent (its tools / system prompt / middleware) rather
+      # than being silently swallowed by the supervisor's permissive
+      # LLM router. Dev default points at the in-network container;
+      # set DYNAMIC_AGENTS_URL in .env to override (e.g. when running
+      # only the autonomous-agents service against a remote DA).
+      - DYNAMIC_AGENTS_URL=${DYNAMIC_AGENTS_URL:-http://dynamic-agents:8001}
       # MongoDB persistence -- when both URI and DATABASE are set the service
       # uses MongoTaskStore + MongoRunStore instead of the in-memory fallback,
       # so tasks created via the UI survive restarts.
