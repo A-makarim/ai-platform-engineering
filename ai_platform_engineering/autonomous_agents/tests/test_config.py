@@ -90,3 +90,17 @@ def test_cors_origins_rejects_wildcard_in_mixed_list():
     whole list short-circuits to "any origin"."""
     with pytest.raises(pydantic.ValidationError):
         Settings(cors_origins=["http://localhost:3000", "*"])
+
+
+def test_cors_origins_empty_env_string_does_not_crash(monkeypatch):
+    """Docker Compose sets ``CORS_ORIGINS=`` when unset; that must mean
+    "no browser CORS" (the UI uses the Next.js proxy), not a JSON parse
+    error at import time."""
+    monkeypatch.setenv("CORS_ORIGINS", "")
+    s = Settings()
+    assert s.cors_origins == []
+
+
+def test_cors_origins_json_array_in_raw_string():
+    s = Settings(cors_origins_raw='["http://localhost:3000"]')
+    assert s.cors_origins == ["http://localhost:3000"]

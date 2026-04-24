@@ -1,9 +1,32 @@
 """Configuration settings for Autonomous Agents service."""
 
+import json
 from functools import lru_cache
+from typing import Any, Self
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _parse_cors_string(raw: str | None) -> list[str]:
+    """Parse ``CORS_ORIGINS`` / constructor value into a list of origins.
+
+    Accepts: empty (no CORS), a JSON array string, or a comma-separated list.
+    pydantic-settings must *not* bind this field as ``list[str]`` directly:
+    an empty env var becomes ``""`` and the settings source calls
+    ``json.loads("")`` before any field validator runs, which crashes startup.
+    """
+    if raw is None:
+        return []
+    s = str(raw).strip()
+    if not s:
+        return []
+    if s.startswith("["):
+        parsed = json.loads(s)
+        if not isinstance(parsed, list):
+            raise ValueError("CORS_ORIGINS JSON must be a JSON array of strings")
+        return [str(x).strip() for x in parsed if str(x).strip()]
+    return [origin.strip() for origin in s.split(",") if origin.strip()]
 
 
 class Settings(BaseSettings):
@@ -85,37 +108,45 @@ class Settings(BaseSettings):
     # timestamp header. See README.md for the signing contract.
     webhook_replay_window_seconds: int = Field(default=0, ge=0)
 
-    # CORS — keep empty by default; open only in explicit dev/test configs
-    cors_origins: list[str] = []
+    # CORS — stored as a raw string so Docker ``CORS_ORIGINS=`` (empty) does
+    # not trip pydantic-settings' JSON decode for ``list[str]``. Expose the
+    # parsed list via the ``cors_origins`` property (same name as before).
+    cors_origins_raw: str = Field(
+        default="",
+        validation_alias=AliasChoices("CORS_ORIGINS", "AUTONOMOUS_CORS_ORIGINS"),
+    )
+    _cors_origins: list[str] = PrivateAttr(default_factory=list)
 
-    @field_validator("cors_origins", mode="before")
+    @model_validator(mode="before")
     @classmethod
-    def _parse_cors_origins(cls, v):
-        # Accept either a JSON list (native pydantic-settings behaviour)
-        # OR a plain comma-separated string from `.env`. Operators
-        # routinely paste the latter ("http://localhost:3000,https://app.example.com")
-        # and would otherwise hit an opaque parse error. Strings are
-        # split on commas and whitespace-trimmed.
-        if isinstance(v, str):
-            v = [origin.strip() for origin in v.split(",") if origin.strip()]
-        return v
+    def _legacy_cors_constructor_kwarg(cls, data: Any) -> Any:
+        # Unit tests and callers use ``Settings(cors_origins=[...])`` /
+        # ``Settings(cors_origins="http://a,http://b")`` — translate to raw.
+        if not isinstance(data, dict) or "cors_origins" not in data:
+            return data
+        co = data.pop("cors_origins")
+        if isinstance(co, list):
+            data["cors_origins_raw"] = ",".join(str(x) for x in co if str(x)) if co else ""
+        elif isinstance(co, str):
+            data["cors_origins_raw"] = co
+        return data
 
-    @field_validator("cors_origins")
-    @classmethod
-    def _reject_unsafe_cors_wildcard(cls, v: list[str]) -> list[str]:
-        # IMP-05: ``cors_origins=["*"]`` plus ``allow_credentials=True``
-        # (the FastAPI default in main.py) is a CORS spec violation --
-        # browsers refuse the response and you get cryptic "credentialed
-        # request rejected" errors at runtime. Worse, some misconfigured
-        # gateways DO honour it and expose every authenticated route to
-        # any origin. Fail fast at startup so the misconfig is obvious.
-        if any(origin.strip() == "*" for origin in v):
+    @model_validator(mode="after")
+    def _materialize_cors_origins(self) -> Self:
+        # IMP-05: reject ``*`` with allow_credentials=True (see main.py).
+        parsed = _parse_cors_string(self.cors_origins_raw)
+        if any(origin.strip() == "*" for origin in parsed):
             raise ValueError(
                 "cors_origins=['*'] is unsafe with allow_credentials=True; "
                 "list each allowed origin explicitly (e.g. "
                 "['http://localhost:3000','https://app.example.com'])"
             )
-        return v
+        self._cors_origins = parsed
+        return self
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return self._cors_origins
 
     # MongoDB persistence (REQUIRED).
     # Both ``mongodb_uri`` and ``mongodb_database`` must be set before
