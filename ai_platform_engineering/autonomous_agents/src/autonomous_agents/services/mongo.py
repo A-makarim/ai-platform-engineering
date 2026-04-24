@@ -614,7 +614,19 @@ class MongoService:
     ) -> None:
         now = now or datetime.now(timezone.utc)
         effective_task_id = task.id if task else task_id
-        effective_agent = task.agent if task else agent
+        # Routing target precedence: ``task.dynamic_agent_id`` (custom
+        # agent -> dynamic-agents service) > ``task.agent`` (legacy
+        # supervisor sub-agent hint) > the explicit ``agent`` kwarg
+        # (used by ``publish_run`` which has the scheduler-resolved
+        # value already). This matches the precedence in
+        # ``scheduler._publish_safely`` (``task.dynamic_agent_id or
+        # task.agent``) and ``routes/tasks.py``'s preflight branch so
+        # every persisted artifact agrees on which agent owns the
+        # thread.
+        if task is not None:
+            effective_agent = task.dynamic_agent_id or task.agent
+        else:
+            effective_agent = agent
         if effective_task_id is None:
             raise ValueError("task or task_id must be provided")
 
@@ -624,12 +636,35 @@ class MongoService:
             else f"[Autonomous] {effective_task_id}"
         )
 
+        # The UI's routing helpers (``getAgentId`` /
+        # ``isDynamicAgentConversation`` in ui/src/types/a2a.ts) read
+        # the agent target exclusively from ``participants`` -- not
+        # from the top-level ``agent_id`` field. Without this list
+        # ``ChatContainer`` falls back to the supervisor when the
+        # operator clicks an autonomous thread to follow up, which
+        # routes their message to CAIPE instead of the custom agent
+        # that produced the autonomous reply. Mirror the shape used
+        # by ``buildParticipants`` so manual and autonomous chats
+        # share one routing path.
+        participants: list[dict[str, str]] = [
+            {"type": "user", "id": self.settings.chat_history_owner_email},
+        ]
+        if effective_agent:
+            participants.append({"type": "agent", "id": effective_agent})
+
         await self._conversations().update_one(
             {"_id": conv_id},
             {
+                # ``participants`` lives under ``$set`` on purpose so
+                # legacy autonomous conversations already in Mongo
+                # (written before this fix, with no participants)
+                # self-heal the next time the publisher touches them
+                # -- a re-run, preflight ack, or creation update will
+                # backfill the routing target without a migration.
                 "$set": {
                     "title": effective_title,
                     "agent_id": effective_agent,
+                    "participants": participants,
                     "updated_at": now,
                     "metadata": {
                         "agent_version": "autonomous-agents",
