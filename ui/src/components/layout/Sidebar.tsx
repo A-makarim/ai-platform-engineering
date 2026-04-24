@@ -109,16 +109,18 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
           console.error('[Sidebar] Failed to load conversations:', error);
         }
       }
-      // Always (re)load the autonomous task list when on the Autonomous
-      // chip so prompt edits / new runs / new acks land in the sidebar.
-      // Cheap: the autonomous-agents service is local + the synthesis
-      // is in-memory only (no Mongo writes).
-      if (conversationView === 'autonomous') {
-        try {
-          await loadAutonomousConversationsFromService();
-        } catch (error) {
-          console.error('[Sidebar] Failed to sync autonomous tasks:', error);
-        }
+      // Always (re)load the autonomous task list — even on the "All"
+      // chip — so freshly-created tasks and new runs/acks land in the
+      // sidebar without forcing the operator to switch tabs first.
+      // Cheap: the autonomous-agents service is local and the synthesis
+      // is in-memory only (no Mongo writes). Pre-fix this only ran on
+      // ``conversationView === 'autonomous'``, which meant synthesised-
+      // only autonomous threads were missing from "All" until you
+      // visited the other chip.
+      try {
+        await loadAutonomousConversationsFromService();
+      } catch (error) {
+        console.error('[Sidebar] Failed to sync autonomous tasks:', error);
       }
     };
 
@@ -136,6 +138,29 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, storageMode, conversationView]); // Intentionally exclude loaders to prevent re-runs
+
+  // Deselect the active conversation if the current filter would
+  // hide it. Without this the right-pane stays parked on whatever
+  // chat was open even after the operator switches the chip, which
+  // looked "stuck" / desynced -- the list said "no conversations"
+  // but the main area was still rendering one. Only fires for the
+  // Autonomous chip in practice (the "All" branch is always true).
+  useEffect(() => {
+    if (!activeConversationId) return;
+    const active = conversations.find((c) => c.id === activeConversationId);
+    if (!active) return;
+    const stillVisible =
+      conversationView === 'autonomous'
+        ? active.source === 'autonomous'
+        : true;
+    if (!stillVisible) {
+      setActiveConversation(null);
+      router.push('/chat');
+    }
+    // We intentionally depend on conversationView (the user gesture)
+    // and the active id; ``conversations`` is included so a late
+    // server load that drops the active row also triggers the cleanup.
+  }, [conversationView, activeConversationId, conversations, router, setActiveConversation]);
 
   // Fetch dynamic agents for name lookup in conversation list
   useEffect(() => {
@@ -715,9 +740,16 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
               </AnimatePresence>
 
               {conversations.filter((c) =>
+                // Mirror the visible-list predicate above: in "All" we
+                // show everything (so the empty state must also count
+                // every conversation), in "Autonomous" we show only
+                // ``source === 'autonomous'``. Pre-fix this predicate
+                // used ``c.source !== 'autonomous'`` for "All", which
+                // wrongly rendered "No conversations yet" alongside
+                // visible autonomous rows.
                 conversationView === 'autonomous'
                   ? c.source === 'autonomous'
-                  : c.source !== 'autonomous'
+                  : true
               ).length === 0 && !collapsed && (
                 <div className="text-center py-8 px-4">
                   <div className={cn(

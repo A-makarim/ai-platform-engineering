@@ -105,14 +105,18 @@ export const GET = withErrorHandler(async (request: NextRequest) => {
   if (sourceFilter === 'autonomous') {
     query.source = 'autonomous';
     delete query.$or;
+  } else if (sourceFilter === 'web') {
+    query.source = {
+      $in: ['web', null],
+    } as { $in: (string | null)[] };
   } else {
-    query.source = { $nin: ['slack', 'autonomous'] };
-
-    if (sourceFilter === 'web') {
-      query.source = {
-        $in: ['web', null],
-      } as { $in: (string | null)[] };
-    }
+    // Default ("All") view: include autonomous conversations alongside
+    // regular human chats so the sidebar's "All" filter actually shows
+    // both. Slack threads are still excluded because they have their
+    // own dedicated UI and were never wanted in this list. Pre-fix,
+    // autonomous was also in the $nin which contradicted the sidebar's
+    // ``return true`` filter and made autonomous rows vanish from "All".
+    query.source = { $nin: ['slack'] };
   }
 
   // Get total count

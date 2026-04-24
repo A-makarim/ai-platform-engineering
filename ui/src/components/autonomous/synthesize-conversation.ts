@@ -312,7 +312,13 @@ export function synthesizeConversationForTask(
     messages,
     a2aEvents: allEvents,
     streamEvents: [],
-    participants: buildParticipants(task.agent),
+    // Prefer ``dynamic_agent_id`` -- for custom-agent tasks ``agent``
+    // is now ``null`` (see syncAutonomousTasks) and the routing target
+    // lives on ``dynamic_agent_id``. Without this fallback the
+    // synthesised conversation has no agent participant, the sidebar
+    // loses its agent-name suffix, and ChatContainer's ``getAgentId``
+    // falls back to the Platform Engineer instead of the custom agent.
+    participants: buildParticipants(task.dynamic_agent_id ?? task.agent),
     source: "autonomous",
     task_id: task.id,
   };

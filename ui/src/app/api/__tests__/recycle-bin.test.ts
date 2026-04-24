@@ -465,6 +465,51 @@ describe('Archive API', () => {
         ])
       );
     });
+
+    it('default listing INCLUDES autonomous conversations (only excludes slack)', async () => {
+      // Regression: pre-fix the default branch used
+      // ``$nin: ['slack', 'autonomous']`` which contradicted the
+      // sidebar's "All" filter and made autonomous threads vanish
+      // from the All view. The fix narrows the exclusion to slack
+      // only so autonomous chats appear alongside human ones.
+      const convCollection = createMockCollection();
+      convCollection.find.mockReturnValue({
+        sort: jest.fn().mockReturnValue({
+          skip: jest.fn().mockReturnValue({
+            limit: jest.fn().mockReturnValue({
+              toArray: jest.fn().mockResolvedValue([]),
+            }),
+          }),
+        }),
+      });
+      mockCollections['conversations'] = convCollection;
+
+      const req = makeRequest('http://localhost:3000/api/chat/conversations');
+      await GET_CONVERSATIONS(req);
+
+      const findCall = convCollection.find.mock.calls[0][0];
+      expect(findCall.source).toEqual({ $nin: ['slack'] });
+    });
+
+    it('?source=autonomous still narrows to autonomous-only', async () => {
+      const convCollection = createMockCollection();
+      convCollection.find.mockReturnValue({
+        sort: jest.fn().mockReturnValue({
+          skip: jest.fn().mockReturnValue({
+            limit: jest.fn().mockReturnValue({
+              toArray: jest.fn().mockResolvedValue([]),
+            }),
+          }),
+        }),
+      });
+      mockCollections['conversations'] = convCollection;
+
+      const req = makeRequest('http://localhost:3000/api/chat/conversations?source=autonomous');
+      await GET_CONVERSATIONS(req);
+
+      const findCall = convCollection.find.mock.calls[0][0];
+      expect(findCall.source).toBe('autonomous');
+    });
   });
 
   // --------------------------------------------------------------------------
