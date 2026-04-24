@@ -222,12 +222,29 @@ export function TaskList({
                         <TriggerIcon type={task.trigger.type} />
                         {describeTrigger(task.trigger)}
                       </span>
-                      <span>
-                        agent:{" "}
-                        <code className="text-[11px]">
-                          {task.agent ?? "auto"}
-                        </code>
-                      </span>
+                      {task.dynamic_agent_id ? (
+                        // Custom (dynamic) agent route: this task runs
+                        // through the dynamic-agents service against
+                        // the user's own agent rather than the
+                        // supervisor. Render with a distinct label so
+                        // operators can immediately tell dynamic-agent
+                        // rows from MAS-subagent rows -- otherwise the
+                        // routing target was easy to confuse with a
+                        // supervisor sub-agent id.
+                        <span>
+                          custom:{" "}
+                          <code className="text-[11px]">
+                            {task.dynamic_agent_id}
+                          </code>
+                        </span>
+                      ) : (
+                        <span>
+                          agent:{" "}
+                          <code className="text-[11px]">
+                            {task.agent ?? "auto"}
+                          </code>
+                        </span>
+                      )}
                       {/* Spec #099 FR-010 / FR-012: absolute + relative next-run
                           rendering so "will it run soon?" is answerable at a glance. */}
                       <span title={task.next_run ? new Date(task.next_run).toISOString() : ""}>

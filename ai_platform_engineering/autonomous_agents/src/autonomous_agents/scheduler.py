@@ -24,6 +24,7 @@ from autonomous_agents.models import (
     TriggerType,
 )
 from autonomous_agents.services.a2a_client import invoke_agent_streaming
+from autonomous_agents.services.dynamic_agents_client import invoke_dynamic_agent
 from autonomous_agents.services.chat_history import (
     ChatHistoryPublisher,
     NoopChatHistoryPublisher,
@@ -182,20 +183,37 @@ async def execute_task(task: TaskDefinition, context: dict[str, Any] | None = No
     response_text: str | None = None
     error_text: str | None = None
     try:
-        # Phase B (spec #099 Story 2): use the streaming variant so we
-        # capture every supervisor A2A event (execution_plan_update,
-        # tool_notification_*, final_result, etc.) — persisted on the
-        # TaskRun and replayed by the UI synthesiser so past scheduled
-        # fires render with the same rich plan + tools + timeline a
-        # typed chat reply gets.
-        response, events = await invoke_agent_streaming(
-            prompt=task.prompt,
-            task_id=task.id,
-            agent=task.agent,
-            llm_provider=task.llm_provider,
-            context=context,
-            timeout_seconds=task.timeout_seconds,
-        )
+        if task.dynamic_agent_id:
+            # Custom (dynamic) agent path: invoke the dynamic-agents
+            # service directly so the prompt actually executes through
+            # the user's custom agent (its tools / system prompt /
+            # middleware), instead of being silently swallowed by the
+            # supervisor's permissive LLM router. ``events`` is empty
+            # here because /chat/invoke is non-streaming -- a follow-up
+            # can swap in /chat/stream/start parsing for richer chat
+            # replay parity. The synthesiser tolerates an empty list.
+            response, events = await invoke_dynamic_agent(
+                prompt=task.prompt,
+                task_id=task.id,
+                agent_id=task.dynamic_agent_id,
+                conversation_id=conversation_id,
+                timeout=task.timeout_seconds,
+            )
+        else:
+            # Phase B (spec #099 Story 2): use the streaming variant so we
+            # capture every supervisor A2A event (execution_plan_update,
+            # tool_notification_*, final_result, etc.) — persisted on the
+            # TaskRun and replayed by the UI synthesiser so past scheduled
+            # fires render with the same rich plan + tools + timeline a
+            # typed chat reply gets.
+            response, events = await invoke_agent_streaming(
+                prompt=task.prompt,
+                task_id=task.id,
+                agent=task.agent,
+                llm_provider=task.llm_provider,
+                context=context,
+                timeout_seconds=task.timeout_seconds,
+            )
         response_text = response
         run.status = TaskStatus.SUCCESS
         run.response_preview = response[:500]
@@ -230,7 +248,11 @@ async def execute_task(task: TaskDefinition, context: dict[str, Any] | None = No
             context,
             response=response_text,
             error=error_text,
-            agent=task.agent,
+            # For dynamic-agent runs, surface the dynamic agent id as
+            # the routing label so the chat sidebar shows the same
+            # routing target as the autonomous tab. Falls back to the
+            # supervisor sub-agent hint for legacy tasks.
+            agent=task.dynamic_agent_id or task.agent,
         )
 
     return run

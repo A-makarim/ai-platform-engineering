@@ -76,6 +76,17 @@ export interface AutonomousTask {
   name: string;
   description?: string | null;
   agent: string | null;
+  /**
+   * When set, this task is routed through the dynamic-agents service
+   * (custom user-built agent) rather than the supervisor. Mutually
+   * exclusive with ``agent`` -- the autonomous-agents backend prefers
+   * ``dynamic_agent_id`` and clears ``agent`` if both arrive.
+   *
+   * The Custom Agent editor stamps this field via
+   * ``syncAutonomousTasks.ts``; manually-edited supervisor tasks
+   * leave it null.
+   */
+  dynamic_agent_id?: string | null;
   prompt: string;
   llm_provider?: string | null;
   trigger: Trigger;
