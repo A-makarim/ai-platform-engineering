@@ -32,6 +32,7 @@ import { MiddlewarePicker } from "./MiddlewarePicker";
 import { SubagentPicker } from "./SubagentPicker";
 import { AutonomousTasksStep } from "./AutonomousTasksStep";
 import { syncAutonomousTasks } from "./syncAutonomousTasks";
+import { isTaskOwnedByAgent } from "./taskOwnership";
 import { autonomousApi, AutonomousApiError } from "@/components/autonomous/api";
 import type { AutonomousTask } from "@/components/autonomous/types";
 import { gradientThemes } from "@/lib/gradient-themes";
@@ -342,7 +343,7 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
       .listTasks()
       .then((all) => {
         if (cancelled) return;
-        const mine = all.filter((t) => t.agent === agentId);
+        const mine = all.filter((t) => isTaskOwnedByAgent(t, agentId));
         setAutonomousTasks(mine);
         setAutonomousTasksLoaded(mine);
       })
