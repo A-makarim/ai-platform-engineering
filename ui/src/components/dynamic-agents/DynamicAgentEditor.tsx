@@ -24,19 +24,18 @@ import type {
   SubAgentRef,
   BuiltinToolsConfig,
   AgentUIConfig,
+  FeaturesConfig,
 } from "@/types/dynamic-agent";
 import { AllowedToolsPicker } from "./AllowedToolsPicker";
 import { BuiltinToolsPicker } from "./BuiltinToolsPicker";
+import { MiddlewarePicker } from "./MiddlewarePicker";
 import { SubagentPicker } from "./SubagentPicker";
-import { AutonomousTasksStep } from "./AutonomousTasksStep";
-import { syncAutonomousTasks } from "./syncAutonomousTasks";
-import { autonomousApi, AutonomousApiError } from "@/components/autonomous/api";
-import type { AutonomousTask } from "@/components/autonomous/types";
 import { gradientThemes } from "@/lib/gradient-themes";
 
 interface DynamicAgentEditorProps {
   agent: DynamicAgentConfig | null; // null = creating new
   cloneFrom?: DynamicAgentConfig | null; // Agent to clone from (for pre-filling)
+  readOnly?: boolean; // true for config-driven agents (view only)
   onSave: () => void;
   onCancel: () => void;
 }
@@ -99,11 +98,6 @@ const STEPS = [
     label: "Subagents", 
     hint: "Delegate tasks to other agents (optional)" 
   },
-  {
-    id: "autonomous" as const,
-    label: "Autonomous",
-    hint: "Optional: schedule this agent to run automatically",
-  },
 ];
 
 type StepId = typeof STEPS[number]["id"];
@@ -153,7 +147,7 @@ function StepIndicator({
   );
 }
 
-export function DynamicAgentEditor({ agent, cloneFrom, onSave, onCancel }: DynamicAgentEditorProps) {
+export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCancel }: DynamicAgentEditorProps) {
   const isEditing = !!agent;
   const isCloning = !!cloneFrom;
   const { toast } = useToast();
@@ -180,22 +174,18 @@ export function DynamicAgentEditor({ agent, cloneFrom, onSave, onCancel }: Dynam
   const [subagents, setSubagents] = React.useState<SubAgentRef[]>(
     source?.subagents || []
   );
+  const [features, setFeatures] = React.useState<FeaturesConfig | undefined>(
+    source?.features
+  );
   const [modelId, setModelId] = React.useState(source?.model_id || "");
   const [modelProvider, setModelProvider] = React.useState(source?.model_provider || "");
   const [gradientTheme, setGradientTheme] = React.useState<string>(
     source?.ui?.gradient_theme || "default"
   );
 
-  // Autonomous schedules (task definitions with agent=<agent_id>).
-  // Clone flow intentionally starts with an empty list — task ids are
-  // globally unique and can't be duplicated.
-  const [autonomousTasks, setAutonomousTasks] = React.useState<AutonomousTask[]>([]);
-  const [autonomousTasksLoaded, setAutonomousTasksLoaded] = React.useState<AutonomousTask[]>([]);
-  const [autonomousTasksLoading, setAutonomousTasksLoading] = React.useState(false);
-  const [autonomousTasksError, setAutonomousTasksError] = React.useState<string | null>(null);
-
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  const [middlewareError, setMiddlewareError] = React.useState(false);
   const [availableModels, setAvailableModels] = React.useState<
     { model_id: string; name: string; provider: string; description: string }[]
   >([]);
@@ -223,11 +213,15 @@ export function DynamicAgentEditor({ agent, cloneFrom, onSave, onCancel }: Dynam
       import("@codemirror/lang-markdown"),
       import("@codemirror/language-data"),
       import("@codemirror/view"),
-    ]).then(([mdMod, langDataMod, viewMod]) => {
+      import("@/lib/codemirror/jinja2-highlight"),
+      import("@/lib/codemirror/markdown-highlight"),
+    ]).then(([mdMod, langDataMod, viewMod, jinja2Mod, mdHighlightMod]) => {
       if (!cancelled) {
         setCmExtensions([
           mdMod.markdown({ codeLanguages: langDataMod.languages }),
           viewMod.EditorView.lineWrapping,
+          mdHighlightMod.markdownHighlight,
+          jinja2Mod.jinja2Highlight,
         ]);
       }
     });
@@ -324,45 +318,6 @@ export function DynamicAgentEditor({ agent, cloneFrom, onSave, onCancel }: Dynam
     }
     fetchTeams();
   }, []);
-
-  // Load existing autonomous tasks for this agent (edit mode only).
-  // Clone / create paths start with an empty list so we never POST
-  // task ids that would collide with the source agent's schedules.
-  React.useEffect(() => {
-    if (!isEditing || !agent?._id) return;
-    let cancelled = false;
-    const agentId = agent._id;
-    setAutonomousTasksLoading(true);
-    setAutonomousTasksError(null);
-    autonomousApi
-      .listTasks()
-      .then((all) => {
-        if (cancelled) return;
-        const mine = all.filter((t) => t.agent === agentId);
-        setAutonomousTasks(mine);
-        setAutonomousTasksLoaded(mine);
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        // 401/403 from the autonomous proxy just means the user isn't
-        // admin — surface a softer message rather than a scary banner.
-        if (err instanceof AutonomousApiError && (err.status === 401 || err.status === 403)) {
-          setAutonomousTasksError(
-            "You do not have permission to view autonomous schedules for this agent.",
-          );
-        } else {
-          setAutonomousTasksError(
-            err instanceof Error ? err.message : "Failed to load autonomous schedules.",
-          );
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setAutonomousTasksLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [isEditing, agent?._id]);
 
   // Step wizard state
   const [activeStep, setActiveStep] = React.useState<StepId>("basic");
@@ -538,11 +493,6 @@ export function DynamicAgentEditor({ agent, cloneFrom, onSave, onCancel }: Dynam
         ? { gradient_theme: gradientTheme }
         : undefined;
 
-      // Agent slug used when stamping autonomous tasks after the save
-      // resolves. When editing, the document id already exists; when
-      // creating, we use the slug we'll POST with.
-      let savedAgentId: string;
-
       if (isEditing) {
         // Update existing agent
         const updateData: DynamicAgentConfigUpdate = {
@@ -557,6 +507,7 @@ export function DynamicAgentEditor({ agent, cloneFrom, onSave, onCancel }: Dynam
           model_id: modelId,
           model_provider: modelProvider,
           ui: uiConfig,
+          features: features,
         };
 
         const response = await fetch(`/api/dynamic-agents?id=${agent._id}`, {
@@ -569,7 +520,6 @@ export function DynamicAgentEditor({ agent, cloneFrom, onSave, onCancel }: Dynam
         if (!data.success) {
           throw new Error(data.error || "Failed to update agent");
         }
-        savedAgentId = agent._id;
       } else {
         // Create new agent
         const createData: DynamicAgentConfigCreate = {
@@ -585,6 +535,7 @@ export function DynamicAgentEditor({ agent, cloneFrom, onSave, onCancel }: Dynam
           model_id: modelId,
           model_provider: modelProvider,
           ui: uiConfig,
+          features: features,
         };
 
         const response = await fetch("/api/dynamic-agents", {
@@ -596,38 +547,6 @@ export function DynamicAgentEditor({ agent, cloneFrom, onSave, onCancel }: Dynam
         const data = await response.json();
         if (!data.success) {
           throw new Error(data.error || "Failed to create agent");
-        }
-        savedAgentId = generatedId;
-      }
-
-      // Sync autonomous schedules AFTER the agent save has resolved —
-      // that guarantees we always have an id to stamp into ``task.agent``.
-      // Task write failures are collected and surfaced as a non-fatal
-      // warning so an operator can retry without losing an agent save
-      // that already succeeded.
-      if (autonomousTasks.length > 0 || autonomousTasksLoaded.length > 0) {
-        try {
-          const results = await syncAutonomousTasks({
-            agentId: savedAgentId,
-            drafts: autonomousTasks,
-            serverTasks: autonomousTasksLoaded,
-            api: autonomousApi,
-          });
-          const failures = results.filter((r) => !r.ok);
-          if (failures.length > 0) {
-            toast(
-              `Saved agent, but ${failures.length} schedule change${failures.length === 1 ? "" : "s"} failed. See the Autonomous tab.`,
-              "error",
-            );
-          }
-        } catch (err: unknown) {
-          // Defensive: syncAutonomousTasks already catches per-entry,
-          // but if the helper itself throws (e.g. api missing) we still
-          // don't want to roll back the successful agent write.
-          toast(
-            err instanceof Error ? err.message : "Failed to save autonomous schedules",
-            "error",
-          );
         }
       }
 
@@ -650,10 +569,12 @@ export function DynamicAgentEditor({ agent, cloneFrom, onSave, onCancel }: Dynam
           </Button>
           <div>
             <CardTitle>
-              {isEditing ? "Edit Custom Agent" : isCloning ? "Clone Custom Agent" : "Create Custom Agent"}
+              {readOnly ? "View Agent" : isEditing ? "Edit Agent" : isCloning ? "Clone Agent" : "Create Agent"}
             </CardTitle>
             <CardDescription>
-              {isEditing
+              {readOnly
+                ? "This agent is managed by configuration and cannot be edited"
+                : isEditing
                 ? "Update the agent configuration"
                 : isCloning
                 ? `Creating a copy of "${cloneFrom?.name}"`
@@ -676,6 +597,8 @@ export function DynamicAgentEditor({ agent, cloneFrom, onSave, onCancel }: Dynam
             <h3 className="font-medium">Step {currentStepIndex + 1}: {currentStepConfig?.label}</h3>
             <p className="text-sm text-muted-foreground">{currentStepConfig?.hint}</p>
           </div>
+
+          <fieldset disabled={readOnly} className={readOnly ? "opacity-70 space-y-4" : "space-y-4"}>
 
           {/* Basic Info Step */}
           {activeStep === "basic" && (
@@ -1170,6 +1093,17 @@ export function DynamicAgentEditor({ agent, cloneFrom, onSave, onCancel }: Dynam
                   disabled={loading}
                 />
               </div>
+
+              {/* Advanced: Middleware */}
+              <div className="border-t pt-4">
+                <MiddlewarePicker
+                  value={features}
+                  onChange={setFeatures}
+                  disabled={loading}
+                  availableModels={availableModels}
+                  onError={setMiddlewareError}
+                />
+              </div>
             </div>
           )}
 
@@ -1197,25 +1131,13 @@ export function DynamicAgentEditor({ agent, cloneFrom, onSave, onCancel }: Dynam
             </div>
           )}
 
-          {/* Autonomous Step */}
-          {activeStep === "autonomous" && (
-            <AutonomousTasksStep
-              agentId={isEditing ? agent?._id || "" : generatedId}
-              tasks={autonomousTasks}
-              onChange={setAutonomousTasks}
-              loading={autonomousTasksLoading}
-              error={autonomousTasksError}
-              disabled={loading}
-              isCloning={isCloning}
-            />
-          )}
-
           {/* Error */}
           {error && (
             <div className="rounded-lg bg-destructive/10 border border-destructive/30 p-3">
               <p className="text-sm text-destructive">{error}</p>
             </div>
           )}
+          </fieldset>
 
           {/* Step Navigation - Right aligned */}
           <div className="flex items-center justify-end gap-2 pt-4 border-t">
@@ -1246,24 +1168,32 @@ export function DynamicAgentEditor({ agent, cloneFrom, onSave, onCancel }: Dynam
       {/* Action Buttons - Outside the card content */}
       <div className="flex items-center gap-2 px-6 py-4 border-t bg-muted/30">
         <div className="text-xs text-muted-foreground mr-auto hidden sm:block">
-          {builtinTools?.fetch_url?.enabled ? "1 built-in, " : ""}
-          {Object.keys(allowedTools).length} MCP server(s), {subagents.length} subagent(s), {autonomousTasks.length} schedule(s)
+          {readOnly ? (
+            "This agent is config-driven and cannot be modified"
+          ) : (
+            <>
+              {builtinTools?.fetch_url?.enabled ? "1 built-in, " : ""}
+              {Object.keys(allowedTools).length} MCP server(s), {subagents.length} subagent(s), {autonomousTasks.length} schedule(s)
+            </>
+          )}
         </div>
         <Button type="button" variant="outline" onClick={onCancel} disabled={loading}>
-          Cancel
+          {readOnly ? "Close" : "Cancel"}
         </Button>
-        <Button onClick={handleSubmit} disabled={loading || !isValid}>
-          {loading ? (
-            <>
-              <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-              {isEditing ? "Saving..." : "Creating..."}
-            </>
-          ) : isEditing ? (
-            "Save Changes"
-          ) : (
-            "Create Agent"
-          )}
-        </Button>
+        {!readOnly && (
+          <Button onClick={handleSubmit} disabled={loading || !isValid || middlewareError}>
+            {loading ? (
+              <>
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                {isEditing ? "Saving..." : "Creating..."}
+              </>
+            ) : isEditing ? (
+              "Save Changes"
+            ) : (
+              "Create Agent"
+            )}
+          </Button>
+        )}
       </div>
     </Card>
   );
