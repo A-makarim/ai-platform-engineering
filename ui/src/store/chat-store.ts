@@ -1090,7 +1090,7 @@ const storeImplementation = (set: any, get: any) => ({
           // synthesised set (those are necessarily user-typed turns or
           // streamed assistant replies). Sort by timestamp so the
           // thread reads chronologically. ``a2aEvents`` and
-          // ``sseEvents`` are preserved from the existing conversation
+          // ``streamEvents`` are preserved from the existing conversation
           // so the rich timeline / debug panel survive resync.
           const existingAutonomous = new Map<string, Conversation>(
             state.conversations
@@ -1112,7 +1112,7 @@ const storeImplementation = (set: any, get: any) => ({
               ...freshConv,
               messages,
               a2aEvents: existing.a2aEvents,
-              sseEvents: existing.sseEvents,
+              streamEvents: existing.streamEvents,
             };
           });
 

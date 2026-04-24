@@ -19,9 +19,9 @@
  * the live-chat experience that today already works).
  */
 
-import type { ArtifactPart, TimelineSegment } from "@/types/a2a";
+import type { ArtifactPart, SupervisorTimelineSegment } from "@/types/a2a";
 import { parsePlanStepsFromData, parseToolFromArtifact } from "@/lib/timeline-parsers";
-import { TimelineManager } from "@/lib/timeline-manager";
+import { SupervisorTimelineManager } from "@/lib/timeline-manager";
 
 /**
  * Pull the first text body out of an artifact's ``parts``.
@@ -53,9 +53,9 @@ function _firstText(parts: unknown): string {
  */
 export function buildTimelineSegmentsFromEvents(
   events: ReadonlyArray<Record<string, unknown>>,
-): TimelineSegment[] {
+): SupervisorTimelineSegment[] {
   if (!events || events.length === 0) return [];
-  const timeline = new TimelineManager();
+  const timeline = new SupervisorTimelineManager();
   let eventNum = 0;
 
   for (const event of events) {

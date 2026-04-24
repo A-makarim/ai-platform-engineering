@@ -22,6 +22,7 @@
  */
 
 import type { A2AEvent, ChatMessage, Conversation } from "@/types/a2a";
+import { buildParticipants } from "@/types/a2a";
 import { buildTimelineSegmentsFromEvents } from "@/lib/replay-timeline";
 
 import type { AutonomousTask, TaskRun } from "./types";
@@ -310,7 +311,8 @@ export function synthesizeConversationForTask(
     updatedAt,
     messages,
     a2aEvents: allEvents,
-    sseEvents: [],
+    streamEvents: [],
+    participants: buildParticipants(task.agent),
     source: "autonomous",
     task_id: task.id,
   };

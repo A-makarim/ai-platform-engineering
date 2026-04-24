@@ -30,6 +30,10 @@ import { AllowedToolsPicker } from "./AllowedToolsPicker";
 import { BuiltinToolsPicker } from "./BuiltinToolsPicker";
 import { MiddlewarePicker } from "./MiddlewarePicker";
 import { SubagentPicker } from "./SubagentPicker";
+import { AutonomousTasksStep } from "./AutonomousTasksStep";
+import { syncAutonomousTasks } from "./syncAutonomousTasks";
+import { autonomousApi, AutonomousApiError } from "@/components/autonomous/api";
+import type { AutonomousTask } from "@/components/autonomous/types";
 import { gradientThemes } from "@/lib/gradient-themes";
 
 interface DynamicAgentEditorProps {
@@ -97,6 +101,11 @@ const STEPS = [
     id: "subagents" as const, 
     label: "Subagents", 
     hint: "Delegate tasks to other agents (optional)" 
+  },
+  {
+    id: "autonomous" as const,
+    label: "Autonomous",
+    hint: "Optional: schedule this agent to run automatically",
   },
 ];
 
@@ -182,6 +191,10 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
   const [gradientTheme, setGradientTheme] = React.useState<string>(
     source?.ui?.gradient_theme || "default"
   );
+  const [autonomousTasks, setAutonomousTasks] = React.useState<AutonomousTask[]>([]);
+  const [autonomousTasksLoaded, setAutonomousTasksLoaded] = React.useState<AutonomousTask[]>([]);
+  const [autonomousTasksLoading, setAutonomousTasksLoading] = React.useState(false);
+  const [autonomousTasksError, setAutonomousTasksError] = React.useState<string | null>(null);
 
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
@@ -318,6 +331,40 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
     }
     fetchTeams();
   }, []);
+
+  React.useEffect(() => {
+    if (!isEditing || !agent?._id) return;
+    let cancelled = false;
+    const agentId = agent._id;
+    setAutonomousTasksLoading(true);
+    setAutonomousTasksError(null);
+    autonomousApi
+      .listTasks()
+      .then((all) => {
+        if (cancelled) return;
+        const mine = all.filter((t) => t.agent === agentId);
+        setAutonomousTasks(mine);
+        setAutonomousTasksLoaded(mine);
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        if (err instanceof AutonomousApiError && (err.status === 401 || err.status === 403)) {
+          setAutonomousTasksError(
+            "You do not have permission to view autonomous schedules for this agent.",
+          );
+        } else {
+          setAutonomousTasksError(
+            err instanceof Error ? err.message : "Failed to load autonomous schedules.",
+          );
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setAutonomousTasksLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isEditing, agent?._id]);
 
   // Step wizard state
   const [activeStep, setActiveStep] = React.useState<StepId>("basic");
@@ -492,6 +539,7 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
       const uiConfig: AgentUIConfig | undefined = gradientTheme
         ? { gradient_theme: gradientTheme }
         : undefined;
+      let savedAgentId: string;
 
       if (isEditing) {
         // Update existing agent
@@ -520,6 +568,7 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
         if (!data.success) {
           throw new Error(data.error || "Failed to update agent");
         }
+        savedAgentId = agent._id;
       } else {
         // Create new agent
         const createData: DynamicAgentConfigCreate = {
@@ -547,6 +596,30 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
         const data = await response.json();
         if (!data.success) {
           throw new Error(data.error || "Failed to create agent");
+        }
+        savedAgentId = generatedId;
+      }
+
+      if (autonomousTasks.length > 0 || autonomousTasksLoaded.length > 0) {
+        try {
+          const results = await syncAutonomousTasks({
+            agentId: savedAgentId,
+            drafts: autonomousTasks,
+            serverTasks: autonomousTasksLoaded,
+            api: autonomousApi,
+          });
+          const failures = results.filter((r) => !r.ok);
+          if (failures.length > 0) {
+            toast(
+              `Saved agent, but ${failures.length} schedule change${failures.length === 1 ? "" : "s"} failed. See the Autonomous tab.`,
+              "error",
+            );
+          }
+        } catch (err: unknown) {
+          toast(
+            err instanceof Error ? err.message : "Failed to save autonomous schedules",
+            "error",
+          );
         }
       }
 
@@ -1129,6 +1202,18 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
                 parentVisibility={visibility}
               />
             </div>
+          )}
+
+          {activeStep === "autonomous" && (
+            <AutonomousTasksStep
+              agentId={isEditing ? agent?._id || "" : generatedId}
+              tasks={autonomousTasks}
+              onChange={setAutonomousTasks}
+              loading={autonomousTasksLoading}
+              error={autonomousTasksError}
+              disabled={loading}
+              isCloning={isCloning}
+            />
           )}
 
           {/* Error */}
