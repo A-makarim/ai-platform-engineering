@@ -256,12 +256,21 @@ class AgentRuntime:
             f"[llm] Instantiating LLM for agent '{self.config.name}': "
             f"provider={self.config.model_provider}, model={self.config.model_id}"
         )
-        # Configure botocore with extended timeouts for Bedrock to prevent
-        # ReadTimeoutError during long-running agent operations (especially subagents)
-        boto_config = BotocoreConfig(read_timeout=300, connect_timeout=60)
+        # Only AWS Bedrock accepts a botocore Config; for every other
+        # provider (openai, azure-openai, anthropic-claude, ...) the
+        # `config=` kwarg flows down to the underlying SDK client and
+        # blows up with e.g.
+        #   AsyncCompletions.create() got an unexpected keyword argument 'config'
+        # so we gate it on the provider string.
+        get_llm_kwargs: dict[str, Any] = {"model": self.config.model_id}
+        if (self.config.model_provider or "").strip().lower() == "aws-bedrock":
+            # Configure botocore with extended timeouts for Bedrock to prevent
+            # ReadTimeoutError during long-running agent operations (especially subagents)
+            get_llm_kwargs["config"] = BotocoreConfig(
+                read_timeout=300, connect_timeout=60
+            )
         llm = LLMFactory(provider=self.config.model_provider).get_llm(
-            model=self.config.model_id,
-            config=boto_config,
+            **get_llm_kwargs
         )
         logger.info(f"[llm] LLM instantiated for agent '{self.config.name}': type={type(llm).__name__}")
 

@@ -215,11 +215,17 @@ def _instantiate_model(
     Returns:
         Initialized BaseChatModel instance.
     """
-    boto_config = BotocoreConfig(read_timeout=300, connect_timeout=60)
-    return LLMFactory(provider=model_provider).get_llm(
-        model=model_id,
-        config=boto_config,
-    )
+    # Only AWS Bedrock accepts a botocore Config; for every other provider
+    # (openai, azure-openai, anthropic-claude, ...) the `config=` kwarg
+    # flows down to the underlying SDK client and blows up with e.g.
+    #   AsyncCompletions.create() got an unexpected keyword argument 'config'
+    # so we gate it on the provider string.
+    kwargs: dict[str, Any] = {"model": model_id}
+    if (model_provider or "").strip().lower() == "aws-bedrock":
+        # Extended timeouts for Bedrock to prevent ReadTimeoutError during
+        # long-running middleware-driven model calls.
+        kwargs["config"] = BotocoreConfig(read_timeout=300, connect_timeout=60)
+    return LLMFactory(provider=model_provider).get_llm(**kwargs)
 
 
 def _build_llm_tool_selector(params: dict[str, Any]) -> LLMToolSelectorMiddleware:
