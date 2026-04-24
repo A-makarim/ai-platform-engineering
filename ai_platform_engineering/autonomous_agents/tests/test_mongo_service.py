@@ -434,6 +434,16 @@ async def test_conversation_document_carries_required_ui_fields(
     assert "weekly-prs" in conv["tags"]
     assert conv["is_archived"] is False
     assert conv["is_pinned"] is False
+    # Regression guard for the "follow-ups go to the supervisor" bug:
+    # the UI's ``getAgentId`` reads routing exclusively from
+    # ``participants`` (see ui/src/types/a2a.ts), not ``agent_id``,
+    # so the doc must carry the user/agent participant pair or
+    # follow-up messages on the synthesised chat thread fall back to
+    # the supervisor instead of going to the configured agent.
+    assert conv["participants"] == [
+        {"type": "user", "id": "autonomous@system"},
+        {"type": "agent", "id": "github"},
+    ]
 
 
 async def test_publish_run_is_idempotent_across_status_transitions(
@@ -508,6 +518,126 @@ async def test_publish_creation_intent_and_preflight_ack(service: MongoService):
     kinds = [m["metadata"]["kind"] for m in msgs]
     assert "creation_intent" in kinds
     assert "preflight_ack" in kinds
+
+
+# ============================================================================
+# Conversation participant routing (custom-agent autonomous chats)
+# ============================================================================
+#
+# These cases pin down the contract between the autonomous-agents Mongo
+# writer and the UI's chat router. The UI decides "who answers a
+# follow-up message in this chat?" purely from ``participants`` -- if
+# the agent participant is missing or wrong, the user types into a
+# custom-agent thread and the supervisor responds, which is the bug
+# this test module guards against.
+
+
+async def test_publish_run_writes_participants_for_supervisor_task(
+    service: MongoService,
+):
+    """Supervisor sub-agent tasks (legacy ``agent`` field set) must
+    still land an agent participant on the conversation so the UI's
+    ``getAgentId`` keeps routing follow-ups to that sub-agent."""
+    run = TaskRun(
+        run_id="r1",
+        task_id="t-sup",
+        task_name="Supervisor task",
+        status=TaskStatus.SUCCESS,
+        started_at=_spaced(0),
+        finished_at=_spaced(1),
+    )
+    await service.publish_run(
+        run,
+        prompt="hello",
+        response="world",
+        error=None,
+        agent="github",
+    )
+    conv = await service._conversations().find_one({})
+    assert conv["agent_id"] == "github"
+    assert conv["participants"] == [
+        {"type": "user", "id": "autonomous@system"},
+        {"type": "agent", "id": "github"},
+    ]
+
+
+async def test_publish_creation_intent_prefers_dynamic_agent_id_over_agent(
+    service: MongoService,
+):
+    """Custom-agent tasks stamp ``dynamic_agent_id`` and clear
+    ``agent`` (see ``syncAutonomousTasks``). The Mongo writer must
+    pick the dynamic-agent id as the routing target so a follow-up
+    chat on that thread goes to the custom agent, not the supervisor.
+
+    The mixed case (both fields set) is also pinned: ``dynamic_agent_id``
+    wins to match the precedence used in ``scheduler._publish_safely``
+    and ``routes/tasks.py`` -- if the writer disagreed, the persisted
+    agent_id would silently flip to the supervisor sub-agent on every
+    creation/preflight write.
+    """
+    task = TaskDefinition(
+        id="custom-task",
+        name="Custom Task",
+        agent=None,
+        dynamic_agent_id="my_custom_agent",
+        prompt="do the thing",
+        trigger=CronTrigger(schedule="0 9 * * *"),
+    )
+    await service.publish_creation_intent(task)
+
+    conv = await service._conversations().find_one({})
+    assert conv["agent_id"] == "my_custom_agent"
+    assert conv["participants"] == [
+        {"type": "user", "id": "autonomous@system"},
+        {"type": "agent", "id": "my_custom_agent"},
+    ]
+
+    # Mixed case: ``TaskDefinition``'s validator clears ``agent`` when
+    # ``dynamic_agent_id`` is also set, so by the time the writer
+    # sees the task the routing target is unambiguous. This assertion
+    # locks in the end-to-end behaviour: the persisted doc routes to
+    # the dynamic agent regardless of the input drafted shape.
+    mixed = TaskDefinition(
+        id="mixed-task",
+        name="Mixed Task",
+        agent="github",
+        dynamic_agent_id="my_custom_agent",
+        prompt="do the thing",
+        trigger=CronTrigger(schedule="0 9 * * *"),
+    )
+    await service.publish_creation_intent(mixed)
+    mixed_conv = await service._conversations().find_one(
+        {"_id": _conversation_id_for_task("mixed-task")}
+    )
+    assert mixed_conv["agent_id"] == "my_custom_agent"
+    assert {"type": "agent", "id": "my_custom_agent"} in mixed_conv["participants"]
+
+
+async def test_upsert_conversation_omits_agent_participant_when_no_routing_target(
+    service: MongoService,
+):
+    """LLM-router-picks-it case: neither ``agent`` nor
+    ``dynamic_agent_id`` is set. Don't fabricate an agent participant
+    -- the UI then treats the thread as a plain conversation and the
+    supervisor's LLM router decides downstream like it does today.
+    The user participant must still be present so ownership/sharing
+    queries keep working.
+    """
+    task = TaskDefinition(
+        id="router-task",
+        name="Router-decides Task",
+        agent=None,
+        dynamic_agent_id=None,
+        prompt="figure it out",
+        trigger=CronTrigger(schedule="0 9 * * *"),
+    )
+    await service.publish_creation_intent(task)
+
+    conv = await service._conversations().find_one({})
+    assert conv["agent_id"] is None
+    assert conv["participants"] == [
+        {"type": "user", "id": "autonomous@system"},
+    ]
 
 
 # ============================================================================
