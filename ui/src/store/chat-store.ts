@@ -37,7 +37,7 @@ interface ChatState {
 
   // Actions
   createConversation: (agentId?: string) => Promise<string>;
-  setActiveConversation: (id: string) => void;
+  setActiveConversation: (id: string | null) => void;
   addMessage: (conversationId: string, message: Omit<ChatMessage, "id" | "timestamp" | "events">, turnId?: string, messageId?: string) => string;
   updateMessage: (conversationId: string, messageId: string, updates: Partial<ChatMessage>) => void;
   appendToMessage: (conversationId: string, messageId: string, content: string) => void;
@@ -132,6 +132,23 @@ const PERIODIC_SAVE_EVENT_THRESHOLD = 20; // Save every 20 events during streami
 // overwrite the correct in-memory state with that stale data.
 const pendingSaveTimestamps = new Map<string, number>();
 const PENDING_SAVE_GRACE_MS = 5000; // 5 second grace period after streaming ends
+
+function isEmptyNewConversation(conv: Conversation): boolean {
+  return (
+    conv.title === "New Conversation" &&
+    conv.messages.length === 0 &&
+    !conv.source
+  );
+}
+
+function compareConversationsForSidebar(a: Conversation, b: Conversation): number {
+  const aIsEmptyNew = isEmptyNewConversation(a);
+  const bIsEmptyNew = isEmptyNewConversation(b);
+  if (aIsEmptyNew !== bIsEmptyNew) {
+    return aIsEmptyNew ? 1 : -1;
+  }
+  return b.updatedAt.getTime() - a.updatedAt.getTime();
+}
 
 // Serialize A2A event for MongoDB storage (strip circular refs and large raw data)
 function serializeA2AEvent(event: A2AEvent): Record<string, unknown> {
@@ -305,12 +322,14 @@ const storeImplementation = (set: any, get: any) => ({
         return id;
       },
 
-      setActiveConversation: (id: string) => {
+      setActiveConversation: (id: string | null) => {
         const prev = get();
         const newUnviewed = new Set(prev.unviewedConversations);
-        newUnviewed.delete(id);
         const newInputRequired = new Set(prev.inputRequiredConversations);
-        newInputRequired.delete(id);
+        if (id) {
+          newUnviewed.delete(id);
+          newInputRequired.delete(id);
+        }
         set({
           activeConversationId: id,
           unviewedConversations: newUnviewed,
@@ -980,7 +999,7 @@ const storeImplementation = (set: any, get: any) => ({
           const localOnlyPreserved = currentState.conversations.filter(
             conv => !serverIds.has(conv.id) && (
               currentState.streamingConversations.has(conv.id) ||
-              conv.id === currentState.activeConversationId
+              (conv.id === currentState.activeConversationId && !isEmptyNewConversation(conv))
             )
           );
 
@@ -989,9 +1008,7 @@ const storeImplementation = (set: any, get: any) => ({
           }
 
           const allConversations = [...serverConversations, ...localOnlyPreserved];
-          const sortedConversations = allConversations.sort(
-            (a, b) => b.updatedAt.getTime() - a.updatedAt.getTime()
-          );
+          const sortedConversations = allConversations.sort(compareConversationsForSidebar);
 
           // Check if active conversation was deleted on another device
           const activeId = currentState.activeConversationId;
@@ -1118,7 +1135,7 @@ const storeImplementation = (set: any, get: any) => ({
 
           const others = state.conversations.filter((c) => c.source !== 'autonomous');
           const final = [...others, ...merged].sort(
-            (a, b) => b.updatedAt.getTime() - a.updatedAt.getTime(),
+            compareConversationsForSidebar,
           );
           return { conversations: final };
         });

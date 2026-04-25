@@ -923,6 +923,67 @@ describe('chat-store', () => {
       expect(convIds).not.toContain('stale-conv');
     });
 
+    it('does not preserve an active empty New Conversation placeholder absent from the server response', async () => {
+      const emptyNew = makeConversation({ id: 'empty-new', title: 'New Conversation', messages: [] });
+      const realConv = makeConversation({ id: 'real-conv', title: 'Real Conversation' });
+
+      useChatStore.setState({
+        conversations: [emptyNew, realConv],
+        activeConversationId: 'empty-new',
+      });
+
+      mockApiClient.getConversations.mockResolvedValue({
+        items: [
+          {
+            _id: 'real-conv',
+            title: 'Real Conversation',
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          },
+        ],
+        total: 1,
+        page: 1,
+        page_size: 100,
+        has_more: false,
+      });
+
+      await useChatStore.getState().loadConversationsFromServer();
+
+      const convIds = useChatStore.getState().conversations.map(c => c.id);
+      expect(convIds).not.toContain('empty-new');
+      expect(convIds).toContain('real-conv');
+    });
+
+    it('sorts empty New Conversation placeholders below titled conversations', async () => {
+      mockApiClient.getConversations.mockResolvedValue({
+        items: [
+          {
+            _id: 'empty-new',
+            title: 'New Conversation',
+            created_at: new Date('2026-01-02').toISOString(),
+            updated_at: new Date('2026-01-02').toISOString(),
+          },
+          {
+            _id: 'real-conv',
+            title: 'Real Conversation',
+            created_at: new Date('2026-01-01').toISOString(),
+            updated_at: new Date('2026-01-01').toISOString(),
+          },
+        ],
+        total: 2,
+        page: 1,
+        page_size: 100,
+        has_more: false,
+      });
+
+      await useChatStore.getState().loadConversationsFromServer();
+
+      expect(useChatStore.getState().conversations.map(c => c.id)).toEqual([
+        'real-conv',
+        'empty-new',
+      ]);
+    });
+
     it('skips loading in localStorage mode', async () => {
       (global as any).__mockStorageMode = 'localStorage';
 

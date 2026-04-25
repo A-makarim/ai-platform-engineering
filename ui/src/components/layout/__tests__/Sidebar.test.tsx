@@ -48,6 +48,7 @@ const mockSetActiveConversation = jest.fn()
 const mockCreateConversation = jest.fn(() => 'new-conv-id')
 const mockDeleteConversation = jest.fn()
 const mockLoadConversationsFromServer = jest.fn().mockResolvedValue(undefined)
+const mockLoadAutonomousConversationsFromService = jest.fn().mockResolvedValue(undefined)
 const mockLoadMessagesFromServer = jest.fn().mockResolvedValue(undefined)
 const mockLoadTurnsFromServer = jest.fn().mockResolvedValue(undefined)
 const mockIsConversationStreaming = jest.fn((_id: string) => false)
@@ -68,6 +69,7 @@ jest.mock('@/store/chat-store', () => {
       createConversation: mockCreateConversation,
       deleteConversation: mockDeleteConversation,
       loadConversationsFromServer: mockLoadConversationsFromServer,
+      loadAutonomousConversationsFromService: mockLoadAutonomousConversationsFromService,
       loadMessagesFromServer: mockLoadMessagesFromServer,
       loadTurnsFromServer: mockLoadTurnsFromServer,
       isConversationStreaming: mockIsConversationStreaming,
@@ -193,6 +195,7 @@ describe('Sidebar — Live Status Indicator', () => {
     jest.clearAllMocks()
     mockConversations = []
     mockActiveConversationId = null
+    mockLoadAutonomousConversationsFromService.mockResolvedValue(undefined)
     mockIsConversationStreaming.mockImplementation(() => false)
     mockHasUnviewedMessages.mockImplementation(() => false)
     mockIsConversationInputRequired.mockImplementation(() => false)
@@ -427,6 +430,41 @@ describe('Sidebar — Live Status Indicator', () => {
       fireEvent.click(screen.getByText('Clickable Chat'))
 
       expect(mockSetActiveConversation).toHaveBeenCalledWith('conv-click')
+    })
+  })
+
+  // --------------------------------------------------------------------------
+  // Autonomous filter routing
+  // --------------------------------------------------------------------------
+
+  describe('autonomous filter routing', () => {
+    it('switches from a normal active chat to the first autonomous thread without routing to bare /chat', () => {
+      mockConversations = [
+        makeConv('normal-1', 'Normal Chat'),
+        makeConv('auto-1', 'Autonomous Task', { source: 'autonomous' }),
+      ]
+      mockActiveConversationId = 'normal-1'
+
+      render(<Sidebar {...defaultProps} />)
+
+      fireEvent.click(screen.getByRole('button', { name: /autonomous/i }))
+
+      expect(mockSetActiveConversation).toHaveBeenCalledWith('auto-1')
+      expect(mockPush).toHaveBeenCalledWith('/chat/auto-1')
+      expect(mockPush).not.toHaveBeenCalledWith('/chat')
+    })
+
+    it('routes to the autonomous empty state when no autonomous threads exist', () => {
+      mockConversations = [makeConv('normal-1', 'Normal Chat')]
+      mockActiveConversationId = 'normal-1'
+
+      render(<Sidebar {...defaultProps} />)
+
+      fireEvent.click(screen.getByRole('button', { name: /autonomous/i }))
+
+      expect(mockSetActiveConversation).toHaveBeenCalledWith(null)
+      expect(mockPush).toHaveBeenCalledWith('/chat?source=autonomous')
+      expect(mockPush).not.toHaveBeenCalledWith('/chat')
     })
   })
 

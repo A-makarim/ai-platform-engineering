@@ -154,8 +154,14 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
         ? active.source === 'autonomous'
         : true;
     if (!stillVisible) {
-      setActiveConversation(null);
-      router.push('/chat');
+      const firstAutonomous = conversations.find((c) => c.source === 'autonomous');
+      if (firstAutonomous) {
+        setActiveConversation(firstAutonomous.id);
+        router.push(`/chat/${firstAutonomous.id}`);
+      } else {
+        setActiveConversation(null);
+        router.push('/chat?source=autonomous');
+      }
     }
     // We intentionally depend on conversationView (the user gesture)
     // and the active id; ``conversations`` is included so a late
