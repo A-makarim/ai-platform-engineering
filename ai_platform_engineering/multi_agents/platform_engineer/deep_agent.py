@@ -87,6 +87,7 @@ from ai_platform_engineering.multi_agents.tools import (
     delete_autonomous_task,
     delete_github_webhook,
     get_current_date,
+    get_webhook_task_template,
     jq,
     list_autonomous_tasks,
     list_github_webhooks,
@@ -1416,6 +1417,12 @@ class PlatformEngineerDeepAgent:
             list_github_webhooks,
             delete_github_webhook,
             test_github_webhook,
+            # Spec #099 webhook follow-up Phase 4 — canonical prompt
+            # templates for common scenarios so the LLM doesn't have to
+            # improvise structure (acknowledge-first, investigate, report,
+            # comment-back) every time. Operator parameters (repo, webex
+            # room, investigation depth) are substituted at fetch time.
+            get_webhook_task_template,
         ]
 
         # Self-service task tools

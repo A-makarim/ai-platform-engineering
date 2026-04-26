@@ -44,6 +44,13 @@ from ai_platform_engineering.multi_agents.tools.github_webhooks import (
     delete_github_webhook,
     test_github_webhook,
 )
+# Spec #099 webhook follow-up Phase 4 — canonical prompt templates so
+# the supervisor LLM hands create_autonomous_task a well-structured
+# prompt for common scenarios (issue triage, PR review, push notify)
+# instead of improvising from scratch every time.
+from ai_platform_engineering.multi_agents.tools.webhook_task_templates import (
+    get_webhook_task_template,
+)
 
 # Command-line tools from utils/agent_tools/ (available to all agents)
 from ai_platform_engineering.utils.agent_tools import (
@@ -84,6 +91,9 @@ __all__ = [
     'list_github_webhooks',
     'delete_github_webhook',
     'test_github_webhook',
+
+    # Canonical webhook-task prompt templates (spec #099 Phase 4)
+    'get_webhook_task_template',
 
     # Command-line tools (pass full shell command)
     'git',          # git("git clone https://github.com/org/repo")
