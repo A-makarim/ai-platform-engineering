@@ -71,6 +71,16 @@ services:
       # autonomous-agents container's service name; override only if the
       # service is reached via a non-default hostname/port.
       - AUTONOMOUS_AGENTS_URL=${AUTONOMOUS_AGENTS_URL:-http://autonomous-agents:8002}
+      # Spec #099 webhook follow-up — the EXTERNALLY-reachable URL of the
+      # autonomous-agents service. Used when constructing callback URLs
+      # given back to GitHub (or any other external webhook sender). In
+      # dev this is typically an ngrok / cloudflared tunnel; in prod it
+      # is the real hostname ops provisions for the service. When unset,
+      # the supervisor tools log a prominent warning so demos don't
+      # silently produce unreachable URLs. Distinct from the internal
+      # AUTONOMOUS_AGENTS_URL above because GitHub can't resolve
+      # ``autonomous-agents`` from the public internet.
+      - AUTONOMOUS_AGENTS_PUBLIC_URL=${AUTONOMOUS_AGENTS_PUBLIC_URL:-}
 
       # A2A transport configuration (p2p or slim)
       - A2A_TRANSPORT=${A2A_TRANSPORT:-p2p}

@@ -111,6 +111,13 @@ services:
       - LANGFUSE_HOST=${LANGFUSE_HOST:-http://langfuse-web:3000}
       - LANGFUSE_SESSION_ID=${LANGFUSE_SESSION_ID:-ai-platform-engineering}
       - LANGFUSE_USER_ID=${LANGFUSE_USER_ID:-platform-engineer}
+      # Autonomous Agents — internal service URL for the supervisor's task
+      # management tools; externally-reachable URL used when constructing
+      # callback URLs for webhook senders (GitHub, etc). See .env.example
+      # for guidance; AUTONOMOUS_AGENTS_PUBLIC_URL should be a real domain
+      # or tunnel in production.
+      - AUTONOMOUS_AGENTS_URL=${AUTONOMOUS_AGENTS_URL:-http://autonomous-agents:8002}
+      - AUTONOMOUS_AGENTS_PUBLIC_URL=${AUTONOMOUS_AGENTS_PUBLIC_URL:-}
     command: platform-engineer
 
   ####################################################################################################
