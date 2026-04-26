@@ -34,6 +34,16 @@ from ai_platform_engineering.multi_agents.tools.autonomous_tasks import (
     trigger_autonomous_task_now,
     validate_cron_expression,
 )
+# Spec #099 webhook follow-up — GitHub-side webhook registration so the
+# supervisor can wire a repo to an autonomous-agents webhook task in a
+# single conversational turn (no visiting github.com to click through
+# Settings → Webhooks).
+from ai_platform_engineering.multi_agents.tools.github_webhooks import (
+    register_github_webhook,
+    list_github_webhooks,
+    delete_github_webhook,
+    test_github_webhook,
+)
 
 # Command-line tools from utils/agent_tools/ (available to all agents)
 from ai_platform_engineering.utils.agent_tools import (
@@ -68,6 +78,12 @@ __all__ = [
     'delete_autonomous_task',
     'trigger_autonomous_task_now',
     'validate_cron_expression',
+
+    # GitHub webhook management (spec #099 webhook follow-up)
+    'register_github_webhook',
+    'list_github_webhooks',
+    'delete_github_webhook',
+    'test_github_webhook',
 
     # Command-line tools (pass full shell command)
     'git',          # git("git clone https://github.com/org/repo")

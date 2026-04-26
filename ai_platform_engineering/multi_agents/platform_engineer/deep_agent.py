@@ -85,9 +85,13 @@ from ai_platform_engineering.multi_agents.tools import (
     create_autonomous_task,
     curl,
     delete_autonomous_task,
+    delete_github_webhook,
     get_current_date,
     jq,
     list_autonomous_tasks,
+    list_github_webhooks,
+    register_github_webhook,
+    test_github_webhook,
     trigger_autonomous_task_now,
     update_autonomous_task,
     validate_cron_expression,
@@ -1402,6 +1406,16 @@ class PlatformEngineerDeepAgent:
             delete_autonomous_task,
             trigger_autonomous_task_now,
             validate_cron_expression,
+            # Spec #099 webhook follow-up — GitHub-side webhook registration
+            # so the supervisor can answer requests like "every time someone
+            # opens an issue on X, message me on Webex and solve it" by
+            # chaining create_autonomous_task (for the receiver) with
+            # register_github_webhook (for the sender). Uses the same GITHUB
+            # token as the github sub-agent; the token needs admin:repo_hook.
+            register_github_webhook,
+            list_github_webhooks,
+            delete_github_webhook,
+            test_github_webhook,
         ]
 
         # Self-service task tools
