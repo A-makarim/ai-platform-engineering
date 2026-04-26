@@ -158,6 +158,135 @@ def test_create_cron_without_schedule_returns_validation_error(monkeypatch):
     assert "trigger_schedule" in out
 
 
+# ---------------------------------------------------------------------------
+# create_autonomous_task — webhook auto-secret + callback URL (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+def test_create_webhook_task_auto_generates_secret(monkeypatch):
+    """No caller secret -> tool generates 32-byte hex, forwards to server,
+    AND surfaces it in the response exactly once so the LLM can pass it
+    straight to ``register_github_webhook`` without a round-trip to the
+    operator."""
+    monkeypatch.delenv("AUTONOMOUS_AGENTS_PUBLIC_URL", raising=False)
+    captured: dict = {}
+
+    def handler(request):
+        import json as _json
+        captured["body"] = _json.loads(request.read())
+        return httpx.Response(
+            201, json=_ok_task("auto-triage", trigger={"type": "webhook", "has_secret": True})
+        )
+
+    _patch_httpx(monkeypatch, handler)
+    result = ta.create_autonomous_task.invoke({
+        "id": "auto-triage",
+        "name": "Auto Triage",
+        "prompt": "Handle the incoming event",
+        "trigger_type": "webhook",
+    })
+
+    # Server receives a complete webhook trigger with a real secret.
+    body = captured["body"]
+    assert body["trigger"]["type"] == "webhook"
+    secret_sent = body["trigger"]["secret"]
+    assert isinstance(secret_sent, str) and len(secret_sent) == 64  # 32 bytes hex
+
+    # LLM-facing response surfaces everything the next tool call needs.
+    assert "Created autonomous task" in result
+    assert "callback_url:" in result
+    assert "/hooks/auto-triage" in result
+    assert secret_sent in result  # the exact secret is echoed once
+    assert "auto-generated" in result
+    # Warning about AUTONOMOUS_AGENTS_PUBLIC_URL being unset — operator
+    # needs to know the callback won't be externally reachable yet.
+    assert "AUTONOMOUS_AGENTS_PUBLIC_URL" in result
+
+
+def test_create_webhook_task_uses_caller_supplied_secret_without_echo(monkeypatch):
+    """Caller provides a secret -> forwarded to server, but NOT echoed in
+    the response string. Echoing a caller-supplied secret would widen the
+    leak surface (logs, chat transcripts) for no UX benefit -- the caller
+    already has it."""
+    monkeypatch.delenv("AUTONOMOUS_AGENTS_PUBLIC_URL", raising=False)
+    captured: dict = {}
+
+    def handler(request):
+        import json as _json
+        captured["body"] = _json.loads(request.read())
+        return httpx.Response(201, json=_ok_task("t1", trigger={"type": "webhook", "has_secret": True}))
+
+    _patch_httpx(monkeypatch, handler)
+    result = ta.create_autonomous_task.invoke({
+        "id": "t1",
+        "name": "T",
+        "prompt": "do the thing",
+        "trigger_type": "webhook",
+        "webhook_secret": "caller-supplied-secret-value",
+    })
+
+    assert captured["body"]["trigger"]["secret"] == "caller-supplied-secret-value"
+    assert "caller-supplied-secret-value" not in result
+    assert "auto-generated" not in result
+    assert "using the value you supplied" in result
+    # callback_url is still always surfaced — that's not sensitive.
+    assert "callback_url:" in result
+
+
+def test_create_webhook_task_uses_public_url_when_set(monkeypatch):
+    """When AUTONOMOUS_AGENTS_PUBLIC_URL is set, callback_url uses it
+    (not AUTONOMOUS_AGENTS_URL) and the 'not externally reachable' warning
+    is suppressed."""
+    monkeypatch.setenv(
+        "AUTONOMOUS_AGENTS_PUBLIC_URL", "https://abcd-1-2-3-4.ngrok.io"
+    )
+    monkeypatch.setenv("AUTONOMOUS_AGENTS_URL", "http://autonomous-agents:8002")
+
+    def handler(_request):
+        return httpx.Response(201, json=_ok_task("demo", trigger={"type": "webhook", "has_secret": True}))
+
+    _patch_httpx(monkeypatch, handler)
+    result = ta.create_autonomous_task.invoke({
+        "id": "demo",
+        "name": "Demo",
+        "prompt": "do the thing",
+        "trigger_type": "webhook",
+    })
+
+    assert "callback_url: https://abcd-1-2-3-4.ngrok.io/hooks/demo" in result
+    # Warning should NOT appear when the public URL is set.
+    assert "AUTONOMOUS_AGENTS_PUBLIC_URL is not set" not in result
+
+
+def test_create_cron_task_does_not_include_webhook_fields(monkeypatch):
+    """Regression guard: non-webhook tasks must not get a secret field
+    tacked onto their trigger nor a callback_url in the response string.
+    A leaked secret on a cron task would be wasted LLM context and could
+    confuse a follow-up register_github_webhook call."""
+    captured: dict = {}
+
+    def handler(request):
+        import json as _json
+        captured["body"] = _json.loads(request.read())
+        return httpx.Response(201, json=_ok_task("cron-t"))
+
+    _patch_httpx(monkeypatch, handler)
+    result = ta.create_autonomous_task.invoke({
+        "id": "cron-t",
+        "name": "Cron T",
+        "prompt": "do the thing",
+        "trigger_type": "cron",
+        "trigger_schedule": "0 9 * * *",
+        # Even if the LLM mistakenly passes webhook_secret, the tool
+        # must ignore it for non-webhook triggers.
+        "webhook_secret": "should-not-appear",
+    })
+
+    assert "secret" not in captured["body"]["trigger"]
+    assert "callback_url" not in result
+    assert "should-not-appear" not in result
+
+
 def test_create_interval_without_period_returns_validation_error(monkeypatch):
     def handler(req):
         raise AssertionError("HTTP call should not have been made")

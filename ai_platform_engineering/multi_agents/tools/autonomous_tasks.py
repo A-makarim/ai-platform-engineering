@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets as _secrets
 from typing import Any, Literal
 
 import httpx
@@ -56,8 +57,47 @@ logger = logging.getLogger(__name__)
 
 
 def _autonomous_agents_url() -> str:
-    """Base URL for the autonomous-agents FastAPI service. Trailing slash stripped."""
+    """Internal (service-to-service) base URL for autonomous-agents.
+
+    Read from ``AUTONOMOUS_AGENTS_URL`` (e.g. ``http://autonomous-agents:8002``
+    in docker-compose, ``http://localhost:8002`` for native dev).
+
+    Used by the tool to POST to the REST API. Not the URL we hand to
+    external webhook senders like GitHub -- that's :func:`_public_base_url`.
+    """
     return (os.environ.get("AUTONOMOUS_AGENTS_URL") or "http://localhost:8002").rstrip("/")
+
+
+def _public_base_url() -> str:
+    """Externally-reachable base URL for autonomous-agents.
+
+    Webhook senders like GitHub need to reach us from the public
+    internet, which means neither ``http://autonomous-agents:8002``
+    (internal docker DNS) nor ``http://localhost:8002`` (loopback)
+    are usable. Operators set ``AUTONOMOUS_AGENTS_PUBLIC_URL`` to the
+    machine's ngrok/cloudflared tunnel for dev or the real hostname
+    for prod.
+
+    Falls back to ``AUTONOMOUS_AGENTS_URL`` when unset so existing
+    local-dev flows still produce a well-formed callback URL even if
+    external reachability is lacking. The LLM can read the returned
+    URL and tell the operator "this won't work from GitHub until you
+    set AUTONOMOUS_AGENTS_PUBLIC_URL".
+    """
+    public = os.environ.get("AUTONOMOUS_AGENTS_PUBLIC_URL")
+    if public:
+        return public.rstrip("/")
+    return _autonomous_agents_url()
+
+
+def _webhook_callback_url(task_id: str) -> str:
+    """Build the canonical callback URL for a webhook task.
+
+    Centralised so both :func:`create_autonomous_task` and any future
+    code path that needs to report "this task is reachable at..."
+    produce identical strings.
+    """
+    return f"{_public_base_url()}/hooks/{task_id}"
 
 
 def _api_url(path: str) -> str:
@@ -138,6 +178,7 @@ def create_autonomous_task(
     trigger_seconds: int | None = None,
     trigger_minutes: int | None = None,
     trigger_hours: int | None = None,
+    webhook_secret: str | None = None,
     description: str | None = None,
     agent: str | None = None,
     llm_provider: str | None = None,
@@ -150,6 +191,13 @@ def create_autonomous_task(
     proposed task back to the operator (id, name, trigger, prompt) BEFORE
     calling this tool — task creation is mildly destructive (it spawns
     a scheduled job) and the operator should sign off.
+
+    For ``trigger_type='webhook'`` tasks, this tool's response includes
+    the ``callback_url`` and HMAC ``secret`` that the next step --
+    usually ``register_github_webhook`` -- needs to wire an external
+    sender (GitHub, PagerDuty, etc.) to the new task. If ``webhook_secret``
+    is not supplied, a fresh 32-byte hex secret is generated server-side
+    so the caller doesn't have to invent one.
 
     Args:
         id: Unique short identifier (letters, digits, ``-``, ``_`` only).
@@ -169,6 +217,13 @@ def create_autonomous_task(
             ``trigger_type='interval'``.
         trigger_minutes: Interval period in minutes.
         trigger_hours: Interval period in hours.
+        webhook_secret: Optional HMAC-SHA256 secret for
+            ``trigger_type='webhook'``. GitHub (and any compliant sender)
+            signs each delivery with this so the receiver can verify the
+            request is genuine. If omitted for a webhook task, a fresh
+            32-byte hex secret is auto-generated and returned in the
+            success string so the operator / the next tool call can use
+            it. Ignored for non-webhook triggers.
         description: Optional free-form description shown alongside the
             task in the UI list.
         agent: Optional routing hint — sub-agent id to dispatch to (e.g.
@@ -182,7 +237,12 @@ def create_autonomous_task(
             (operator can flip it on later from the UI).
 
     Returns a confirmation string with the new task summary, or a
-    human-readable error explaining what went wrong.
+    human-readable error explaining what went wrong. For webhook
+    triggers the response additionally includes:
+      ``callback_url``: where to point the external sender
+      ``secret``: HMAC key (auto-generated if not supplied) -- surfaced
+          exactly once, so the LLM should either pass it straight to
+          the next tool call or relay it to the operator.
     """
     trigger: dict[str, Any] = {"type": trigger_type}
     if trigger_type == "cron":
@@ -205,7 +265,21 @@ def create_autonomous_task(
             trigger["minutes"] = trigger_minutes
         if trigger_hours:
             trigger["hours"] = trigger_hours
-    # webhook trigger has no required fields beyond ``type``.
+    elif trigger_type == "webhook":
+        # Per the Phase 2 design doc in WEBHOOK_DEMO_PLAN.md: auto-generate
+        # a per-task secret when the caller doesn't supply one so the LLM
+        # can chain create_autonomous_task -> register_github_webhook in a
+        # single turn without a separate "generate a secret" round-trip.
+        # Track whether it was auto-generated so we can surface it in the
+        # response only in that case (operator visibility) -- echoing a
+        # caller-supplied secret would pointlessly widen the leak surface.
+        if webhook_secret:
+            secret_value = webhook_secret
+            secret_was_generated = False
+        else:
+            secret_value = _secrets.token_hex(32)
+            secret_was_generated = True
+        trigger["secret"] = secret_value
 
     payload: dict[str, Any] = {
         "id": id,
@@ -231,7 +305,34 @@ def create_autonomous_task(
     except httpx.TransportError as exc:
         return f"Autonomous-agents service unreachable at {_autonomous_agents_url()}: {exc}"
 
-    return f"Created autonomous task:\n{_format_task(created)}"
+    lines = [f"Created autonomous task:\n{_format_task(created)}"]
+
+    # Webhook-specific follow-up: expose the URL external senders need
+    # and the secret they need to sign with. The caller's typical next
+    # move is register_github_webhook(..., callback_url=<url>, secret=<val>)
+    # to wire GitHub to this task -- doing that in the same LLM turn is
+    # the whole point of spec #099 webhook follow-up.
+    if trigger_type == "webhook":
+        callback_url = _webhook_callback_url(created.get("id") or id)
+        lines.append("")
+        lines.append(f"callback_url: {callback_url}")
+        if secret_was_generated:
+            lines.append(
+                f"secret: {secret_value}  "
+                "(auto-generated; pass this to register_github_webhook)"
+            )
+        else:
+            lines.append("secret: (using the value you supplied)")
+        if not os.environ.get("AUTONOMOUS_AGENTS_PUBLIC_URL"):
+            lines.append(
+                "Note: AUTONOMOUS_AGENTS_PUBLIC_URL is not set, so the "
+                "callback_url above is internal-only. External senders "
+                "like GitHub will not reach it. Set "
+                "AUTONOMOUS_AGENTS_PUBLIC_URL to the machine's public "
+                "hostname (ngrok tunnel in dev, real domain in prod) "
+                "and re-create the webhook on GitHub."
+            )
+    return "\n".join(lines)
 
 
 @tool
