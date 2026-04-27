@@ -387,3 +387,55 @@ def test_signature_helper_matches_endpoint_for_body_only(client, monkeypatch):
         "/api/v1/hooks/wh-1", content=body, headers={"X-Hub-Signature-256": sig}
     )
     assert resp.status_code == 200
+
+
+def test_github_ping_is_ignored_without_firing_task(client, monkeypatch):
+    """GitHub sends a ping immediately after webhook creation.
+
+    That delivery proves reachability but does not contain an ``issue``
+    object. Treating it as a real task run creates a misleading
+    "malformed payload" autonomous conversation before any issue was
+    opened.
+    """
+    _set_settings(monkeypatch)
+    _register(_make_task())
+
+    resp = client.post(
+        "/api/v1/hooks/wh-1",
+        json={"zen": "Accessible for all.", "hook": {"events": ["issues"]}},
+        headers={"X-GitHub-Event": "ping"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "status": "ignored",
+        "reason": "github_ping",
+        "task_id": "wh-1",
+    }
+    assert client.captured["calls"] == []
+
+
+def test_signed_github_ping_still_requires_valid_signature(client, monkeypatch):
+    _set_settings(monkeypatch)
+    _register(_make_task(secret="task-secret"))
+
+    body = json.dumps({"zen": "Accessible for all."}).encode()
+
+    unsigned = client.post(
+        "/api/v1/hooks/wh-1",
+        content=body,
+        headers={"X-GitHub-Event": "ping"},
+    )
+    assert unsigned.status_code == 401
+
+    signed = client.post(
+        "/api/v1/hooks/wh-1",
+        content=body,
+        headers={
+            "X-GitHub-Event": "ping",
+            "X-Hub-Signature-256": _hex_sig("task-secret", body),
+        },
+    )
+    assert signed.status_code == 200
+    assert signed.json()["status"] == "ignored"
+    assert client.captured["calls"] == []

@@ -144,6 +144,7 @@ async def receive_webhook(
     task_id: str,
     request: Request,
     x_hub_signature_256: str | None = Header(None),
+    x_github_event: str | None = Header(None),
     x_webhook_timestamp: str | None = Header(None),
 ) -> dict:
     """Accept an incoming webhook and immediately run the matching task."""
@@ -183,6 +184,10 @@ async def receive_webhook(
             task_id,
             source,
         )
+
+    if (x_github_event or "").lower() == "ping":
+        logger.info("Ignoring GitHub ping delivery for webhook task '%s'", task_id)
+        return {"status": "ignored", "reason": "github_ping", "task_id": task_id}
 
     context = _parse_context(body)
     payload = WebhookPayload(data=context)
