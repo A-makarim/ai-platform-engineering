@@ -120,8 +120,12 @@ export function buildTimelineSegmentsFromEvents(
     }
   }
 
-  // End any in-progress thinking — replay is by definition complete.
-  timeline.endThinking();
+  // Replay is by definition complete. Finalize mirrors the live
+  // streaming onDone path: it stops any open text stream and closes
+  // notification pseudo-tools such as "composing_answer" that may not
+  // have a matching tool_notification_end artifact in persisted A2A
+  // history.
+  timeline.finalize();
 
   return timeline.getSegments();
 }
