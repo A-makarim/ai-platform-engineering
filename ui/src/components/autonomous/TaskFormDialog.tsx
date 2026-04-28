@@ -133,25 +133,35 @@ export function TaskFormDialog({ open, onOpenChange, task, onSubmit }: TaskFormD
               <Label htmlFor="task-agent">Agent (optional)</Label>
               {agentsError || (!agentsLoading && agentOptions.length === 0) ? (
                 // Supervisor unreachable or no agents discovered — fall back
-                // to a free-text input so operators aren't blocked. Same
-                // black-on-white styling so the affordance is consistent
-                // with the dropdown variant below.
+                // to a free-text input so operators aren't blocked.
                 <Input
                   id="task-agent"
                   value={form.agent}
                   onChange={(e) => update("agent", e.target.value)}
                   placeholder="leave blank to let the LLM router decide"
-                  className="bg-black text-white placeholder:text-neutral-400 border-neutral-700 focus-visible:ring-neutral-500"
                 />
               ) : (
+                // Use the active theme's `--background` / `--foreground`
+                // tokens so the control exactly matches the dialog body in
+                // every theme (light, dark, midnight, …) instead of a
+                // hard-coded #000 that looks slightly off in dark themes
+                // where --background is e.g. hsl(230 25% 5%), not pure black.
+                // Browsers ignore most CSS on <option>, so we read the same
+                // CSS variables via inline style with hsl(var(--…)).
                 <select
                   id="task-agent"
                   value={form.agent}
                   onChange={(e) => update("agent", e.target.value)}
                   disabled={agentsLoading}
-                  className="flex h-9 w-full rounded-md border border-neutral-700 bg-black px-3 py-1 text-sm text-white shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-500 disabled:cursor-not-allowed disabled:opacity-50"
+                  className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm text-foreground shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  <option value="" style={{ backgroundColor: "#000", color: "#fff" }}>
+                  <option
+                    value=""
+                    style={{
+                      backgroundColor: "hsl(var(--background))",
+                      color: "hsl(var(--foreground))",
+                    }}
+                  >
                     {agentsLoading
                       ? "Loading agents…"
                       : "(let supervisor decide)"}
@@ -160,7 +170,10 @@ export function TaskFormDialog({ open, onOpenChange, task, onSubmit }: TaskFormD
                     <option
                       key={opt.value}
                       value={opt.value}
-                      style={{ backgroundColor: "#000", color: "#fff" }}
+                      style={{
+                        backgroundColor: "hsl(var(--background))",
+                        color: "hsl(var(--foreground))",
+                      }}
                     >
                       {opt.label}
                     </option>
@@ -173,7 +186,10 @@ export function TaskFormDialog({ open, onOpenChange, task, onSubmit }: TaskFormD
                     !agentOptions.some((opt) => opt.value === form.agent) && (
                       <option
                         value={form.agent}
-                        style={{ backgroundColor: "#000", color: "#fff" }}
+                        style={{
+                          backgroundColor: "hsl(var(--background))",
+                          color: "hsl(var(--foreground))",
+                        }}
                       >
                         {form.agent} (not currently available)
                       </option>
