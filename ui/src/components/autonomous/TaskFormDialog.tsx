@@ -17,6 +17,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import { useAgentTools } from "@/hooks/use-agent-tools";
 
 import type { AutonomousTask, TaskFormState, TriggerType } from "./types";
 import { fromFormState, toFormState } from "./formState";
@@ -34,6 +35,7 @@ export function TaskFormDialog({ open, onOpenChange, task, onSubmit }: TaskFormD
   const [form, setForm] = useState<TaskFormState>(() => toFormState(task));
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const { agents: agentOptions, loading: agentsLoading, error: agentsError } = useAgentTools();
 
   // Reset whenever the dialog opens or the underlying task changes.
   // Without this, editing task A then opening "create" would inherit
@@ -129,12 +131,55 @@ export function TaskFormDialog({ open, onOpenChange, task, onSubmit }: TaskFormD
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-1">
               <Label htmlFor="task-agent">Agent (optional)</Label>
-              <Input
-                id="task-agent"
-                value={form.agent}
-                onChange={(e) => update("agent", e.target.value)}
-                placeholder="leave blank to let the LLM router decide"
-              />
+              {agentsError || (!agentsLoading && agentOptions.length === 0) ? (
+                // Supervisor unreachable or no agents discovered — fall back
+                // to a free-text input so operators aren't blocked. Same
+                // black-on-white styling so the affordance is consistent
+                // with the dropdown variant below.
+                <Input
+                  id="task-agent"
+                  value={form.agent}
+                  onChange={(e) => update("agent", e.target.value)}
+                  placeholder="leave blank to let the LLM router decide"
+                  className="bg-black text-white placeholder:text-neutral-400 border-neutral-700 focus-visible:ring-neutral-500"
+                />
+              ) : (
+                <select
+                  id="task-agent"
+                  value={form.agent}
+                  onChange={(e) => update("agent", e.target.value)}
+                  disabled={agentsLoading}
+                  className="flex h-9 w-full rounded-md border border-neutral-700 bg-black px-3 py-1 text-sm text-white shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-500 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <option value="" style={{ backgroundColor: "#000", color: "#fff" }}>
+                    {agentsLoading
+                      ? "Loading agents…"
+                      : "(let supervisor decide)"}
+                  </option>
+                  {agentOptions.map((opt) => (
+                    <option
+                      key={opt.value}
+                      value={opt.value}
+                      style={{ backgroundColor: "#000", color: "#fff" }}
+                    >
+                      {opt.label}
+                    </option>
+                  ))}
+                  {/* Preserve a stored agent value that's no longer
+                      advertised by the supervisor (e.g. agent renamed
+                      or temporarily offline) so editing the task
+                      doesn't silently drop it. */}
+                  {form.agent &&
+                    !agentOptions.some((opt) => opt.value === form.agent) && (
+                      <option
+                        value={form.agent}
+                        style={{ backgroundColor: "#000", color: "#fff" }}
+                      >
+                        {form.agent} (not currently available)
+                      </option>
+                    )}
+                </select>
+              )}
               <p className="text-[11px] text-muted-foreground">
                 Optional routing hint (e.g. <code>github</code>). Leave blank
                 and the supervisor&apos;s LLM picks an agent from the prompt
