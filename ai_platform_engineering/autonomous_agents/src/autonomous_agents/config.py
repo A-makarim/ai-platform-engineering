@@ -208,6 +208,22 @@ class Settings(BaseSettings):
     # truth for CRUD operations).
     mongodb_tasks_collection: str = "autonomous_tasks"
 
+    # MongoDB collection mapping a Webex messageId to the (task_id,
+    # run_id) that produced it. Populated best-effort by the scheduler
+    # after every successful run that called the Webex ``post_message``
+    # tool, and consumed by the inbound Webex bot bridge so an in-thread
+    # reply can be routed back as a follow-up to the originating task.
+    # Empty / unused when no Webex bot is deployed -- safe to leave at
+    # the default.
+    mongodb_webex_thread_map_collection: str = "webex_thread_map"
+
+    # TTL (in days) for entries in ``webex_thread_map``. Threads that
+    # haven't been touched in this window are auto-expired by Mongo so
+    # the collection doesn't grow unbounded. Defaults to 30 days --
+    # plenty of time for an operator to follow up on a flagged issue,
+    # short enough that abandoned threads don't pile up.
+    webex_thread_map_ttl_days: int = Field(default=30, ge=1)
+
     # Connect-retry knobs used by main.py's lifespan. First connect
     # attempt happens immediately; subsequent attempts wait ``delay``
     # seconds between tries. ``ge=1`` keeps "never try" from being

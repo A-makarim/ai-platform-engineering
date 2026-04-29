@@ -32,12 +32,18 @@ from autonomous_agents.services.chat_history import (
     _conversation_id_for_task,
 )
 from autonomous_agents.services.mongo import RunStore
+from autonomous_agents.services.webex_threads import (
+    WebexThreadEntry,
+    WebexThreadMap,
+    extract_webex_message_ids,
+)
 
 logger = logging.getLogger("autonomous_agents")
 
 _scheduler: AsyncIOScheduler | None = None
 _run_store: RunStore | None = None
 _chat_history_publisher: ChatHistoryPublisher | None = None
+_webex_thread_map: WebexThreadMap | None = None
 
 
 def get_scheduler() -> AsyncIOScheduler:
@@ -92,6 +98,24 @@ def set_chat_history_publisher(publisher: ChatHistoryPublisher) -> None:
     _chat_history_publisher = publisher
 
 
+def get_webex_thread_map() -> WebexThreadMap | None:
+    """Return the active :class:`WebexThreadMap`, or None if unconfigured.
+
+    The thread map is **optional** -- deployments without a Webex bot
+    have nothing to record and we want their scheduler to skip the
+    write entirely instead of erroring or storing rows that nothing
+    ever queries. Returning ``None`` here is a deliberate signal to
+    :func:`_record_webex_threads` that this responsibility is opt-in.
+    """
+    return _webex_thread_map
+
+
+def set_webex_thread_map(thread_map: WebexThreadMap | None) -> None:
+    """Inject the active :class:`WebexThreadMap` -- called from the FastAPI lifespan."""
+    global _webex_thread_map
+    _webex_thread_map = thread_map
+
+
 async def _record_safely(store: RunStore, run: TaskRun) -> None:
     """Persist ``run`` and swallow store-side exceptions.
 
@@ -108,6 +132,51 @@ async def _record_safely(store: RunStore, run: TaskRun) -> None:
             f"[{run.task_id}] Failed to persist run {run.run_id} "
             f"(status={run.status}): {exc}"
         )
+
+
+async def _record_webex_threads_safely(
+    thread_map: WebexThreadMap | None,
+    task_id: str,
+    run_id: str,
+    events: list[dict[str, Any]] | None,
+) -> None:
+    """Best-effort scan-and-record of Webex messageIds the run produced.
+
+    Walks ``events`` for the ``post_message`` tool descriptor we
+    inject in the Webex MCP server, then upserts each
+    ``messageId -> (task_id, run_id, room_id)`` into the configured
+    :class:`WebexThreadMap`. This is the seam that lets a later
+    in-thread reply (Webex delivers it as a webhook with
+    ``parentId=<that messageId>``) be routed back to the originating
+    task as a follow-up.
+
+    Same contract as :func:`_record_safely` and :func:`_publish_safely`:
+    thread-map writes are observability/routing infrastructure, not
+    the source of truth for whether a task ran. Failures here MUST
+    NEVER abort task execution -- log loudly, return, move on.
+    """
+    if thread_map is None:
+        # No bot deployed -> nothing to do. Common case.
+        return
+    pairs = extract_webex_message_ids(events)
+    if not pairs:
+        return
+    for message_id, room_id in pairs:
+        try:
+            await thread_map.record(
+                WebexThreadEntry(
+                    message_id=message_id,
+                    task_id=task_id,
+                    run_id=run_id,
+                    room_id=room_id,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 -- best-effort
+            logger.error(
+                "[%s] Failed to record Webex thread map entry "
+                "(message_id=%s, run_id=%s): %s",
+                task_id, message_id, run_id, exc,
+            )
 
 
 async def _publish_safely(
@@ -283,6 +352,19 @@ async def execute_task(
             # supervisor sub-agent hint for legacy tasks.
             agent=task.dynamic_agent_id or task.agent,
         )
+        # Webex thread map: only worth scanning on a successful run --
+        # a FAILED run usually didn't get far enough to call any
+        # tools, and even when it did the message we'd record points
+        # to a half-completed conversation that the bot wouldn't want
+        # to continue. The helper is a no-op when no thread map has
+        # been injected (i.e. no Webex bot deployed).
+        if run.status == TaskStatus.SUCCESS:
+            await _record_webex_threads_safely(
+                get_webex_thread_map(),
+                task_id=task.id,
+                run_id=run_id,
+                events=run.events,
+            )
 
     return run
 
