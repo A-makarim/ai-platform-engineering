@@ -95,8 +95,15 @@ def verify_webex_signature(
     the Webex side -- some operators ship the bridge unsigned in
     dev). Returns False on missing / mismatched headers when a
     secret IS configured.
+
+    Note: ``pydantic-settings`` deserialises an empty ``.env`` value
+    (e.g. ``WEBEX_WEBHOOK_SECRET=``) as ``""``, not ``None``. Treat
+    both as "no secret" so dev operators who blank the variable to
+    disable signing don't accidentally end up with a bot that 401s
+    every event because the empty-string secret still triggers the
+    "must verify" branch.
     """
-    if secret is None:
+    if not secret:
         return True
     if not signature_header:
         return False

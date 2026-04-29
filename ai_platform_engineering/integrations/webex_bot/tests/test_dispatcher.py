@@ -261,6 +261,19 @@ def test_verify_webex_signature_passes_when_no_secret_configured():
     )
 
 
+def test_verify_webex_signature_treats_empty_string_secret_as_no_secret():
+    """Regression: ``pydantic-settings`` parses ``WEBEX_WEBHOOK_SECRET=``
+    (blank) as ``""`` rather than ``None``. The verifier must treat
+    both the same way -- otherwise blanking the env variable to
+    disable signing produces a bot that 401s every event because
+    its (empty) secret never matches the (absent) header.
+    """
+    assert (
+        verify_webex_signature(secret="", body=b"{}", signature_header=None)
+        is True
+    )
+
+
 def test_verify_webex_signature_passes_with_valid_signature():
     body = b'{"data":{"id":"x"}}'
     sig = _spark_sig("topsecret", body)
