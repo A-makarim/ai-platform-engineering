@@ -47,17 +47,16 @@ interface DynamicAgentEditorProps {
 
 /**
  * Generate a URL-safe slug from an agent name.
- * e.g., "Knowledge Agent" -> "knowledge_agent"
+ * Keep this in sync with the dynamic-agents API slugify helper.
+ * e.g., "Knowledge Agent" -> "knowledge-agent"
  */
 function generateSlug(name: string): string {
   return name
     .toLowerCase()
     .trim()
-    .replace(/[^a-z0-9\s-]/g, "") // Remove special characters
-    .replace(/\s+/g, "_")          // Replace spaces with underscores
-    .replace(/-+/g, "_")           // Replace hyphens with underscores
-    .replace(/_+/g, "_")           // Collapse multiple underscores
-    .replace(/^_|_$/g, "");        // Trim leading/trailing underscores
+    .replace(/[^a-z0-9]+/g, "-") // Replace non-alphanumeric runs with hyphens
+    .replace(/-+/g, "-")         // Collapse multiple hyphens
+    .replace(/^-|-$/g, "");      // Trim leading/trailing hyphens
 }
 
 const VISIBILITY_OPTIONS: { value: VisibilityType; label: string; icon: React.ReactNode; description: string }[] = [
@@ -598,7 +597,7 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
         if (!data.success) {
           throw new Error(data.error || "Failed to create agent");
         }
-        savedAgentId = generatedId;
+        savedAgentId = data.data?._id || generatedId;
       }
 
       if (autonomousTasks.length > 0 || autonomousTasksLoaded.length > 0) {
