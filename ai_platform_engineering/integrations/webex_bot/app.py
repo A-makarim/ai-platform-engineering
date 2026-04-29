@@ -82,11 +82,16 @@ async def ensure_webhook_registered(
 
     Idempotent strategy:
         * If a webhook with our ``name`` exists pointing at the same
-          ``target_url`` -- leave it.
-        * If it points elsewhere -- delete it and recreate with the
-          current target_url. This keeps the dev-loop on ngrok
-          (``https://<random>.ngrok-free.app``) painless: rotating
-          the public URL just requires a service restart.
+          ``target_url`` AND its signed/unsigned state matches our
+          current ``secret`` argument -- leave it.
+        * Otherwise (stale URL OR signed/unsigned mismatch) -- delete
+          it and recreate with the current settings. This keeps the
+          dev-loop on ngrok painless (rotating the public URL just
+          needs a service restart) AND prevents the silent-rejection
+          trap where we add a ``WEBEX_WEBHOOK_SECRET`` to ``.env``
+          on a second restart but the webhook already exists in
+          Webex without a secret -- every event then arrives without
+          ``X-Spark-Signature`` and the bot 401s them.
         * If none exist -- create a fresh one.
 
     We deliberately do NOT scan for "any webhook pointing at this
@@ -99,21 +104,43 @@ async def ensure_webhook_registered(
     existing = await webex.list_webhooks()
     ours = [w for w in existing if w.get("name") == name]
 
+    # Webex's GET /webhooks list response returns ``"secret": ""`` for
+    # unsigned webhooks (and omits the field on some tenant flavours);
+    # treat both as "no secret configured" for the comparison below.
+    desired_signed = bool(secret)
+
     for wh in ours:
-        if wh.get("targetUrl") == target_url:
+        existing_signed = bool(wh.get("secret"))
+        if (
+            wh.get("targetUrl") == target_url
+            and existing_signed == desired_signed
+        ):
             logger.info(
-                "Webex webhook %s already points at %s -- reusing",
+                "Webex webhook %s already points at %s (signed=%s) -- reusing",
                 wh.get("id"),
                 target_url,
+                desired_signed,
             )
             return wh
-        # Stale registration; nuke and re-create with current URL.
+        # Stale registration (URL changed OR signing posture flipped);
+        # nuke and re-create. Logging the precise mismatch reason
+        # makes the "I added a secret and now nothing arrives"
+        # situation immediately obvious in the startup log.
+        reason_bits: list[str] = []
+        if wh.get("targetUrl") != target_url:
+            reason_bits.append(
+                f"url {wh.get('targetUrl')!r} -> {target_url!r}"
+            )
+        if existing_signed != desired_signed:
+            reason_bits.append(
+                f"signed {existing_signed} -> {desired_signed}"
+            )
         try:
             await webex.delete_webhook(wh["id"])
             logger.info(
-                "Deleted stale Webex webhook %s (was -> %s)",
+                "Deleted stale Webex webhook %s (%s)",
                 wh["id"],
-                wh.get("targetUrl"),
+                "; ".join(reason_bits) or "no reason captured",
             )
         except httpx.HTTPError as exc:
             logger.warning("Failed to delete stale webhook %s: %s", wh["id"], exc)

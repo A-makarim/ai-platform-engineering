@@ -67,12 +67,13 @@ async def test_creates_when_none_exist():
 
 
 @pytest.mark.asyncio
-async def test_reuses_when_name_and_target_match():
+async def test_reuses_when_name_and_target_and_signing_match():
     existing = [
         {
             "id": "wh-1",
             "name": "caipe-autonomous-followups",
             "targetUrl": "https://abcd.ngrok-free.app/webex/events",
+            "secret": "",  # unsigned, matches our None secret below
         }
     ]
     client = FakeWebexClient(existing=existing)
@@ -85,6 +86,59 @@ async def test_reuses_when_name_and_target_match():
     assert client.deleted == []
     assert client.created == []
     assert result["id"] == "wh-1"
+
+
+@pytest.mark.asyncio
+async def test_replaces_unsigned_webhook_when_secret_is_now_configured():
+    """Regression: adding ``WEBEX_WEBHOOK_SECRET`` to .env on a
+    restart must force re-registration. Otherwise Webex keeps
+    delivering unsigned events and the bot 401s every one of them
+    (we hit this in dev with PR #3)."""
+    existing = [
+        {
+            "id": "wh-unsigned",
+            "name": "caipe-autonomous-followups",
+            "targetUrl": "https://abcd.ngrok-free.app/webex/events",
+            "secret": "",  # registered without a secret
+        }
+    ]
+    client = FakeWebexClient(existing=existing)
+
+    await ensure_webhook_registered(
+        client,  # type: ignore[arg-type]
+        target_url="https://abcd.ngrok-free.app/webex/events",
+        secret="now-configured",
+    )
+
+    assert client.deleted == ["wh-unsigned"]
+    assert len(client.created) == 1
+    assert client.created[0]["secret"] == "now-configured"
+
+
+@pytest.mark.asyncio
+async def test_replaces_signed_webhook_when_secret_was_removed():
+    """The reverse: dropping ``WEBEX_WEBHOOK_SECRET`` from .env must
+    also force re-registration so Webex stops signing events the bot
+    isn't expecting to verify."""
+    existing = [
+        {
+            "id": "wh-signed",
+            "name": "caipe-autonomous-followups",
+            "targetUrl": "https://abcd.ngrok-free.app/webex/events",
+            "secret": "old-secret",
+        }
+    ]
+    client = FakeWebexClient(existing=existing)
+
+    await ensure_webhook_registered(
+        client,  # type: ignore[arg-type]
+        target_url="https://abcd.ngrok-free.app/webex/events",
+        secret=None,
+    )
+
+    assert client.deleted == ["wh-signed"]
+    assert len(client.created) == 1
+    assert "secret" not in client.created[0]
 
 
 @pytest.mark.asyncio
