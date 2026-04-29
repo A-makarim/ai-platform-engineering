@@ -17,6 +17,7 @@ from apscheduler.triggers.interval import IntervalTrigger as APSIntervalTrigger
 
 from autonomous_agents.models import (
     CronTrigger,
+    FollowUpContext,
     IntervalTrigger,
     TaskDefinition,
     TaskRun,
@@ -150,13 +151,24 @@ async def _publish_safely(
         )
 
 
-async def execute_task(task: TaskDefinition, context: dict[str, Any] | None = None) -> TaskRun:
+async def execute_task(
+    task: TaskDefinition,
+    context: dict[str, Any] | None = None,
+    follow_up: FollowUpContext | None = None,
+) -> TaskRun:
     """Run a single task, record the result, and return the TaskRun.
 
     Public entry point used both by APScheduler (cron/interval) and by
     the routes layer (manual trigger, webhook). Keeping this public is
     intentional — it's part of the contract with the FastAPI handlers
     that drive ad-hoc execution. Don't add a leading underscore back.
+
+    ``follow_up`` is set when an inbound bridge (e.g. the Webex bot)
+    re-fires this task with operator feedback in response to a prior
+    run. The follow-up text is appended to the task prompt under a
+    clearly-labelled section, and ``TaskRun.parent_run_id`` is
+    populated so the chat-thread synthesiser can render a single
+    threaded timeline.
     """
     run_id = str(uuid.uuid4())
     # Pre-compute the deterministic per-task conversation id so it lands
@@ -171,6 +183,7 @@ async def execute_task(task: TaskDefinition, context: dict[str, Any] | None = No
         task_name=task.name,
         status=TaskStatus.RUNNING,
         conversation_id=conversation_id,
+        parent_run_id=follow_up.parent_run_id if follow_up else None,
     )
 
     store = get_run_store()
@@ -179,11 +192,27 @@ async def execute_task(task: TaskDefinition, context: dict[str, Any] | None = No
     # task — see _record_safely.
     await _record_safely(store, run)
 
-    logger.info(f"[{task.id}] Starting run {run_id}")
+    logger.info(
+        "[%s] Starting run %s%s",
+        task.id,
+        run_id,
+        f" (follow-up to {follow_up.parent_run_id})" if follow_up else "",
+    )
     response_text: str | None = None
     error_text: str | None = None
+    # Materialise the prompt the agent will actually see. For follow-up
+    # runs we splice the operator reply into a clearly-labelled section
+    # so the LLM treats it as new instructions rather than confusing it
+    # with the original webhook payload context. The original task
+    # definition is left untouched (we work off a model_copy) so this
+    # has no persistence side-effects.
+    effective_task = (
+        task.model_copy(update={"prompt": _augment_prompt_for_followup(task.prompt, follow_up)})
+        if follow_up is not None
+        else task
+    )
     try:
-        if task.dynamic_agent_id:
+        if effective_task.dynamic_agent_id:
             # Custom (dynamic) agent path: invoke the dynamic-agents
             # service directly so the prompt actually executes through
             # the user's custom agent (its tools / system prompt /
@@ -193,11 +222,11 @@ async def execute_task(task: TaskDefinition, context: dict[str, Any] | None = No
             # can swap in /chat/stream/start parsing for richer chat
             # replay parity. The synthesiser tolerates an empty list.
             response, events = await invoke_dynamic_agent(
-                prompt=task.prompt,
-                task_id=task.id,
-                agent_id=task.dynamic_agent_id,
+                prompt=effective_task.prompt,
+                task_id=effective_task.id,
+                agent_id=effective_task.dynamic_agent_id,
                 conversation_id=conversation_id,
-                timeout=task.timeout_seconds,
+                timeout=effective_task.timeout_seconds,
             )
         else:
             # Phase B (spec #099 Story 2): use the streaming variant so we
@@ -207,12 +236,12 @@ async def execute_task(task: TaskDefinition, context: dict[str, Any] | None = No
             # fires render with the same rich plan + tools + timeline a
             # typed chat reply gets.
             response, events = await invoke_agent_streaming(
-                prompt=task.prompt,
-                task_id=task.id,
-                agent=task.agent,
-                llm_provider=task.llm_provider,
+                prompt=effective_task.prompt,
+                task_id=effective_task.id,
+                agent=effective_task.agent,
+                llm_provider=effective_task.llm_provider,
                 context=context,
-                timeout_seconds=task.timeout_seconds,
+                timeout_seconds=effective_task.timeout_seconds,
             )
         response_text = response
         run.status = TaskStatus.SUCCESS
@@ -256,6 +285,30 @@ async def execute_task(task: TaskDefinition, context: dict[str, Any] | None = No
         )
 
     return run
+
+
+def _augment_prompt_for_followup(
+    base_prompt: str, follow_up: FollowUpContext | None
+) -> str:
+    """Splice an operator follow-up reply into the task prompt.
+
+    The follow-up is rendered as a clearly-labelled trailing section
+    so the task-runtime LLM treats it as new instructions rather than
+    blending it into the original webhook context. We deliberately do
+    NOT rewrite or summarise the operator's text -- the LLM is the
+    judge of what the feedback means.
+    """
+    if follow_up is None:
+        return base_prompt
+
+    who = follow_up.user_ref or "operator"
+    transport = follow_up.transport or "follow-up"
+    return (
+        f"{base_prompt}\n\n"
+        f"Operator follow-up ({transport}, from {who}, "
+        f"in reply to run {follow_up.parent_run_id}):\n"
+        f"{follow_up.user_text}"
+    )
 
 
 def _prompt_for_publish(
@@ -402,6 +455,15 @@ def register_tasks(tasks: list[TaskDefinition]) -> None:
     logger.info(f"Scheduler started with {len(scheduler.get_jobs())} job(s)")
 
 
-async def fire_webhook_task(task: TaskDefinition, context: dict[str, Any]) -> TaskRun:
-    """Immediately execute a webhook-triggered task and return the completed run."""
-    return await execute_task(task, context=context)
+async def fire_webhook_task(
+    task: TaskDefinition,
+    context: dict[str, Any],
+    follow_up: FollowUpContext | None = None,
+) -> TaskRun:
+    """Immediately execute a webhook-triggered task and return the completed run.
+
+    ``follow_up`` is forwarded to :func:`execute_task` so the inbound
+    bridge can re-fire the same task with operator feedback. ``None``
+    for the original webhook fire and for the test-trigger button.
+    """
+    return await execute_task(task, context=context, follow_up=follow_up)

@@ -13,8 +13,14 @@ from typing import Any
 from fastapi import APIRouter, Header, HTTPException, Request
 
 from autonomous_agents.config import get_settings
-from autonomous_agents.models import TaskDefinition, TriggerType, WebhookPayload, WebhookTrigger
-from autonomous_agents.scheduler import fire_webhook_task
+from autonomous_agents.models import (
+    FollowUpContext,
+    TaskDefinition,
+    TriggerType,
+    WebhookPayload,
+    WebhookTrigger,
+)
+from autonomous_agents.scheduler import fire_webhook_task, get_run_store
 
 logger = logging.getLogger("autonomous_agents")
 router = APIRouter(tags=["webhooks"])
@@ -194,3 +200,134 @@ async def receive_webhook(
     run = await fire_webhook_task(task, context=payload.model_dump())
 
     return {"status": "accepted", "run_id": run.run_id, "task_id": task_id}
+
+
+async def _verify_followup_signature(
+    task: TaskDefinition,
+    body: bytes,
+    signature: str | None,
+    timestamp_header: str | None,
+) -> None:
+    """Shared HMAC + replay-window check for follow-up requests.
+
+    Same scheme as ``receive_webhook`` so the inbound bridge can use a
+    single signing routine for both the initial fire and follow-ups.
+    Raises :class:`HTTPException` on any failure; returns ``None`` on
+    success. Does nothing when no secret is configured (mirrors the
+    behaviour of ``receive_webhook`` for unsigned setups).
+    """
+    secret, source = _resolve_secret(task)
+    if not secret:
+        return
+
+    settings = get_settings()
+    replay_window = settings.webhook_replay_window_seconds
+
+    timestamp_for_signing: str | None = None
+    if replay_window > 0:
+        _validate_timestamp(timestamp_header, replay_window)
+        timestamp_for_signing = timestamp_header
+
+    if not signature:
+        raise HTTPException(status_code=401, detail="Missing X-Hub-Signature-256 header")
+
+    expected = _expected_signature(secret, body, timestamp_for_signing)
+    if not hmac.compare_digest(expected, signature):
+        # Do not reveal expected signature in response/logs.
+        logger.warning(
+            "Follow-up signature mismatch for task '%s' (secret_source=%s)",
+            task.id,
+            source,
+        )
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+
+@router.post("/hooks/{task_id}/follow-up")
+async def receive_followup(
+    task_id: str,
+    request: Request,
+    x_hub_signature_256: str | None = Header(None),
+    x_webhook_timestamp: str | None = Header(None),
+) -> dict:
+    """Re-fire an existing webhook task with operator follow-up text.
+
+    Used by inbound bridges (e.g. the Webex bot) to forward an
+    in-thread reply back to the task that started the thread. The
+    body is a JSON :class:`FollowUpContext`; HMAC validation reuses
+    the task's webhook secret so the bridge can sign with the same
+    key it uses for the initial fire path.
+
+    The resulting :class:`TaskRun` is linked to its parent via
+    ``parent_run_id`` so the chat-thread synthesiser can render a
+    single threaded timeline. The route returns 202-style metadata
+    immediately rather than streaming the new run's events -- the
+    bridge polls ``/tasks/{task_id}/runs`` (or the chat publisher) for
+    the terminal state.
+    """
+    task = _webhook_tasks.get(task_id)
+    if not task:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No webhook task found for id '{task_id}'",
+        )
+    if not isinstance(task.trigger, WebhookTrigger):
+        raise HTTPException(
+            status_code=500, detail=f"Task '{task_id}' is not a webhook task"
+        )
+
+    body = await request.body()
+    await _verify_followup_signature(
+        task, body, x_hub_signature_256, x_webhook_timestamp
+    )
+
+    try:
+        parsed = json.loads(body) if body else {}
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400, detail="Follow-up body must be valid JSON"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(
+            status_code=400, detail="Follow-up body must be a JSON object"
+        )
+
+    try:
+        follow_up = FollowUpContext.model_validate(parsed)
+    except ValueError as exc:
+        # Pydantic raises ValidationError (a ValueError subclass) for
+        # missing / mistyped fields. Surface the message verbatim so the
+        # bridge author can see exactly which field is wrong.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Defensive: confirm the parent run actually belongs to this task
+    # so a misrouted follow-up cannot graft itself onto a foreign
+    # task's chat thread. We list the task's recent runs (capped at
+    # the same value as the /tasks/{id}/runs endpoint) and verify
+    # the parent id is in that set; an unknown id 404s, a known id
+    # owned by a different task is impossible by construction since
+    # we only scan this task's runs. Using list_by_task instead of a
+    # bespoke get(run_id) keeps the RunStore protocol unchanged.
+    recent = await get_run_store().list_by_task(task_id, limit=500)
+    if not any(r.run_id == follow_up.parent_run_id for r in recent):
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Parent run '{follow_up.parent_run_id}' not found for "
+                f"task '{task_id}'"
+            ),
+        )
+
+    run = await fire_webhook_task(task, context={}, follow_up=follow_up)
+    logger.info(
+        "[%s] Follow-up run %s queued (parent=%s, transport=%s)",
+        task_id,
+        run.run_id,
+        follow_up.parent_run_id,
+        follow_up.transport or "unknown",
+    )
+    return {
+        "status": "accepted",
+        "run_id": run.run_id,
+        "task_id": task_id,
+        "parent_run_id": follow_up.parent_run_id,
+    }

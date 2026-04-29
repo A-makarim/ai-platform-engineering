@@ -176,6 +176,40 @@ class TaskDefinition(BaseModel):
 # Task run records (in-memory, can be backed by DB later)
 # =============================================================================
 
+class FollowUpContext(BaseModel):
+    """Operator follow-up that re-fires an existing webhook task.
+
+    Carries the bits the task-runtime LLM needs to keep the conversation
+    going: who replied, what they said, and which prior run they are
+    responding to. The chat-thread synthesiser uses ``parent_run_id`` to
+    link the resulting TaskRun back to its originator so the UI can
+    render a single timeline instead of two unrelated rows.
+    """
+
+    parent_run_id: str = Field(
+        ..., description="run_id of the task run that this is a follow-up to"
+    )
+    user_text: str = Field(
+        ..., description="Free-form follow-up text from the operator"
+    )
+    user_ref: str | None = Field(
+        default=None,
+        description=(
+            "Stable identifier for the replier (e.g. Webex personEmail) -- "
+            "used as a non-PII audit hint in chat history. Optional so "
+            "non-Webex transports can omit it."
+        ),
+    )
+    transport: str | None = Field(
+        default=None,
+        description=(
+            "Name of the inbound bridge that produced this follow-up "
+            "(e.g. 'webex'). Free-form so future bridges (slack, "
+            "teams, ...) can reuse the field without a model bump."
+        ),
+    )
+
+
 class TaskRun(BaseModel):
     run_id: str
     task_id: str
@@ -185,6 +219,12 @@ class TaskRun(BaseModel):
     finished_at: datetime | None = None
     response_preview: str | None = None
     error: str | None = None
+    # When this run was produced by a follow-up reply (e.g. the Webex
+    # bot forwarding an in-thread message), this points at the run
+    # the operator was replying to. Lets the UI render a single
+    # threaded timeline instead of unrelated rows. ``None`` for the
+    # original webhook fire and for cron / interval / manual runs.
+    parent_run_id: str | None = None
     # IMP-13: id of the chat-history conversation that mirrors this
     # run, when publishing is enabled. Lets the UI deep-link from a
     # run row to ``/chat/<conversation_id>``. Optional and stable per
