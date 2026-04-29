@@ -619,7 +619,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
                                 className="shrink-0 px-1 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wider bg-purple-500/15 text-purple-600 dark:text-purple-400 border border-purple-500/30"
                                 title="This is an autonomous task with a schedule. Typing here sends to the supervisor on the same context the cron uses."
                               >
-                                auto
+                                auto trigger
                               </span>
                             )}
                             {isShared && (
