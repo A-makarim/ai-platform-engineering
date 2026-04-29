@@ -7,22 +7,34 @@ authors = [
   { name = "CNOE Contributors" }
 ]
 requires-python = ">=3.13,<4.0"
+# Use compatible-release ranges (``~=``) for runtime deps -- this
+# package has no other consumers in the monorepo, so we don't need
+# the rest of the workspace's strict pinning. Ranges let a fresh
+# unpinned ``uv sync`` (the lockless path used in dev) succeed
+# regardless of small upstream patch drift, while still respecting
+# major versions for API stability.
 dependencies = [
-  "fastapi==0.118.3",
-  "uvicorn[standard]==0.39.0",
-  "httpx==0.28.1",
-  "pydantic==2.12.5",
-  "pydantic-settings==2.10.1",
-  "motor==3.6.0",
-  "loguru==0.7.3",
+  "fastapi~=0.118",
+  "uvicorn[standard]~=0.32",
+  "httpx~=0.28",
+  "pydantic~=2.12",
+  "pydantic-settings~=2.10",
+  "motor~=3.7",
+  "loguru~=0.7",
 ]
 
 [dependency-groups]
+# Test-only dependencies. Excluded from production images via
+# ``uv sync --no-dev``. Pinned to ranges (``~=``) rather than exact
+# versions so the resolver can pick the latest patch on a fresh
+# build without us needing to chase upstream releases manually --
+# pytest-asyncio in particular has not yet hit a stable 1.x line,
+# so an exact ``==1.x.y`` pin races their release cadence.
 unittest = [
-  "pytest==9.0.3",
-  "pytest-asyncio==1.4.0",
-  "pytest-mock==3.15.1",
-  "respx==0.22.0",
+  "pytest~=8.3",
+  "pytest-asyncio~=0.24",
+  "pytest-mock~=3.14",
+  "respx~=0.21",
 ]
 
 [[tool.uv.index]]

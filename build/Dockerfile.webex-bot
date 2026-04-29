@@ -35,11 +35,14 @@ WORKDIR /app
 COPY ai_platform_engineering/integrations/webex_bot/pyproject.toml /app/
 COPY ai_platform_engineering/integrations/webex_bot/uv.lock* /app/
 
+# ``--no-default-groups`` belt-and-braces with ``--no-dev``: skips
+# the [dependency-groups] table entirely so a missing/yanked test-only
+# pin (e.g. pytest-asyncio in flux) can never block a prod build.
 RUN --mount=type=cache,target=/root/.cache/uv \
     if [ -f /app/uv.lock ]; then \
-        uv sync --locked --no-dev; \
+        uv sync --locked --no-dev --no-default-groups; \
     else \
-        uv sync --no-dev; \
+        uv sync --no-dev --no-default-groups; \
     fi
 
 # Copy the package itself under ``/app/webex_bot/`` so the container
