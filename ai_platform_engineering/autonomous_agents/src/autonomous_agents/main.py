@@ -20,6 +20,8 @@ from autonomous_agents.scheduler import (
     register_tasks,
     set_chat_history_publisher,
     set_run_store,
+    set_task_resolver,
+    set_trigger_store,
 )
 from autonomous_agents.services.chat_history import NoopChatHistoryPublisher
 from autonomous_agents.services.mongo import (
@@ -125,6 +127,13 @@ async def lifespan(app: FastAPI):
     set_task_store(task_store)
     set_run_store(run_store)
     set_chat_history_publisher(chat_publisher)
+    # IMP-20: wire dedup. ``mongo`` itself implements the
+    # ``TriggerInstanceStore`` Protocol so we hand it directly to the
+    # scheduler. The task resolver is just ``task_store.get`` and lets
+    # the scheduled-fire wrapper re-read the latest definition on
+    # every fire instead of keeping stale captured state.
+    set_trigger_store(mongo)
+    set_task_resolver(task_store.get)
 
     # MongoDB is the single source of truth for task definitions.
     # At startup we read the persisted task set and register it with

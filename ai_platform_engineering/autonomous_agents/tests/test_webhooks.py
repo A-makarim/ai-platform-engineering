@@ -87,13 +87,23 @@ def client(monkeypatch) -> TestClient:
 
     captured: dict[str, Any] = {"calls": []}
 
-    async def _fake_fire(task: TaskDefinition, context: dict[str, Any]) -> TaskRun:
-        captured["calls"].append((task.id, context))
+    async def _fake_fire(
+        task: TaskDefinition,
+        context: dict[str, Any],
+        *,
+        trigger_id: str | None = None,
+    ) -> TaskRun:
+        # IMP-20: ``fire_webhook_task`` now forwards ``trigger_id`` so
+        # the run row cross-references the dedup record. Tests that
+        # don't inject a trigger store get ``trigger_id=None`` here
+        # which exercises the legacy "no dedup" path end-to-end.
+        captured["calls"].append((task.id, context, trigger_id))
         return TaskRun(
             run_id="r-1",
             task_id=task.id,
             task_name=task.name,
             status=TaskStatus.SUCCESS,
+            trigger_id=trigger_id,
         )
 
     monkeypatch.setattr(webhooks_route, "fire_webhook_task", _fake_fire)
@@ -137,8 +147,10 @@ def test_no_secret_anywhere_accepts_unsigned_request(client, monkeypatch):
     # we can assert the endpoint actually dispatched the task with the
     # parsed JSON body as context — otherwise a buggy router that
     # 200s without firing would silently pass these tests.
+    # IMP-20: ``fire_webhook_task`` now also receives a trigger_id; in
+    # this test no dedup store is injected so it stays None.
     assert client.captured["calls"] == [
-        ("wh-1", {"source": None, "event": None, "data": {"hello": "world"}})
+        ("wh-1", {"source": None, "event": None, "data": {"hello": "world"}}, None)
     ]
 
 

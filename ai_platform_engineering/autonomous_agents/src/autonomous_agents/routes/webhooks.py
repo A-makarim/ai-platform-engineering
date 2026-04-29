@@ -6,17 +6,42 @@ import json
 import logging
 import math
 import time
+import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Header, HTTPException, Request
 
 from autonomous_agents.config import get_settings
-from autonomous_agents.models import TaskDefinition, TriggerType, WebhookPayload, WebhookTrigger
-from autonomous_agents.scheduler import fire_webhook_task
+from autonomous_agents.models import (
+    TaskDefinition,
+    TriggerInstance,
+    TriggerSource,
+    TriggerType,
+    WebhookPayload,
+    WebhookTrigger,
+)
+from autonomous_agents.scheduler import (
+    TriggerInstanceStore,
+    fire_webhook_task,
+    get_trigger_store,
+)
+from autonomous_agents.services.trigger_dedup import derive_webhook_dedupe_key
 
 logger = logging.getLogger("autonomous_agents")
 router = APIRouter(tags=["webhooks"])
 
 _webhook_tasks: dict[str, TaskDefinition] = {}
+
+
+def _resolve_trigger_store() -> TriggerInstanceStore | None:
+    """Return the active dedup store, if injected.
+
+    Indirected through a helper (rather than reading the module global
+    directly) so tests can monkeypatch this single seam to inject a
+    fake without having to reach into the scheduler module's
+    internals.
+    """
+    return get_trigger_store()
 
 
 def register_webhook_task(task: TaskDefinition) -> None:
@@ -189,6 +214,65 @@ async def receive_webhook(
         pass
 
     payload = WebhookPayload(data=context if isinstance(context, dict) else {})
-    run = await fire_webhook_task(task, context=payload.model_dump())
 
-    return {"status": "accepted", "run_id": run.run_id, "task_id": task_id}
+    # IMP-20: dedup against duplicate webhook deliveries (GitHub /
+    # PagerDuty etc. retry within a short window when the receiver
+    # appears slow). The Mongo unique index on ``dedupe_key`` makes
+    # this safe across replicas. When the dedup store isn't injected
+    # (early test setup, kill-switch off via store.try_acquire_trigger)
+    # we fall through to the legacy "always fire" path.
+    dedupe_key, delivery_id = derive_webhook_dedupe_key(
+        task_id, request.headers, body
+    )
+    trigger_id: str | None = None
+    trigger_store = _resolve_trigger_store()
+    if trigger_store is not None:
+        instance = TriggerInstance(
+            trigger_id=str(uuid.uuid4()),
+            task_id=task_id,
+            dedupe_key=dedupe_key,
+            source=TriggerSource.WEBHOOK,
+            delivery_id=delivery_id,
+            received_at=datetime.now(timezone.utc),
+        )
+        try:
+            stored, acquired = await trigger_store.try_acquire_trigger(instance)
+        except Exception as exc:  # noqa: BLE001
+            # Mongo failure on the dedup write must never reject a
+            # valid signed webhook -- we'd rather double-fire (visible
+            # in run history) than drop a legitimate event. Log and
+            # proceed with no dedup protection for this delivery.
+            logger.warning(
+                "Webhook try_acquire_trigger failed for task '%s' "
+                "(delivery_id=%s): %s -- proceeding without dedup",
+                task_id, delivery_id, exc,
+            )
+            stored, acquired = instance, True
+        if not acquired:
+            # Critically the response is HTTP 200 (not 4xx) so the
+            # upstream sender stops retrying. The body carries the
+            # original run id so the operator can deep-link from the
+            # delivery log to the actual run.
+            logger.info(
+                "Webhook duplicate for task '%s' (delivery_id=%s) -> "
+                "trigger %s, original_run=%s",
+                task_id, delivery_id, stored.trigger_id, stored.run_id,
+            )
+            return {
+                "status": "duplicate",
+                "trigger_id": stored.trigger_id,
+                "run_id": stored.run_id,
+                "task_id": task_id,
+            }
+        trigger_id = stored.trigger_id
+
+    run = await fire_webhook_task(
+        task, context=payload.model_dump(), trigger_id=trigger_id
+    )
+
+    return {
+        "status": "accepted",
+        "run_id": run.run_id,
+        "trigger_id": trigger_id,
+        "task_id": task_id,
+    }

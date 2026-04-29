@@ -12,10 +12,18 @@ hot-reload helpers so changes take effect without a service restart.
 
 import asyncio
 import logging
+import uuid
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Header, HTTPException, status
 
-from autonomous_agents.models import TaskDefinition, TaskRun, WebhookTrigger
+from autonomous_agents.models import (
+    TaskDefinition,
+    TaskRun,
+    TriggerInstance,
+    TriggerSource,
+    WebhookTrigger,
+)
 from autonomous_agents.routes.webhooks import (
     register_webhook_task,
     unregister_webhook_task,
@@ -25,6 +33,7 @@ from autonomous_agents.scheduler import (
     get_chat_history_publisher,
     get_run_store,
     get_scheduler,
+    get_trigger_store,
     register_task,
     unregister_task,
 )
@@ -35,6 +44,7 @@ from autonomous_agents.services.mongo import (
     TaskStore,
 )
 from autonomous_agents.services.preflight import Acknowledgement, preflight
+from autonomous_agents.services.trigger_dedup import derive_manual_dedupe_key
 
 logger = logging.getLogger("autonomous_agents")
 
@@ -477,16 +487,67 @@ async def get_task_runs(task_id: str) -> list[TaskRun]:
 
 
 @router.post("/tasks/{task_id}/run", response_model=dict)
-async def trigger_task_manually(task_id: str) -> dict:
-    """Manually trigger a task to run immediately (for testing)."""
+async def trigger_task_manually(
+    task_id: str,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict:
+    """Manually trigger a task to run immediately (for testing).
+
+    IMP-20 dedup: when the caller supplies an ``Idempotency-Key``
+    header, two POSTs with the same key collapse to a single fire and
+    the second returns ``status: duplicate`` carrying the original
+    run id (HTTP idempotency-key convention). Without the header
+    every POST mints a fresh dedupe key so the existing
+    fire-and-forget UX is preserved -- double-clicking the "Run now"
+    button without a key still produces two runs, by design.
+    """
     task = await get_task_store().get(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
 
+    dedupe_key, used_key = derive_manual_dedupe_key(task_id, idempotency_key)
+    trigger_id: str | None = None
+    trigger_store = get_trigger_store()
+    if trigger_store is not None:
+        instance = TriggerInstance(
+            trigger_id=str(uuid.uuid4()),
+            task_id=task_id,
+            dedupe_key=dedupe_key,
+            source=TriggerSource.MANUAL,
+            delivery_id=used_key,
+            received_at=datetime.now(timezone.utc),
+        )
+        try:
+            stored, acquired = await trigger_store.try_acquire_trigger(instance)
+        except Exception as exc:  # noqa: BLE001
+            # Mongo failure on the dedup write must not block a manual
+            # trigger -- the operator is sitting in the UI waiting for
+            # feedback. Log and proceed; same contract as the webhook
+            # and scheduler paths.
+            logger.warning(
+                "[%s] Manual trigger try_acquire_trigger failed: %s -- "
+                "proceeding without dedup",
+                task_id, exc,
+            )
+            stored, acquired = instance, True
+        if not acquired:
+            logger.info(
+                "[%s] Manual trigger duplicate (idempotency_key=%s) -> "
+                "trigger %s, original_run=%s",
+                task_id, used_key, stored.trigger_id, stored.run_id,
+            )
+            return {
+                "status": "duplicate",
+                "trigger_id": stored.trigger_id,
+                "run_id": stored.run_id,
+                "task_id": task_id,
+            }
+        trigger_id = stored.trigger_id
+
     # Fire-and-forget -- the run is recorded in the store as it
     # progresses so the UI can poll /tasks/{id}/runs to see the result.
-    asyncio.create_task(execute_task(task))
-    return {"status": "triggered", "task_id": task_id}
+    asyncio.create_task(execute_task(task, trigger_id=trigger_id))
+    return {"status": "triggered", "trigger_id": trigger_id, "task_id": task_id}
 
 
 @router.get("/runs", response_model=list[TaskRun])

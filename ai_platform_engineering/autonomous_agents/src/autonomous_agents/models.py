@@ -24,6 +24,22 @@ class TaskStatus(str, Enum):
     SKIPPED = "skipped"
 
 
+class TriggerSource(str, Enum):
+    """Where a single fire of a task originated from.
+
+    Webhook = inbound POST /hooks/{task_id}; cron / interval = APScheduler
+    fired the task at its scheduled tick; manual = operator clicked "Run
+    now" or POST'd /tasks/{id}/run. The value is stamped on every
+    :class:`TriggerInstance` so the audit trail can answer "who fired
+    this run?" without having to cross-reference logs.
+    """
+
+    WEBHOOK = "webhook"
+    CRON = "cron"
+    INTERVAL = "interval"
+    MANUAL = "manual"
+
+
 # =============================================================================
 # Trigger definitions -
 # =============================================================================
@@ -168,6 +184,65 @@ class TaskRun(BaseModel):
     # logs) that don't want to walk the events list.
     response_full: str | None = None
     events: list[dict[str, Any]] = Field(default_factory=list)
+    # IMP-20: cross-reference back to the ``TriggerInstance`` that
+    # produced this run. Optional / nullable so runs from before the
+    # dedup feature shipped (or runs created with
+    # ``TRIGGER_DEDUP_ENABLED=false``) keep validating. Populated by
+    # ``execute_task`` when the caller threads the trigger id through.
+    trigger_id: str | None = None
+
+
+# =============================================================================
+# Trigger instance — IMP-20 dedup record (one per fire attempt)
+# =============================================================================
+
+
+class TriggerInstance(BaseModel):
+    """Persisted record of a single attempt to fire a task.
+
+    The ``dedupe_key`` field is the source of truth for "have we already
+    seen this exact trigger?" — a unique Mongo index on it makes
+    concurrent inserts deterministic across replicas. An attempt that
+    races and loses the unique-index race is reported back to the caller
+    via the ``acquired=False`` return from ``MongoService.try_acquire_trigger``;
+    the *original* row is what the caller then forwards to the user as
+    "duplicate of run X".
+
+    ``run_id`` is filled in by ``scheduler.execute_task`` after the run
+    starts (best-effort — a failure to attach must never abort the run,
+    same contract as the run-history publisher) so the audit trail can
+    walk trigger -> run -> conversation in one hop.
+    """
+
+    trigger_id: str = Field(..., description="UUIDv4; mapped to Mongo _id.")
+    task_id: str
+    dedupe_key: str = Field(
+        ...,
+        description=(
+            "Per-source dedup key. Mongo unique index target. Format depends "
+            "on source: webhook = 'webhook:{task}:{delivery_id_or_body_hash}', "
+            "cron/interval = '{source}:{task}:{fire_iso}', "
+            "manual = 'manual:{task}:{idempotency_key_or_uuid}'."
+        ),
+    )
+    source: TriggerSource
+    delivery_id: str | None = Field(
+        default=None,
+        description=(
+            "Raw delivery-id header value for webhook sources, or the caller-"
+            "supplied Idempotency-Key for manual sources. None for cron / "
+            "interval / unsigned webhooks. Stored verbatim for audit only."
+        ),
+    )
+    scheduled_for: datetime | None = Field(
+        default=None,
+        description="Cron / interval rounded fire time; None for webhook / manual.",
+    )
+    received_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    run_id: str | None = Field(
+        default=None,
+        description="Set after execute_task starts; None on the duplicate path.",
+    )
 
 
 # =============================================================================

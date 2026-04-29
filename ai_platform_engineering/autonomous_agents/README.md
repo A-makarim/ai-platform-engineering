@@ -288,6 +288,103 @@ no-op implementation, so the rest of the service is unaffected:
 
 ---
 
+## Duplicate-trigger protection
+
+Every fire path -- webhook, cron, interval, and manual `POST
+/tasks/{id}/run` -- writes a `TriggerInstance` row to the
+`autonomous_trigger_instances` MongoDB collection **before** calling
+into the supervisor. A unique index on `dedupe_key` makes concurrent
+inserts deterministic across replicas: the second concurrent caller
+loses the race, learns the original `run_id` from the winning row,
+and short-circuits with a `status: "duplicate"` response.
+
+This solves four real-world problems in one mechanism:
+
+| Source              | Problem                                                                                      | Dedup key format                                  |
+|---------------------|----------------------------------------------------------------------------------------------|---------------------------------------------------|
+| **Webhook**         | GitHub / PagerDuty / etc. retry the same delivery within ~10 s when the receiver looks slow. | `webhook:{task_id}:{delivery_id_or_body_hash}`    |
+| **Cron**            | APScheduler can submit a second copy of a slow job; multi-replica deployments double-fire.   | `cron:{task_id}:{rounded_fire_iso}`               |
+| **Interval**        | Same as cron.                                                                                | `interval:{task_id}:{rounded_fire_iso}`           |
+| **Manual `/run`**   | Operator double-clicks the "Run now" button.                                                 | `manual:{task_id}:{Idempotency-Key}` (else fresh UUID) |
+
+### Webhook delivery id
+
+`derive_webhook_dedupe_key` searches `WEBHOOK_DELIVERY_ID_HEADERS` (in
+order, case-insensitive) for an upstream-supplied id. Defaults cover
+GitHub (`X-GitHub-Delivery`), the generic `X-Hook-Delivery-Id` shape,
+and `X-Webhook-Delivery`. When none of these are present the helper
+falls back to `sha256(body)[:16]` so even unsigned webhooks dedupe
+within the TTL window. Two genuinely-distinct events with bit-identical
+bodies inside the window will dedupe to one fire -- configure your
+upstream to include a delivery header if that matters for your use
+case.
+
+### Manual idempotency
+
+Send `Idempotency-Key: <client-chosen-string>` on `POST
+/tasks/{id}/run` to make a click-twice safe. Without the header, the
+helper mints a fresh UUID per request so the legacy fire-and-forget
+behaviour is preserved -- two unkeyed clicks produce two runs.
+
+### Duplicate response shape
+
+The duplicate response is **HTTP 200** (not 4xx) so the upstream
+sender stops retrying. Body:
+
+```json
+{
+  "status": "duplicate",
+  "trigger_id": "<uuid>",
+  "run_id": "<original run id, may be null if the winner hasn't recorded yet>",
+  "task_id": "..."
+}
+```
+
+The successful (first-fire) response now also carries the
+`trigger_id` so callers can deep-link from the upstream delivery log
+to the audit row in `autonomous_trigger_instances`.
+
+### Defence in depth
+
+Beyond the unique index, `register_task` now sets
+`max_instances=1, coalesce=True` on every APScheduler job. APScheduler
+itself refuses to submit a second concurrent run of the same job, so
+the Mongo unique-index race only kicks in for the multi-replica case.
+
+### Indexes
+
+The `autonomous_trigger_instances` collection has three indexes
+(created automatically on startup):
+
+- **Unique** on `dedupe_key` -- the dedup defence.
+- **TTL** on `received_at` (`expireAfterSeconds = TRIGGER_DEDUP_TTL_SECONDS`,
+  default 7 days) -- bounds collection size and gives a finite "two
+  identical bodies dedupe within this window" semantic.
+- Compound `(task_id ASC, received_at DESC)` -- supports a future
+  per-task audit endpoint.
+
+### Configuration
+
+| Env var                                | Default                                                          | Purpose                                                                                                          |
+|----------------------------------------|------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------|
+| `TRIGGER_DEDUP_ENABLED`                | `true`                                                           | Kill switch. When `false`, the helper short-circuits to "always acquire" without touching Mongo.                 |
+| `TRIGGER_DEDUP_TTL_SECONDS`            | `604800` (7 days)                                                | TTL on the dedup collection. Lower = shorter dedup window; higher = more storage.                                |
+| `WEBHOOK_DELIVERY_ID_HEADERS`          | `X-GitHub-Delivery,X-Hook-Delivery-Id,X-Webhook-Delivery`        | Comma-separated allow-list. First present header wins. Falls back to body hash when none present.                |
+| `MONGODB_TRIGGER_INSTANCES_COLLECTION` | `autonomous_trigger_instances`                                   | Override the collection name (rare).                                                                             |
+
+### What this does *not* solve
+
+This feature is dedup-only. Two **distinct** triggers for the same
+task overlapping in time (e.g. webhook fires while a previous cron
+run is still streaming) are **not** serialised -- both runs proceed
+concurrently. That's a per-task concurrency-lock problem; it can
+layer cleanly on top of the dedup record (rejecting `try_acquire`
+when an in-flight `run_id` exists for the task) but is intentionally
+out of scope for IMP-20 to keep behaviour for distinct triggers
+unchanged.
+
+---
+
 ## Supervisor call reliability
 
 Each task run makes a single A2A call to the supervisor. That call is

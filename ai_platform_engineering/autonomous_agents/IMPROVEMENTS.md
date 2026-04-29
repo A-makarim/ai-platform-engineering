@@ -280,6 +280,97 @@ don't persist).
 
 ---
 
+### IMP-20 — Duplicate-trigger protection (Mongo-backed `TriggerInstance`)
+- **Status**: DONE (this branch)
+- **Why**: Every fire path could double-execute a task on a single
+  trigger event:
+  1. **Webhooks**: GitHub / PagerDuty / generic CI senders retry the
+     same delivery within ~10 s when the receiver looks slow. Our
+     handler ack'd the second delivery as a fresh fire and burned LLM
+     budget twice.
+  2. **APScheduler**: a slow job that overruns its tick gets a second
+     copy submitted; once IMP-15 ships and we have >1 replica, every
+     cron tick will fire `N` times.
+  3. **Manual `POST /tasks/{id}/run`**: an operator double-clicking
+     "Run now" produces two runs; the UI has no way to indicate
+     "this is the same click, please collapse it".
+- **What shipped**:
+  1. New `TriggerInstance` model + `TriggerSource` enum
+     (`models.py`); new `trigger_id: str | None` cross-reference on
+     `TaskRun`.
+  2. New Mongo collection `autonomous_trigger_instances` with a
+     **unique** index on `dedupe_key` (the dedup defence) and a
+     **TTL** index on `received_at` (bounds collection size, gives a
+     finite "two identical bodies dedupe within this window"
+     semantic). Plus a compound `(task_id, received_at desc)` for a
+     future audit endpoint.
+  3. New `services/trigger_dedup.py` helper module centralising the
+     per-source dedupe-key derivation: webhook (configurable
+     delivery-id header allow-list, body-hash fallback), cron /
+     interval (rounded fire time, source-prefixed namespace),
+     manual (`Idempotency-Key` header or fresh UUID).
+  4. `MongoService.try_acquire_trigger` -- inserts the row; on
+     `DuplicateKeyError` loads the original by `dedupe_key` and
+     returns `(original, False)` so the caller can forward the
+     original `run_id` upstream. Plus `attach_run_to_trigger` to
+     stamp the run-id back-reference once the run starts (best
+     effort, mirrors `_record_safely`).
+  5. **Webhook route** (`routes/webhooks.py`): dedup before
+     `fire_webhook_task`. Duplicate response is **HTTP 200** (not
+     4xx) so GitHub / PagerDuty stop retrying; body carries
+     `status: "duplicate"`, the original `trigger_id`, and the
+     original `run_id`.
+  6. **Scheduler** (`scheduler.py`): new `_execute_scheduled`
+     wrapper registered with APScheduler instead of `execute_task`
+     directly. Re-reads the live task on every fire (so disabled /
+     deleted tasks short-circuit), acquires a trigger, then
+     dispatches. Also sets `max_instances=1, coalesce=True` on
+     every job as defence in depth.
+  7. **Manual route** (`routes/tasks.py`): accepts an
+     `Idempotency-Key` header (HTTP convention). Without the header
+     every POST mints a fresh dedup key so the legacy
+     fire-and-forget UX is preserved.
+  8. **Settings** (`config.py`): `TRIGGER_DEDUP_ENABLED` kill
+     switch, `TRIGGER_DEDUP_TTL_SECONDS`,
+     `WEBHOOK_DELIVERY_ID_HEADERS` (comma-split parser like
+     `CORS_ORIGINS`), `MONGODB_TRIGGER_INSTANCES_COLLECTION`.
+  9. Tests: `tests/test_trigger_dedup.py` (helper-level + Mongo
+     race semantics + webhook route end-to-end + scheduler wrapper +
+     `TaskRun` cross-reference). Existing `test_webhooks.py` updated
+     so `_fake_fire` accepts the new `trigger_id` kwarg.
+  10. Docs: new "Duplicate-trigger protection" section in `README.md`
+      covering dedup key per source, TTL, kill switch, configurable
+      webhook header list, and the duplicate-response contract.
+- **Out of scope (deliberately)**:
+  - **Per-task concurrency lock** -- IMP-20 is dedup-only. Two
+    *distinct* triggers (e.g. webhook fires while a previous cron
+    run is still streaming) still proceed concurrently. Layering a
+    concurrency policy on top is straightforward (reject
+    `try_acquire` when an in-flight `run_id` exists for the
+    `task_id`, gated by a new `TaskDefinition.concurrency_policy`)
+    but explicitly tracked separately.
+  - **IMP-15** still owed: this PR makes multi-replica cron
+    *correct* (the unique index suppresses duplicates) even before
+    leader election ships, but each replica still wastes the LLM /
+    A2A round-trip up to the dedup gate.
+- **Touches**:
+    `src/autonomous_agents/models.py`,
+    `src/autonomous_agents/config.py`,
+    `src/autonomous_agents/main.py`,
+    `src/autonomous_agents/scheduler.py`,
+    `src/autonomous_agents/routes/webhooks.py`,
+    `src/autonomous_agents/routes/tasks.py`,
+    `src/autonomous_agents/services/mongo.py`,
+    `src/autonomous_agents/services/trigger_dedup.py` (new),
+    `tests/test_trigger_dedup.py` (new),
+    `tests/test_webhooks.py`,
+    `README.md`,
+    `IMPROVEMENTS.md`.
+- **Depends on**: existing Mongo dependency (already required by
+  `main.lifespan`).
+
+---
+
 ### IMP-19 — Admin-gate the autonomous-agents UI proxy
 - **Status**: DONE (PR — branch `prebuild/feat/autonomous-agents-admin-gating`)
 - **Why**: After IMP-12 the proxy at `/api/autonomous/[...path]` only

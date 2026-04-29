@@ -56,6 +56,7 @@ from autonomous_agents.models import (
     TaskDefinition,
     TaskRun,
     TaskStatus,
+    TriggerInstance,
 )
 from autonomous_agents.services.chat_history import (
     MessageKind,
@@ -311,6 +312,14 @@ class MongoService:
     def _messages(self) -> Any:
         return self._require_chat()[self.settings.chat_history_messages_collection]
 
+    def _trigger_instances(self) -> Any:
+        # IMP-20: per-fire dedup record. Lives on the primary db
+        # alongside tasks/runs so a single Mongo outage takes them all
+        # down together (no surprise partial-availability mode).
+        return self._require_primary()[
+            self.settings.mongodb_trigger_instances_collection
+        ]
+
     # ------------------------------------------------------------------
     # Indexes
     # ------------------------------------------------------------------
@@ -353,6 +362,36 @@ class MongoService:
             #      conversations may legitimately share message_id).
             await self._messages().create_index(
                 [("conversation_id", 1), ("message_id", 1)]
+            )
+            # ---- Trigger instances (IMP-20): unique on dedupe_key is
+            #      THE defence against duplicate fires -- a concurrent
+            #      insert that loses the race surfaces as
+            #      DuplicateKeyError to ``try_acquire_trigger`` which
+            #      then returns ``acquired=False`` to the caller. Must
+            #      be unique; without it the dedup is best-effort and
+            #      a single race can produce duplicate runs.
+            await self._trigger_instances().create_index(
+                [("dedupe_key", 1)],
+                unique=True,
+                name="trigger_instances_dedupe_key_unique",
+            )
+            # ---- Trigger instances: TTL on received_at bounds the
+            #      collection size and gives a finite "two identical
+            #      bodies within the window dedupe to one run"
+            #      semantic for senders that don't include a delivery
+            #      header. ``expireAfterSeconds`` is read from
+            #      Settings so operators can tune (or disable, by
+            #      setting a very large value) without code changes.
+            await self._trigger_instances().create_index(
+                [("received_at", 1)],
+                expireAfterSeconds=self.settings.trigger_dedup_ttl_seconds,
+                name="trigger_instances_ttl",
+            )
+            # ---- Trigger instances: serves a future "audit by task"
+            #      endpoint. Cheap to add now while we're priming.
+            await self._trigger_instances().create_index(
+                [("task_id", 1), ("received_at", -1)],
+                name="trigger_instances_by_task_recent",
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -448,6 +487,94 @@ class MongoService:
             .limit(limit)
         )
         return [self._doc_to_run(doc) async for doc in cursor]
+
+    # ==================================================================
+    # Trigger instances (IMP-20 — duplicate-trigger detection)
+    # ==================================================================
+
+    async def try_acquire_trigger(
+        self, instance: TriggerInstance
+    ) -> tuple[TriggerInstance, bool]:
+        """Insert a :class:`TriggerInstance` or return the original on conflict.
+
+        Returns ``(instance, True)`` if this caller is the one who
+        successfully wrote the row -- the caller then proceeds to
+        execute the task. Returns ``(original, False)`` if a row with
+        the same ``dedupe_key`` already exists -- the caller short-
+        circuits and reports "duplicate" back to the upstream sender.
+
+        The unique index on ``dedupe_key`` (created in
+        ``_ensure_indexes``) is what makes this safe across replicas:
+        two concurrent inserts produce exactly one winner; the loser
+        sees ``DuplicateKeyError`` and we resolve the original row by
+        ``dedupe_key`` lookup. Same class-name match for
+        ``DuplicateKeyError`` as :meth:`create_task` so we don't have
+        to wire pymongo into the import graph.
+
+        Kill switch: when ``settings.trigger_dedup_enabled`` is False
+        we return ``(instance, True)`` immediately without touching
+        Mongo so a regression can be rolled back via env var without
+        a deploy.
+        """
+        if not self.settings.trigger_dedup_enabled:
+            return instance, True
+
+        doc = instance.model_dump(mode="python")
+        doc["_id"] = instance.trigger_id
+        try:
+            await self._trigger_instances().insert_one(doc)
+            return instance, True
+        except Exception as exc:  # noqa: BLE001 -- translated below
+            if exc.__class__.__name__ != "DuplicateKeyError":
+                raise
+            # Race lost: fetch the winner's row by dedupe_key and
+            # report it back to the caller. We use ``dedupe_key`` (not
+            # ``_id``) for the lookup because the in-flight call has a
+            # fresh ``trigger_id`` that doesn't match the stored row.
+            existing_doc = await self._trigger_instances().find_one(
+                {"dedupe_key": instance.dedupe_key}
+            )
+            if existing_doc is None:
+                # Extremely unlikely: TTL reaped the original row in
+                # the microsecond between our failed insert and the
+                # follow-up read. Treat the caller as the new winner;
+                # they'll get a fresh row on the next attempt.
+                logger.warning(
+                    "try_acquire_trigger: DuplicateKeyError for dedupe_key=%s "
+                    "but original row missing -- treating caller as winner",
+                    instance.dedupe_key,
+                )
+                return instance, True
+            return self._doc_to_trigger_instance(existing_doc), False
+
+    async def attach_run_to_trigger(self, trigger_id: str, run_id: str) -> None:
+        """Stamp the run id on the trigger row. Best-effort.
+
+        Called after :func:`scheduler.execute_task` has recorded the
+        first RUNNING state so the audit chain ``trigger -> run ->
+        conversation`` is walkable in one Mongo query. Failure is
+        logged + swallowed -- losing the back-reference must never
+        abort the run, mirroring ``_record_safely`` in the scheduler.
+        """
+        try:
+            await self._trigger_instances().update_one(
+                {"_id": trigger_id},
+                {"$set": {"run_id": run_id}},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "attach_run_to_trigger swallowed for trigger=%s run=%s: %s",
+                trigger_id,
+                run_id,
+                exc,
+            )
+
+    async def get_trigger_instance(
+        self, trigger_id: str
+    ) -> TriggerInstance | None:
+        """Look up a trigger row by its id (audit / test helper)."""
+        doc = await self._trigger_instances().find_one({"_id": trigger_id})
+        return self._doc_to_trigger_instance(doc) if doc else None
 
     # ==================================================================
     # Chat history (per-task conversations)
@@ -752,6 +879,11 @@ class MongoService:
     def _doc_to_run(doc: dict[str, Any]) -> TaskRun:
         doc.pop("_id", None)
         return TaskRun.model_validate(doc)
+
+    @staticmethod
+    def _doc_to_trigger_instance(doc: dict[str, Any]) -> TriggerInstance:
+        doc.pop("_id", None)
+        return TriggerInstance.model_validate(doc)
 
 
 # ======================================================================

@@ -139,6 +139,12 @@ class Settings(BaseSettings):
     # truth for CRUD operations).
     mongodb_tasks_collection: str = "autonomous_tasks"
 
+    # IMP-20 — Mongo collection that stores per-fire ``TriggerInstance``
+    # rows used for duplicate-trigger detection. Indexed (unique) on
+    # ``dedupe_key`` and TTL-cleaned on ``received_at`` so the
+    # collection size stays bounded by the dedup window.
+    mongodb_trigger_instances_collection: str = "autonomous_trigger_instances"
+
     # Connect-retry knobs used by main.py's lifespan. First connect
     # attempt happens immediately; subsequent attempts wait ``delay``
     # seconds between tries. ``ge=1`` keeps "never try" from being
@@ -212,6 +218,58 @@ class Settings(BaseSettings):
     # this code to keep publishing working.
     chat_history_conversations_collection: str = "conversations"
     chat_history_messages_collection: str = "messages"
+
+    # IMP-20 — duplicate-trigger detection.
+    #
+    # When enabled (the default), every fire path -- webhook, cron,
+    # interval, manual -- writes a ``TriggerInstance`` row to MongoDB
+    # before invoking ``execute_task``. A unique index on the
+    # per-source ``dedupe_key`` makes the second concurrent insert lose
+    # the race; the caller short-circuits to a "duplicate" response
+    # carrying the original ``run_id`` so upstream senders (GitHub,
+    # PagerDuty, etc.) stop retrying.
+    #
+    # ``trigger_dedup_enabled=False`` is a kill-switch -- the helper
+    # always returns ``acquired=True`` without touching Mongo so a
+    # regression can be rolled back via env var without redeploying.
+    trigger_dedup_enabled: bool = True
+
+    # How long a ``TriggerInstance`` row lives in Mongo before the TTL
+    # index reclaims it. Bounds the collection size and -- importantly
+    # -- gives a finite "two identical bodies arrive within this
+    # window dedupe to one run" semantic, which is the right trade-off
+    # for senders that don't include a delivery-id header. Default
+    # 7 days; raise or lower based on the real upstream retry budget.
+    trigger_dedup_ttl_seconds: int = Field(default=7 * 24 * 3600, ge=60)
+
+    # Header allow-list searched (in order) for a webhook delivery id
+    # that becomes the dedupe key. The defaults cover GitHub,
+    # PagerDuty-style ``X-Hook-Delivery-Id``, and a generic fallback
+    # used by some custom senders. When none of these are present the
+    # helper falls back to ``sha256(body)[:16]`` so even unsigned
+    # webhooks dedupe within the TTL window.
+    #
+    # Accepts either a JSON list or a comma-separated string from
+    # ``.env`` (operators routinely paste the latter -- mirror the
+    # ``cors_origins`` parser).
+    webhook_delivery_id_headers: list[str] = Field(
+        default_factory=lambda: [
+            "X-GitHub-Delivery",
+            "X-Hook-Delivery-Id",
+            "X-Webhook-Delivery",
+        ]
+    )
+
+    @field_validator("webhook_delivery_id_headers", mode="before")
+    @classmethod
+    def _parse_delivery_id_headers(cls, v):
+        # Same UX as ``cors_origins``: accept comma-separated env var
+        # syntax in addition to JSON lists. Trimming + dropping empty
+        # tokens prevents stray commas in ``.env`` from creating
+        # always-missing header lookups.
+        if isinstance(v, str):
+            v = [name.strip() for name in v.split(",") if name.strip()]
+        return v
 
     # Webhook-context redaction switch (default OFF).
     # The autonomous agent's published prompt could otherwise contain
