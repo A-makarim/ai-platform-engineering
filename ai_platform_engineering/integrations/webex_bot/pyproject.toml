@@ -1,0 +1,32 @@
+[project]
+name = "caipe-webex-bot"
+version = "0.1.0"
+description = "CAIPE Webex inbound bridge - routes in-thread replies back to autonomous tasks as follow-ups"
+license = "Apache-2.0"
+authors = [
+  { name = "CNOE Contributors" }
+]
+requires-python = ">=3.13,<4.0"
+dependencies = [
+  "fastapi==0.118.3",
+  "uvicorn[standard]==0.39.0",
+  "httpx==0.28.1",
+  "pydantic==2.12.5",
+  "pydantic-settings==2.10.1",
+  "motor==3.6.0",
+  "loguru==0.7.3",
+]
+
+[dependency-groups]
+unittest = [
+  "pytest==9.0.3",
+  "pytest-asyncio==1.4.0",
+  "pytest-mock==3.15.1",
+  "respx==0.22.0",
+]
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple/"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
