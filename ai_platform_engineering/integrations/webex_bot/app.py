@@ -341,12 +341,19 @@ app = create_app()
 
 
 def main() -> None:
-    """Entry point for ``python -m ai_platform_engineering.integrations.webex_bot``."""
+    """Entry point for ``python -m webex_bot``.
+
+    The package is exposed as the flat ``webex_bot`` name in the
+    Docker image (``build/Dockerfile.webex-bot`` puts the source
+    under ``/app/webex_bot/`` and ``PYTHONPATH=/app``). Tests on a
+    monorepo checkout use the same flat name via ``conftest.py``,
+    so the import string here is environment-agnostic.
+    """
     import uvicorn
 
     settings = get_settings()
     uvicorn.run(
-        "ai_platform_engineering.integrations.webex_bot.app:app",
+        "webex_bot.app:app",
         host=settings.host,
         port=settings.port,
         log_level=settings.log_level.lower(),
