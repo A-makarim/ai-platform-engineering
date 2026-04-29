@@ -21,13 +21,26 @@ RUN groupadd -r -g 1001 appuser && useradd -r -g appuser -u 1001 -m appuser
 
 WORKDIR /app
 
-# pyproject + lock first for layer-cache friendliness; only changes
-# to dependencies invalidate the venv layer below.
+# pyproject (and lockfile if available) first, for layer-cache
+# friendliness: only changes to dependencies invalidate the venv
+# layer below.
+#
+# ``uv.lock`` is intentionally optional. When operators run ``uv lock``
+# locally we get reproducible builds; when they don't (typical Windows
+# dev path with no uv installed) we fall back to a fresh ``uv sync``
+# inside the container. We use a wildcard COPY because Docker silently
+# accepts a missing match for ``COPY foo* dest/`` but errors out on
+# ``COPY foo dest/`` when foo is absent. Keeps the Dockerfile usable
+# from a clean checkout without first having to bootstrap the lock.
 COPY ai_platform_engineering/integrations/webex_bot/pyproject.toml /app/
-COPY ai_platform_engineering/integrations/webex_bot/uv.lock /app/
+COPY ai_platform_engineering/integrations/webex_bot/uv.lock* /app/
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-dev || uv sync --no-dev
+    if [ -f /app/uv.lock ]; then \
+        uv sync --locked --no-dev; \
+    else \
+        uv sync --no-dev; \
+    fi
 
 # Copy the package itself under ``/app/webex_bot/`` so the container
 # can do ``python -m webex_bot`` without dragging in the whole monorepo.
