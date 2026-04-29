@@ -25,12 +25,12 @@ from autonomous_agents.models import (
     TriggerType,
 )
 from autonomous_agents.services.a2a_client import invoke_agent_streaming
-from autonomous_agents.services.dynamic_agents_client import invoke_dynamic_agent
 from autonomous_agents.services.chat_history import (
     ChatHistoryPublisher,
     NoopChatHistoryPublisher,
     _conversation_id_for_task,
 )
+from autonomous_agents.services.dynamic_agents_client import invoke_dynamic_agent
 from autonomous_agents.services.mongo import RunStore
 from autonomous_agents.services.webex_threads import (
     WebexThreadEntry,
@@ -295,6 +295,7 @@ async def execute_task(
                 task_id=effective_task.id,
                 agent_id=effective_task.dynamic_agent_id,
                 conversation_id=conversation_id,
+                context=context,
                 timeout=effective_task.timeout_seconds,
             )
         else:
