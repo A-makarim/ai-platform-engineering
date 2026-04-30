@@ -37,6 +37,7 @@ import { autonomousApi, AutonomousApiError } from "@/components/autonomous/api";
 import type { AutonomousTask } from "@/components/autonomous/types";
 import { SkillsSelector } from "./SkillsSelector";
 import { gradientThemes, getGradientStyle } from "@/lib/gradient-themes";
+import { getConfig } from "@/lib/config";
 
 interface DynamicAgentEditorProps {
   agent: DynamicAgentConfig | null; // null = creating new
@@ -126,7 +127,7 @@ function StepIndicator({
   currentStep, 
   onStepClick 
 }: { 
-  steps: typeof STEPS; 
+  steps: readonly (typeof STEPS[number])[];
   currentStep: StepId; 
   onStepClick: (stepId: StepId) => void;
 }) {
@@ -167,6 +168,7 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
   const isEditing = !!agent;
   const isCloning = !!cloneFrom;
   const { toast } = useToast();
+  const autonomousAgentsEnabled = getConfig('autonomousAgentsEnabled');
   
   // Source for initial values: editing agent > cloning source > empty defaults
   const source = agent || cloneFrom;
@@ -371,6 +373,7 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
   }, []);
 
   React.useEffect(() => {
+    if (!autonomousAgentsEnabled) return;
     if (!isEditing || !agent?._id) return;
     let cancelled = false;
     const agentId = agent._id;
@@ -402,22 +405,32 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
     return () => {
       cancelled = true;
     };
-  }, [isEditing, agent?._id]);
+  }, [isEditing, agent?._id, autonomousAgentsEnabled]);
 
   // Step wizard state
   const [activeStep, setActiveStep] = React.useState<StepId>("basic");
-  const currentStepIndex = STEPS.findIndex((s) => s.id === activeStep);
-  const currentStepConfig = STEPS.find((s) => s.id === activeStep);
+  const visibleSteps = React.useMemo(
+    () => STEPS.filter((step) => autonomousAgentsEnabled || step.id !== "autonomous"),
+    [autonomousAgentsEnabled],
+  );
+  const currentStepIndex = visibleSteps.findIndex((s) => s.id === activeStep);
+  const currentStepConfig = visibleSteps.find((s) => s.id === activeStep);
+
+  React.useEffect(() => {
+    if (!autonomousAgentsEnabled && activeStep === "autonomous") {
+      setActiveStep("basic");
+    }
+  }, [autonomousAgentsEnabled, activeStep]);
 
   const goToPreviousStep = () => {
     if (currentStepIndex > 0) {
-      setActiveStep(STEPS[currentStepIndex - 1].id);
+      setActiveStep(visibleSteps[currentStepIndex - 1].id);
     }
   };
 
   const goToNextStep = () => {
-    if (currentStepIndex < STEPS.length - 1) {
-      setActiveStep(STEPS[currentStepIndex + 1].id);
+    if (currentStepIndex < visibleSteps.length - 1) {
+      setActiveStep(visibleSteps[currentStepIndex + 1].id);
     }
   };
 
@@ -637,7 +650,7 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
         savedAgentId = data.data?._id || generatedId;
       }
 
-      if (autonomousTasks.length > 0 || autonomousTasksLoaded.length > 0) {
+      if (autonomousAgentsEnabled && (autonomousTasks.length > 0 || autonomousTasksLoaded.length > 0)) {
         try {
           const results = await syncAutonomousTasks({
             agentId: savedAgentId,
@@ -714,7 +727,7 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
               <p className="text-xs text-muted-foreground mt-0.5">{currentStepConfig?.hint}</p>
             </div>
             <StepIndicator 
-              steps={STEPS} 
+              steps={visibleSteps}
               currentStep={activeStep} 
               onStepClick={setActiveStep} 
             />
@@ -1279,7 +1292,7 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
             </div>
           )}
 
-          {activeStep === "autonomous" && (
+          {autonomousAgentsEnabled && activeStep === "autonomous" && (
             <AutonomousTasksStep
               agentId={isEditing ? agent?._id || "" : generatedId}
               tasks={autonomousTasks}
@@ -1315,7 +1328,7 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
               type="button" 
               variant="outline" 
               onClick={goToNextStep}
-              disabled={currentStepIndex === STEPS.length - 1 || loading}
+              disabled={currentStepIndex === visibleSteps.length - 1 || loading}
               size="sm"
             >
               Next

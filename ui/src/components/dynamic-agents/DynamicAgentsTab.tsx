@@ -24,8 +24,10 @@ import { autonomousApi } from "@/components/autonomous/api";
 import { getGradientStyle } from "@/lib/gradient-themes";
 import { toYaml } from "@/lib/yaml-serializer";
 import { isTaskOwnedByAgent } from "./taskOwnership";
+import { getConfig } from "@/lib/config";
 
 export function DynamicAgentsTab() {
+  const autonomousAgentsEnabled = getConfig('autonomousAgentsEnabled');
   const [agents, setAgents] = React.useState<DynamicAgentConfig[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
@@ -83,29 +85,31 @@ export function DynamicAgentsTab() {
       });
       const data = await response.json();
       if (data.success) {
-        try {
-          const tasks = await autonomousApi.listTasks();
-          const linkedTasks = tasks.filter((task) => isTaskOwnedByAgent(task, agent._id));
-          const tasksToUpdate = linkedTasks.filter((task) => task.enabled !== nextEnabled);
-          const results = await Promise.allSettled(
-            tasksToUpdate.map((task) =>
-              autonomousApi.updateTask(task.id, {
-                ...task,
-                enabled: nextEnabled,
-              }),
-            ),
-          );
-          const failures = results.filter((result) => result.status === "rejected");
-          if (failures.length > 0) {
+        if (autonomousAgentsEnabled) {
+          try {
+            const tasks = await autonomousApi.listTasks();
+            const linkedTasks = tasks.filter((task) => isTaskOwnedByAgent(task, agent._id));
+            const tasksToUpdate = linkedTasks.filter((task) => task.enabled !== nextEnabled);
+            const results = await Promise.allSettled(
+              tasksToUpdate.map((task) =>
+                autonomousApi.updateTask(task.id, {
+                  ...task,
+                  enabled: nextEnabled,
+                }),
+              ),
+            );
+            const failures = results.filter((result) => result.status === "rejected");
+            if (failures.length > 0) {
+              alert(
+                `Agent status updated, but ${failures.length} linked autonomous task${failures.length === 1 ? "" : "s"} failed to sync.`,
+              );
+            }
+          } catch (err: any) {
             alert(
-              `Agent status updated, but ${failures.length} linked autonomous task${failures.length === 1 ? "" : "s"} failed to sync.`,
+              err.message ||
+                "Agent status updated, but linked autonomous tasks failed to sync.",
             );
           }
-        } catch (err: any) {
-          alert(
-            err.message ||
-              "Agent status updated, but linked autonomous tasks failed to sync.",
-          );
         }
         fetchAgents();
       } else {

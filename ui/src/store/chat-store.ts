@@ -7,6 +7,7 @@ import { A2AClient } from "@/lib/a2a-client";
 import type { StreamAdapter } from "@/lib/streaming";
 import { apiClient } from "@/lib/api-client";
 import { getStorageMode, shouldUseLocalStorage } from "@/lib/storage-config";
+import { getConfig } from "@/lib/config";
 
 // Track streaming state per conversation
 interface StreamingState {
@@ -1057,6 +1058,12 @@ const storeImplementation = (set: any, get: any) => ({
        * ``loadConversationsFromServer``'s contract.
        */
       loadAutonomousConversationsFromService: async () => {
+        if (!getConfig('autonomousAgentsEnabled')) {
+          set((state) => ({
+            conversations: state.conversations.filter((c) => c.source !== 'autonomous'),
+          }));
+          return;
+        }
         // Lazy import keeps the autonomous-only deps out of the chat
         // store's main module load, and avoids a circular import
         // between chat-store -> autonomous-api at startup.
