@@ -298,7 +298,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
         });
       } else {
         // Create conversation in localStorage
-        const conversationId = createConversation(agentId);
+        const conversationId = await createConversation(agentId);
 
         // Use React transition for smooth navigation
         startTransition(() => {
@@ -309,7 +309,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapse, onUseCa
       console.error('[Sidebar] Failed to create conversation:', error);
 
       // Fallback to localStorage
-      const conversationId = createConversation(agentId);
+      const conversationId = await createConversation(agentId);
       startTransition(() => {
         router.push(`/chat/${conversationId}`);
       });
