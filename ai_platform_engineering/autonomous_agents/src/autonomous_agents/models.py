@@ -52,6 +52,26 @@ class IntervalTrigger(BaseModel):
 class WebhookTrigger(BaseModel):
     type: Literal[TriggerType.WEBHOOK] = TriggerType.WEBHOOK
     secret: str | None = Field(None, description="Optional HMAC secret for payload validation")
+    # Optional name of an HTTP header that uniquely identifies a delivery
+    # (e.g. ``X-GitHub-Delivery``, ``X-PagerDuty-Webhook-Id``). When set
+    # and present on the request, the dedup key for the
+    # ``trigger_instances`` collection is derived from
+    # ``f"{task_id}:hdr:{value}"``. When unset (or absent on a given
+    # request) the dedup key falls back to the verified HMAC signature
+    # we already compute for auth -- see
+    # ``services.trigger_instances.derive_dedup_key`` for the full
+    # precedence. Header names are matched case-insensitively per HTTP
+    # convention; we normalise to whatever case the sender used in the
+    # row's ``delivery_header_name`` field for audit clarity.
+    dedup_header: str | None = Field(
+        default=None,
+        description=(
+            "HTTP header name carrying a unique delivery id. When set and "
+            "present, used as the dedup key for the trigger_instances "
+            "collection so retries from the sender don't double-fire the "
+            "task. Falls back to the HMAC signature when absent."
+        ),
+    )
 
 
 Trigger = CronTrigger | IntervalTrigger | WebhookTrigger
@@ -231,6 +251,12 @@ class TaskRun(BaseModel):
     # ``run_id`` (UUID5-derived) so the field is safe to leave unset
     # for runs from before publishing was turned on.
     conversation_id: str | None = None
+    # When this run was kicked off by a webhook delivery, this is the
+    # ``_id`` of the row in ``trigger_instances`` that recorded the
+    # delivery. Lets audit tooling navigate from "what fired this run?"
+    # back to the originating webhook payload metadata. ``None`` for
+    # cron / interval / manual-trigger runs.
+    trigger_instance_id: str | None = None
     # Spec #099 Phase B — full supervisor response and captured A2A
     # streaming events. Populated when the run uses the streaming code
     # path (``invoke_agent_streaming``); ``None`` / empty for legacy

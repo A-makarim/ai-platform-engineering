@@ -87,6 +87,40 @@ class _FakeRunStore:
         return list(self._runs[:limit])
 
 
+class _FakeMongoService:
+    """Mirror of the fake in ``test_webhooks.py``.
+
+    Duplicated rather than shared so each test module stays
+    self-contained -- there's no test conftest yet and the surface is
+    tiny.
+    """
+
+    def __init__(self) -> None:
+        self._rows: dict[str, dict[str, Any]] = {}
+        self.is_connected = True
+
+    async def record_trigger_instance(
+        self, doc: dict[str, Any]
+    ) -> tuple[bool, dict[str, Any] | None]:
+        existing = self._rows.get(doc["_id"])
+        if existing is not None:
+            return False, existing
+        self._rows[doc["_id"]] = dict(doc)
+        return True, None
+
+    async def attach_run_to_trigger_instance(
+        self, dedup_key: str, run_id: str
+    ) -> None:
+        row = self._rows.get(dedup_key)
+        if row is not None:
+            row["run_id"] = run_id
+
+    async def get_trigger_instance(
+        self, dedup_key: str
+    ) -> dict[str, Any] | None:
+        return self._rows.get(dedup_key)
+
+
 @pytest.fixture
 def client(monkeypatch) -> TestClient:
     """Wire the webhooks router into a fresh FastAPI app + reset state."""
@@ -101,19 +135,32 @@ def client(monkeypatch) -> TestClient:
         task: TaskDefinition,
         context: dict[str, Any],
         follow_up: FollowUpContext | None = None,
+        *,
+        run_id: str | None = None,
+        trigger_instance_id: str | None = None,
     ) -> TaskRun:
+        actual_run_id = run_id or "r-followup"
         captured["calls"].append(
-            {"task_id": task.id, "context": context, "follow_up": follow_up}
+            {
+                "task_id": task.id,
+                "context": context,
+                "follow_up": follow_up,
+                "run_id": actual_run_id,
+                "trigger_instance_id": trigger_instance_id,
+            }
         )
         return TaskRun(
-            run_id="r-followup",
+            run_id=actual_run_id,
             task_id=task.id,
             task_name=task.name,
             status=TaskStatus.SUCCESS,
             parent_run_id=follow_up.parent_run_id if follow_up else None,
+            trigger_instance_id=trigger_instance_id,
         )
 
     monkeypatch.setattr(webhooks_route, "fire_webhook_task", _fake_fire)
+    fake_mongo = _FakeMongoService()
+    monkeypatch.setattr(webhooks_route, "get_mongo_service", lambda: fake_mongo)
 
     # Default RunStore: one historical run for "wh-1" so happy-path
     # tests can reference ``parent_run_id="r-original"`` without
@@ -139,6 +186,7 @@ def client(monkeypatch) -> TestClient:
     with TestClient(app) as test_client:
         test_client.captured = captured  # type: ignore[attr-defined]
         test_client.runs = runs  # type: ignore[attr-defined]
+        test_client.mongo = fake_mongo  # type: ignore[attr-defined]
         yield test_client
 
     webhooks_route._webhook_tasks.clear()
@@ -172,11 +220,15 @@ def test_followup_unsigned_forwards_context_and_parent_link(client, monkeypatch)
         },
     )
 
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 202, resp.text
     body = resp.json()
     assert body["task_id"] == "wh-1"
     assert body["parent_run_id"] == "r-original"
-    assert body["run_id"] == "r-followup"
+    assert body["status"] == "accepted"
+    # No secret + no dedup_header => no dedup possible. Run id is the
+    # route-allocated UUID; we just check it's a non-empty string and
+    # matches what was forwarded to the background fire.
+    assert body["run_id"]
 
     [call] = client.captured["calls"]
     follow_up = call["follow_up"]
@@ -188,6 +240,7 @@ def test_followup_unsigned_forwards_context_and_parent_link(client, monkeypatch)
     # Initial-fire context belongs to the original webhook -- follow-ups
     # carry their feedback in ``follow_up`` instead, so context stays empty.
     assert call["context"] == {}
+    assert call["run_id"] == body["run_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +268,7 @@ def test_followup_requires_signature_when_task_has_secret(client, monkeypatch):
         content=body,
         headers={"X-Hub-Signature-256": _hex_sig("task-secret", body)},
     )
-    assert ok.status_code == 200
+    assert ok.status_code == 202
     assert len(client.captured["calls"]) == 1
 
 

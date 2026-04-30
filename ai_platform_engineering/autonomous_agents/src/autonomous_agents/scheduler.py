@@ -134,6 +134,44 @@ async def _record_safely(store: RunStore, run: TaskRun) -> None:
         )
 
 
+async def _attach_run_to_trigger_safely(
+    trigger_instance_id: str | None, run_id: str
+) -> None:
+    """Best-effort back-link from a webhook delivery row to its run id.
+
+    The ``trigger_instances`` collection records every webhook delivery
+    we accepted (see ``services.trigger_instances``). When the scheduler
+    actually starts the run we want the dedup row to point at the
+    resulting ``run_id`` so audit tooling can navigate "delivery X ->
+    run Y" without join hopping.
+
+    Failures here are *never* allowed to abort the task: the dedup row
+    is observability, the task already ran. ``attach_run_to_trigger_instance``
+    on :class:`MongoService` already swallows exceptions; we add an
+    extra guard here in case the singleton itself isn't connected (unit
+    tests, in-memory test setups).
+    """
+    if not trigger_instance_id:
+        return
+    try:
+        # Deferred import keeps scheduler.py importable in unit tests
+        # that never wire up MongoDB at all -- the import alone would
+        # otherwise pull in motor.
+        from autonomous_agents.services.mongo import get_mongo_service
+
+        mongo = get_mongo_service()
+        if not mongo.is_connected:
+            return
+        await mongo.attach_run_to_trigger_instance(trigger_instance_id, run_id)
+    except Exception as exc:  # noqa: BLE001 -- audit-only path
+        logger.warning(
+            "[%s] attach_run_to_trigger_instance(%s) swallowed: %s",
+            run_id,
+            trigger_instance_id,
+            exc,
+        )
+
+
 async def _record_webex_threads_safely(
     thread_map: WebexThreadMap | None,
     task_id: str,
@@ -224,6 +262,9 @@ async def execute_task(
     task: TaskDefinition,
     context: dict[str, Any] | None = None,
     follow_up: FollowUpContext | None = None,
+    *,
+    run_id: str | None = None,
+    trigger_instance_id: str | None = None,
 ) -> TaskRun:
     """Run a single task, record the result, and return the TaskRun.
 
@@ -238,8 +279,19 @@ async def execute_task(
     clearly-labelled section, and ``TaskRun.parent_run_id`` is
     populated so the chat-thread synthesiser can render a single
     threaded timeline.
+
+    ``run_id`` is normally generated here, but the webhook handler
+    pre-allocates one before spawning the background task so it can
+    return the id to the sender in the 202 response without waiting
+    for the task to finish. If supplied it is used verbatim; otherwise
+    a fresh UUIDv4 is minted.
+
+    ``trigger_instance_id`` is the ``_id`` of the row in
+    ``trigger_instances`` that recorded the originating webhook
+    delivery. When set we back-link the run id onto that row in the
+    finally block so audit tooling can navigate delivery -> run.
     """
-    run_id = str(uuid.uuid4())
+    run_id = run_id or str(uuid.uuid4())
     # Pre-compute the deterministic per-task conversation id so it lands
     # in ``autonomous_runs`` from the very first RUNNING write -- the
     # UI can then deep-link from a run row to ``/chat/<id>`` as soon
@@ -253,6 +305,7 @@ async def execute_task(
         status=TaskStatus.RUNNING,
         conversation_id=conversation_id,
         parent_run_id=follow_up.parent_run_id if follow_up else None,
+        trigger_instance_id=trigger_instance_id,
     )
 
     store = get_run_store()
@@ -366,6 +419,11 @@ async def execute_task(
                 run_id=run_id,
                 events=run.events,
             )
+        # Back-link the dedup row to its run id (best-effort, no-op
+        # for cron / interval / manual fires that have no
+        # trigger_instance_id). Done last so a flaky update never
+        # masks a successful run; the helper is itself no-raise.
+        await _attach_run_to_trigger_safely(trigger_instance_id, run_id)
 
     return run
 
@@ -542,11 +600,24 @@ async def fire_webhook_task(
     task: TaskDefinition,
     context: dict[str, Any],
     follow_up: FollowUpContext | None = None,
+    *,
+    run_id: str | None = None,
+    trigger_instance_id: str | None = None,
 ) -> TaskRun:
     """Immediately execute a webhook-triggered task and return the completed run.
 
     ``follow_up`` is forwarded to :func:`execute_task` so the inbound
     bridge can re-fire the same task with operator feedback. ``None``
     for the original webhook fire and for the test-trigger button.
+
+    ``run_id`` / ``trigger_instance_id`` are forwarded so the webhook
+    route can pre-allocate a run id (returned in the 202 response) and
+    link the resulting run back to its dedup row.
     """
-    return await execute_task(task, context=context, follow_up=follow_up)
+    return await execute_task(
+        task,
+        context=context,
+        follow_up=follow_up,
+        run_id=run_id,
+        trigger_instance_id=trigger_instance_id,
+    )

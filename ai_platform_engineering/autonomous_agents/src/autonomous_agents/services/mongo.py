@@ -316,6 +316,11 @@ class MongoService:
             self.settings.mongodb_webex_thread_map_collection
         ]
 
+    def _trigger_instances(self) -> Any:
+        return self._require_primary()[
+            self.settings.mongodb_trigger_instances_collection
+        ]
+
     # ------------------------------------------------------------------
     # Indexes
     # ------------------------------------------------------------------
@@ -370,6 +375,23 @@ class MongoService:
             await self._webex_threads().create_index(
                 [("created_at", 1)],
                 expireAfterSeconds=ttl_seconds,
+            )
+            # ---- Trigger instances: TTL on received_at so dedup
+            #      records age out (default 7 days). The ``_id`` is
+            #      pinned to the dedup key so primary-key lookup is
+            #      already covered by the automatic ``_id_`` index.
+            trigger_ttl_seconds = (
+                self.settings.trigger_instance_ttl_days * 24 * 60 * 60
+            )
+            await self._trigger_instances().create_index(
+                [("received_at", 1)],
+                expireAfterSeconds=trigger_ttl_seconds,
+            )
+            # ---- Trigger instances: secondary index on task_id so
+            #      operator dashboards can list deliveries per task
+            #      without a collection scan.
+            await self._trigger_instances().create_index(
+                [("task_id", 1), ("received_at", -1)]
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -500,6 +522,71 @@ class MongoService:
         await self._webex_threads().replace_one(
             {"_id": message_id}, doc, upsert=True
         )
+
+    # ==================================================================
+    # Trigger instances (webhook delivery dedup)
+    # ==================================================================
+
+    async def record_trigger_instance(
+        self, doc: dict[str, Any]
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Insert ``doc`` (keyed on ``_id`` = dedup key) or report a duplicate.
+
+        Returns ``(created, existing_doc)``:
+
+        * ``(True, None)`` -- the row was newly inserted; caller is the
+          first to see this delivery.
+        * ``(False, existing_doc)`` -- a row with this ``_id`` already
+          exists; caller is a duplicate delivery and should NOT fire
+          the task. ``existing_doc`` may have ``run_id=None`` if the
+          original claim crashed before attaching a run id; the route
+          treats that as "fired but no run recorded yet" and surfaces
+          a clear status instead of guessing.
+
+        Mirrors the ``DuplicateKeyError`` translation used by
+        :meth:`create_task` so callers don't need to import
+        pymongo errors directly.
+        """
+        try:
+            await self._trigger_instances().insert_one(doc)
+            return True, None
+        except Exception as exc:  # noqa: BLE001 -- translated below
+            if exc.__class__.__name__ != "DuplicateKeyError":
+                raise
+            existing = await self._trigger_instances().find_one(
+                {"_id": doc["_id"]}
+            )
+            return False, existing
+
+    async def get_trigger_instance(
+        self, dedup_key: str
+    ) -> dict[str, Any] | None:
+        """Return the stored row for ``dedup_key`` or ``None`` if absent."""
+        return await self._trigger_instances().find_one({"_id": dedup_key})
+
+    async def attach_run_to_trigger_instance(
+        self, dedup_key: str, run_id: str
+    ) -> None:
+        """Record the ``run_id`` chosen by the scheduler on the dedup row.
+
+        Best-effort: a missing row (e.g. TTL-expired between claim and
+        run completion) is silently ignored. The dedup row's purpose is
+        to prevent duplicate execution; whether we successfully back-link
+        to the run is purely an audit nicety and must not raise out of
+        the scheduler's terminal phase.
+        """
+        try:
+            await self._trigger_instances().update_one(
+                {"_id": dedup_key},
+                {"$set": {"run_id": run_id}},
+            )
+        except Exception as exc:  # noqa: BLE001 -- audit-only path
+            logger.warning(
+                "attach_run_to_trigger_instance(%s -> %s) swallowed: %s",
+                dedup_key,
+                run_id,
+                exc,
+            )
 
     async def lookup_webex_thread(self, message_id: str) -> dict[str, Any] | None:
         """Return the raw thread-map document for ``message_id`` or None.

@@ -224,6 +224,24 @@ class Settings(BaseSettings):
     # short enough that abandoned threads don't pile up.
     webex_thread_map_ttl_days: int = Field(default=30, ge=1)
 
+    # MongoDB collection that records every accepted webhook delivery
+    # so retries from senders (GitHub's 10s timeout, network blips,
+    # at-least-once delivery) don't double-fire the task. The
+    # collection is keyed on a per-task dedup key derived from
+    # ``WebhookTrigger.dedup_header`` (when configured + present) or
+    # the verified HMAC signature (when a webhook secret is in use).
+    # See ``services.trigger_instances`` for the precedence and
+    # ``routes.webhooks`` for the receive-time flow.
+    mongodb_trigger_instances_collection: str = "trigger_instances"
+
+    # TTL (in days) for entries in ``trigger_instances``. Most
+    # webhook senders give up retrying within minutes; a week is
+    # comfortably long for forensics ("did this delivery arrive?")
+    # without growing the collection forever. Bump higher only if
+    # operators actively rely on the audit trail for older
+    # deliveries.
+    trigger_instance_ttl_days: int = Field(default=7, ge=1)
+
     # Connect-retry knobs used by main.py's lifespan. First connect
     # attempt happens immediately; subsequent attempts wait ``delay``
     # seconds between tries. ``ge=1`` keeps "never try" from being
