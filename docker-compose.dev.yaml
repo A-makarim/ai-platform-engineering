@@ -1464,8 +1464,8 @@ services:
     ports: ["8003:8003"]
     env_file: [.env]
     environment:
-      - WEBEX_BOT_TOKEN=${WEBEX_BOT_TOKEN:?WEBEX_BOT_TOKEN must be set in .env}
-      - WEBEX_BOT_PUBLIC_URL=${WEBEX_BOT_PUBLIC_URL:?WEBEX_BOT_PUBLIC_URL must be set in .env}
+      - WEBEX_BOT_TOKEN=${WEBEX_BOT_TOKEN:-}
+      - WEBEX_BOT_PUBLIC_URL=${WEBEX_BOT_PUBLIC_URL:-}
       - AUTONOMOUS_AGENTS_URL=${AUTONOMOUS_AGENTS_URL:-http://autonomous-agents:8002}
       - MONGODB_URI=${MONGODB_URI:-mongodb://${MONGODB_ROOT_USERNAME:-admin}:${MONGODB_ROOT_PASSWORD:-changeme}@caipe-mongodb:27017/${MONGODB_DATABASE:-caipe}?authSource=admin}
       - MONGODB_DATABASE=${MONGODB_DATABASE:-caipe}
