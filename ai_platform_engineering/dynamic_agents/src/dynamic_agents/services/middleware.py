@@ -215,11 +215,14 @@ def _instantiate_model(
     Returns:
         Initialized BaseChatModel instance.
     """
-    boto_config = BotocoreConfig(read_timeout=300, connect_timeout=60)
-    return LLMFactory(provider=model_provider).get_llm(
-        model=model_id,
-        config=boto_config,
-    )
+    # Only Bedrock accepts botocore Config. Other providers pass kwargs
+    # through to their SDK clients and reject AWS-specific options.
+    kwargs: dict[str, Any] = {"model": model_id}
+    if (model_provider or "").strip().lower() == "aws-bedrock":
+        # Extended timeouts for Bedrock to prevent ReadTimeoutError during
+        # long-running middleware-driven model calls.
+        kwargs["config"] = BotocoreConfig(read_timeout=300, connect_timeout=60)
+    return LLMFactory(provider=model_provider).get_llm(**kwargs)
 
 
 def _build_llm_tool_selector(params: dict[str, Any]) -> LLMToolSelectorMiddleware:
