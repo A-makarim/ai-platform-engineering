@@ -1,0 +1,56 @@
+# Wolfi (Chainguard) base, aligned with build/Dockerfile.slack-bot.
+FROM cgr.dev/chainguard/wolfi-base
+
+RUN echo "https://packages.wolfi.dev/os" > /etc/apk/repositories
+
+RUN for i in 1 2 3; do apk add --no-cache python-3.13 shadow && break; [ $i -lt 3 ] && sleep $((i * 10)); done && \
+    apk upgrade --no-cache
+
+# Use the official uv binary -- Wolfi apk uv bundles outdated Rust crates with CVEs.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# Wolfi puts Python at /usr/bin/python3.13; keep venv symlinks consistent.
+RUN mkdir -p /usr/local/bin \
+    && ln -sf /usr/bin/python3.13 /usr/local/bin/python3.13 \
+    && ln -sf /usr/bin/python3.13 /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python3.13 /usr/local/bin/python
+
+# Non-root runtime user.
+RUN groupadd -r -g 1001 appuser && useradd -r -g appuser -u 1001 -m appuser
+
+WORKDIR /app
+
+# Copy dependency metadata first for better layer caching.
+# uv.lock is optional for local development builds.
+COPY ai_platform_engineering/integrations/webex_bot/pyproject.toml /app/
+COPY ai_platform_engineering/integrations/webex_bot/uv.lock* /app/
+
+# Install runtime dependencies only.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ -f /app/uv.lock ]; then \
+        uv sync --locked --no-dev --no-default-groups; \
+    else \
+        uv sync --no-dev --no-default-groups; \
+    fi
+
+# Copy only the Webex bot package into the runtime image.
+COPY ai_platform_engineering/integrations/webex_bot/__init__.py     /app/webex_bot/__init__.py
+COPY ai_platform_engineering/integrations/webex_bot/__main__.py     /app/webex_bot/__main__.py
+COPY ai_platform_engineering/integrations/webex_bot/app.py          /app/webex_bot/app.py
+COPY ai_platform_engineering/integrations/webex_bot/config.py       /app/webex_bot/config.py
+COPY ai_platform_engineering/integrations/webex_bot/dispatcher.py   /app/webex_bot/dispatcher.py
+COPY ai_platform_engineering/integrations/webex_bot/thread_store.py /app/webex_bot/thread_store.py
+COPY ai_platform_engineering/integrations/webex_bot/webex_client.py /app/webex_bot/webex_client.py
+
+ENV PATH="/app/.venv/bin:${PATH}" \
+    UV_PROJECT_ENVIRONMENT="/app/.venv" \
+    PYTHONPATH="/app" \
+    PYTHONUNBUFFERED=1
+
+RUN chown -R appuser:appuser /app
+
+USER appuser
+
+EXPOSE 8003
+
+CMD ["python", "-m", "webex_bot"]

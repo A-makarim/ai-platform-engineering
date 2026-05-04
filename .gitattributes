@@ -1,3 +1,5 @@
+# Keep shell scripts executable in Linux containers.
+*.sh text eol=lf
 
 # Use bd merge for beads JSONL files
 .beads/issues.jsonl merge=beads
