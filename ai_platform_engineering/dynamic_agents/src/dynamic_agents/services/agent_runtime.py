@@ -264,12 +264,15 @@ class AgentRuntime(StreamingMixin):
             f"[llm] Instantiating LLM for agent '{self.config.name}': "
             f"provider={self.config.model.provider}, model={self.config.model.id}"
         )
-        # Configure botocore with extended timeouts for Bedrock to prevent
-        # ReadTimeoutError during long-running agent operations (especially subagents)
-        boto_config = BotocoreConfig(read_timeout=300, connect_timeout=60)
+        # Only Bedrock accepts botocore Config. Other providers pass kwargs
+        # through to their SDK clients and reject AWS-specific options.
+        get_llm_kwargs: dict[str, Any] = {"model": self.config.model.id}
+        if (self.config.model.provider or "").strip().lower() == "aws-bedrock":
+            get_llm_kwargs["config"] = BotocoreConfig(
+                read_timeout=300, connect_timeout=60
+            )
         llm = LLMFactory(provider=self.config.model.provider).get_llm(
-            model=self.config.model.id,
-            config=boto_config,
+            **get_llm_kwargs
         )
         logger.info(f"[llm] LLM instantiated for agent '{self.config.name}': type={type(llm).__name__}")
 
