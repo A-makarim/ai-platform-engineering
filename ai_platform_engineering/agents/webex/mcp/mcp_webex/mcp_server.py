@@ -219,6 +219,26 @@ def register_tools(server, auth_token):
             json={k: v for k, v in payload.items() if v is not None},
         )
         response.raise_for_status()
+        # Include Webex ids so downstream consumers can correlate replies.
+        try:
+            sent = response.json()
+        except (ValueError, TypeError):
+            sent = {}
+        message_id = sent.get("id")
+        room_id = sent.get("roomId")
+        parent_id = sent.get("parentId")
+        if message_id:
+            descriptor = f"messageId={message_id}"
+            if room_id:
+                descriptor += f", roomId={room_id}"
+            if parent_id:
+                descriptor += f", parentId={parent_id}"
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Message sent successfully ({descriptor}).",
+                )
+            ]
         return [TextContent(type="text", text="Message sent successfully")]
 
     @server.tool(name=WebexTools.CREATE_ROOM, description=CreateRoom.Config.description)
