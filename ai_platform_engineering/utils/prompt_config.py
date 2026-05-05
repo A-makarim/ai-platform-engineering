@@ -290,9 +290,17 @@ def get_deep_agent_config() -> Dict[str, Any]:
 
 def load_platform_config(path="prompt_config.yaml") -> Dict[str, Any]:
     """Load platform engineer prompt configuration from YAML file."""
+    path = os.environ.get("PROMPT_CONFIG_PATH", path)
     if os.path.exists(path):
-        with open(path, "r") as f:
-            return yaml.safe_load(f)
+        with open(path, "r", encoding="utf-8") as f:
+            loaded = yaml.safe_load(f)
+        if not isinstance(loaded, dict):
+            logger.warning(
+                "platform prompt config at %s is not a mapping (got %s); ignoring",
+                path, type(loaded).__name__,
+            )
+            return {}
+        return loaded
     return {}
 
 def get_platform_agent_info(config: Dict[str, Any], platform_registry) -> tuple:
