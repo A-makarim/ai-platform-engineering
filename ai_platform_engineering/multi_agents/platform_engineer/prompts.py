@@ -35,9 +35,14 @@ FINAL_ANSWER_MARKER_SECTION = """
 # ============================================================================
 # Load YAML config
 def load_prompt_config(path="prompt_config.yaml"):
+    path = os.environ.get("PROMPT_CONFIG_PATH", path)
     if os.path.exists(path):
-        with open(path, "r") as f:
-            return yaml.safe_load(f)
+        with open(path, "r", encoding="utf-8") as f:
+            loaded = yaml.safe_load(f)
+        if not isinstance(loaded, dict):
+            logger.warning("prompt config at %s is not a mapping (got %s); ignoring", path, type(loaded).__name__)
+            return {}
+        return loaded
     return {}
 
 config = load_prompt_config()
