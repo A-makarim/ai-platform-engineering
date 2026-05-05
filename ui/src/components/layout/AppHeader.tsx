@@ -15,6 +15,7 @@ import {
   Workflow,
   Home,
   Bot,
+  Sparkles,
   AlertTriangle,
 } from "lucide-react";
 import { GithubIcon as Github } from "@/components/ui/icons";
@@ -167,12 +168,14 @@ export function AppHeader() {
   };
 
   const combinedStatus = getCombinedStatus();
+  const autonomousAgentsEnabled = config.autonomousAgentsEnabled;
 
   const getActiveTab = () => {
     if (pathname === "/") return "home";
     if (pathname?.startsWith("/chat")) return "chat";
     if (pathname?.startsWith("/knowledge-bases")) return "knowledge";
     if (pathname?.startsWith("/task-builder")) return "task-builder";
+    if (pathname?.startsWith("/autonomous")) return "autonomous";
     if (pathname?.startsWith("/skills") || pathname?.startsWith("/use-cases")) return "skills";
     if (pathname?.startsWith("/dynamic-agents")) return "dynamic-agents";
     if (pathname?.startsWith("/admin")) return "admin";
@@ -279,6 +282,21 @@ export function AppHeader() {
             <Workflow className="h-3.5 w-3.5 shrink-0" />
             Task Builder
           </GuardedLink>
+          {autonomousAgentsEnabled && (
+            <GuardedLink
+              href="/autonomous"
+              prefetch={true}
+              className={cn(
+                "flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-[13px] font-medium whitespace-nowrap transition-all",
+                activeTab === "autonomous"
+                  ? "bg-primary text-primary-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground"
+              )}
+            >
+              <Sparkles className="h-3.5 w-3.5 shrink-0" />
+              Autonomous
+            </GuardedLink>
+          )}
           {/* Knowledge Bases tab - only show if RAG is enabled */}
           {ragEnabled && (
             <GuardedLink

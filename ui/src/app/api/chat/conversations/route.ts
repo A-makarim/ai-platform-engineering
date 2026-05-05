@@ -37,6 +37,9 @@ export const GET = withErrorHandler(async (request: NextRequest) => {
   const archived = url.searchParams.get('archived') === 'true';
   const pinned = url.searchParams.get('pinned') === 'true';
   const clientTypeParam = url.searchParams.get('client_type') as ClientType | null;
+  const sourceParam = url.searchParams.get('source');
+  const sourceFilter =
+    sourceParam === 'autonomous' || sourceParam === 'web' ? sourceParam : null;
 
   // Validate client_type param if provided
   if (clientTypeParam && !VALID_CLIENT_TYPES.includes(clientTypeParam)) {
@@ -97,6 +100,23 @@ export const GET = withErrorHandler(async (request: NextRequest) => {
 
   if (pinned) {
     query.is_pinned = true;
+  }
+
+  if (sourceFilter === 'autonomous') {
+    query.source = 'autonomous';
+    delete query.$or;
+  } else if (sourceFilter === 'web') {
+    query.source = {
+      $in: ['web', null],
+    } as { $in: (string | null)[] };
+  } else {
+    // Default ("All") view: include autonomous conversations alongside
+    // regular human chats so the sidebar's "All" filter actually shows
+    // both. Slack threads are still excluded because they have their
+    // own dedicated UI and were never wanted in this list. Pre-fix,
+    // autonomous was also in the $nin which contradicted the sidebar's
+    // ``return true`` filter and made autonomous rows vanish from "All".
+    query.source = { $nin: ['slack'] };
   }
 
   // Get total count

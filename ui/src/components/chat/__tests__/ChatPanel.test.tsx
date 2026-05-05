@@ -68,6 +68,9 @@ jest.mock('@/store/chat-store', () => ({
     cancelConversationRequest: jest.fn(),
     updateMessageFeedback: jest.fn(),
     consumePendingMessage: jest.fn(() => null),
+    consumeInputDraft: jest.fn(() => null),
+    setInputDraft: jest.fn(),
+    inputDraft: null,
   })),
 }))
 

@@ -151,8 +151,11 @@ export function ChatContainer() {
           setFetchDone(true);
 
           if (storageMode === 'mongodb') {
-            // Dynamic Agents use the old messages path; Platform Engineer uses turns
-            if (isDA) {
+            // Autonomous-task threads are synthesised into chat-store and do
+            // not have a normal MongoDB conversation row to sync.
+            if ((localConv as { source?: string }).source === 'autonomous') {
+              // No-op: the autonomous polling path keeps these fresh.
+            } else if (isDA) {
               loadMessagesFromServer(uuid).catch((err) => {
                 console.warn('[ChatContainer] Failed to sync messages from server:', err);
               });

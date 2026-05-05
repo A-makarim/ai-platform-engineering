@@ -69,6 +69,9 @@ jest.mock('@/store/chat-store', () => ({
     recoverInterruptedTask: jest.fn(),
     evictOldMessageContent: mockEvictOldMessageContent,
     loadMessagesFromServer: mockLoadMessagesFromServer,
+    consumeInputDraft: jest.fn(() => null),
+    setInputDraft: jest.fn(),
+    inputDraft: null,
   })),
 }))
 
@@ -259,6 +262,9 @@ describe('SupervisorChatPanel — Message Windowing', () => {
       recoverInterruptedTask: jest.fn(),
       evictOldMessageContent: mockEvictOldMessageContent,
       loadMessagesFromServer: mockLoadMessagesFromServer,
+      consumeInputDraft: jest.fn(() => null),
+      setInputDraft: jest.fn(),
+      inputDraft: null,
     }))
   })
 
@@ -447,6 +453,9 @@ describe('SupervisorChatPanel — Message Windowing', () => {
         recoverInterruptedTask: jest.fn(),
         evictOldMessageContent: mockEvictOldMessageContent,
         loadMessagesFromServer: mockLoadMessagesFromServer,
+        consumeInputDraft: jest.fn(() => null),
+        setInputDraft: jest.fn(),
+        inputDraft: null,
       }))
 
       rerender(<SupervisorChatPanel endpoint="/api/test" />)
