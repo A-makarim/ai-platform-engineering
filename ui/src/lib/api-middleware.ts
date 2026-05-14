@@ -416,7 +416,7 @@ export async function getUserTeamIds(userEmail: string): Promise<string[]> {
   }
 }
 
-export type ConversationAccessLevel = 'owner' | 'shared' | 'shared_readonly' | 'admin_audit';
+export type ConversationAccessLevel = 'owner' | 'shared' | 'shared_readonly' | 'admin_audit' | 'autonomous_comment';
 
 interface ConversationAccessResult {
   conversation: any;
@@ -427,8 +427,9 @@ interface ConversationAccessResult {
  * Check if user has access to a conversation (owner, shared with directly,
  * shared with one of their teams, via sharing_access records, or admin audit).
  *
- * When `session` is provided and the user is an admin, they receive read-only
- * audit access even if they are not the owner or a share recipient.
+ * When session indicates admin (or admin-view), non-autonomous conversations
+ * yield read-only audit access; autonomous-agent threads yield `autonomous_comment`
+ * so follow-up messaging can be gated separately from audit-only UX.
  */
 export async function requireConversationAccess(
   conversationId: string,
@@ -509,6 +510,18 @@ export async function requireConversationAccess(
       conversation,
       access_level: perm === 'comment' ? 'shared' : 'shared_readonly',
     };
+  }
+
+  // Autonomous threads are written by the autonomous-agents publisher; admins may
+  // comment (user+assistant manual_followup via a strict POST /messages path in
+  // a later change) without full admin-write semantics on web/slack sources.
+  // Checked before the generic admin fallback so privileged viewers get
+  // autonomous_comment rather than audit-only.
+  if (
+    conversation.source === 'autonomous' &&
+    (session?.role === 'admin' || session?.canViewAdmin === true)
+  ) {
+    return { conversation, access_level: 'autonomous_comment' };
   }
 
   // Admins get read-only audit access to any conversation

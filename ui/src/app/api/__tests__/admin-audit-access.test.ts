@@ -278,6 +278,160 @@ describe('requireConversationAccess — admin audit', () => {
   });
 });
 
+describe('requireConversationAccess — autonomous_comment matrix', () => {
+  let requireConversationAccess: any;
+  let ApiError: any;
+
+  beforeEach(async () => {
+    jest.resetModules();
+    const mod = await import('@/lib/api-middleware');
+    requireConversationAccess = mod.requireConversationAccess;
+    ApiError = mod.ApiError;
+  });
+
+  async function seedTailBranchConversation(source?: 'autonomous' | 'web') {
+    const conv: Record<string, unknown> = {
+      _id: CONV_ID,
+      owner_id: 'owner@example.com',
+      title: 'Test',
+      sharing: { shared_with: [], shared_with_teams: [] },
+    };
+    if (source !== undefined) {
+      conv.source = source;
+    }
+    const convsCol = createMockCollection();
+    convsCol.findOne.mockResolvedValue(conv);
+    mockCollections['conversations'] = convsCol;
+
+    const sharingAccessCol = createMockCollection();
+    sharingAccessCol.findOne.mockResolvedValue(null);
+    mockCollections['sharing_access'] = sharingAccessCol;
+    return conv;
+  }
+
+  it('returns autonomous_comment when admin session and autonomous source', async () => {
+    await seedTailBranchConversation('autonomous');
+
+    const result = await requireConversationAccess(
+      CONV_ID,
+      'admin@example.com',
+      mockGetCollection,
+      { role: 'admin' }
+    );
+
+    expect(result.access_level).toBe('autonomous_comment');
+  });
+
+  it('returns autonomous_comment when canViewAdmin and autonomous source', async () => {
+    await seedTailBranchConversation('autonomous');
+
+    const result = await requireConversationAccess(
+      CONV_ID,
+      'auditor@example.com',
+      mockGetCollection,
+      { role: 'user', canViewAdmin: true }
+    );
+
+    expect(result.access_level).toBe('autonomous_comment');
+  });
+
+  it('returns admin_audit when canViewAdmin and web source', async () => {
+    await seedTailBranchConversation('web');
+
+    const result = await requireConversationAccess(
+      CONV_ID,
+      'auditor@example.com',
+      mockGetCollection,
+      { role: 'user', canViewAdmin: true }
+    );
+
+    expect(result.access_level).toBe('admin_audit');
+  });
+
+  it('regression: preserves admin_audit for non-autonomous when admin accesses non-owner conversation', async () => {
+    await seedTailBranchConversation('web');
+
+    const result = await requireConversationAccess(
+      CONV_ID,
+      'admin@example.com',
+      mockGetCollection,
+      { role: 'admin' }
+    );
+
+    expect(result.access_level).toBe('admin_audit');
+  });
+
+  it('returns admin_audit when admin session and source is omitted (non-autonomous)', async () => {
+    await seedTailBranchConversation();
+
+    const result = await requireConversationAccess(
+      CONV_ID,
+      'admin@example.com',
+      mockGetCollection,
+      { role: 'admin' }
+    );
+
+    expect(result.access_level).toBe('admin_audit');
+  });
+
+  it('returns shared_readonly when autonomous source and plain user canViewAdmin false', async () => {
+    await seedTailBranchConversation('autonomous');
+
+    const result = await requireConversationAccess(
+      CONV_ID,
+      'plain@example.com',
+      mockGetCollection,
+      { role: 'user', canViewAdmin: false }
+    );
+
+    expect(result.access_level).toBe('shared_readonly');
+  });
+
+  it('returns shared_readonly when autonomous source and user without canViewAdmin', async () => {
+    await seedTailBranchConversation('autonomous');
+
+    const result = await requireConversationAccess(
+      CONV_ID,
+      'plain@example.com',
+      mockGetCollection,
+      { role: 'user' }
+    );
+
+    expect(result.access_level).toBe('shared_readonly');
+  });
+
+  it('throws 403 when web source and plain user session', async () => {
+    await seedTailBranchConversation('web');
+
+    const err = requireConversationAccess(
+      CONV_ID,
+      'plain@example.com',
+      mockGetCollection,
+      { role: 'user' }
+    );
+
+    await expect(err).rejects.toThrow(ApiError);
+    await expect(err).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  it('returns shared_readonly when autonomous source and no session', async () => {
+    await seedTailBranchConversation('autonomous');
+
+    const result = await requireConversationAccess(CONV_ID, 'plain@example.com', mockGetCollection);
+
+    expect(result.access_level).toBe('shared_readonly');
+  });
+
+  it('throws 403 when web source and no session', async () => {
+    await seedTailBranchConversation('web');
+
+    const err = requireConversationAccess(CONV_ID, 'plain@example.com', mockGetCollection);
+
+    await expect(err).rejects.toThrow(ApiError);
+    await expect(err).rejects.toMatchObject({ statusCode: 403 });
+  });
+});
+
 describe('GET /api/chat/conversations/[id] — access_level in response', () => {
   let GET: any;
 
