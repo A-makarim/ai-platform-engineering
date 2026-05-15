@@ -1806,12 +1806,44 @@ const storeImplementation = (set: any, get: any) => ({
                 (existingConv as { source?: string } | undefined)?.source ===
                 'autonomous';
 
+              // Autonomous synth messages (creation_intent, preflight_ack,
+              // run_request/response, next_run_marker) are generated
+              // client-side by synthesizeConversationForTask and are NEVER
+              // persisted in MongoDB. Without this union the server's
+              // user-typed-only response would clobber them every time
+              // loadMessagesFromServer ran, producing the
+              // "manual chat history disappears in autonomous task chat"
+              // symptom (Inv-G addendum, 2026-05-15).
+              let finalMessages = mergedMessages;
+              if (isAutonomous && existingConv) {
+                const serverIdSet = new Set(messages.map((m) => m.id));
+                const synthOnly = existingConv.messages.filter(
+                  (m) => !serverIdSet.has(m.id),
+                );
+                if (synthOnly.length > 0) {
+                  finalMessages = [...mergedMessages, ...synthOnly].sort(
+                    (a, b) => {
+                      const at = a.timestamp.getTime();
+                      const bt = b.timestamp.getTime();
+                      // NaN-safe: non-finite timestamps sort to the end.
+                      const av = Number.isFinite(at)
+                        ? at
+                        : Number.POSITIVE_INFINITY;
+                      const bv = Number.isFinite(bt)
+                        ? bt
+                        : Number.POSITIVE_INFINITY;
+                      return av - bv;
+                    },
+                  );
+                }
+              }
+
               return {
                 conversations: state.conversations.map((c: Conversation) =>
                   c.id === conversationId
                     ? {
                         ...c,
-                        messages: mergedMessages,
+                        messages: finalMessages,
                         a2aEvents: isAutonomous ? c.a2aEvents : lastTurnA2AEvents,
                         streamEvents: isAutonomous ? c.streamEvents : lastTurnStreamEvents,
                       }
