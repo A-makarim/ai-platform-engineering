@@ -27,6 +27,7 @@ import { useAgentTimeline } from "@/hooks/useDynamicAgentTimeline";
 import type { TaskItem } from "@/components/shared/timeline";
 import { MarkdownRenderer } from "@/components/shared/timeline";
 import type { DynamicAgentConfig } from "@/types/dynamic-agent";
+import { v4 as uuidv4 } from "uuid";
 
 type ReadOnlyReason = 'admin_audit' | 'shared_readonly' | 'agent_deleted' | 'agent_disabled';
 
@@ -837,18 +838,29 @@ export function ChatPanel({ endpoint, conversationId, conversationTitle, readOnl
     };
     clearStreamEvents(convId);
 
-    // Add user message - generate turnId for this request/response pair
-    const turnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    // Add user message - generate turnId for this request/response pair.
+    // Autonomous threads use the strict `manual-<uuid>` namespace so the new
+    // POST /messages branch accepts the follow-up; non-autonomous threads keep
+    // the legacy id format.
+    const isAutonomousThread =
+      (conv as { source?: string } | undefined)?.source === 'autonomous';
+    const turnId = isAutonomousThread
+      ? `manual-${uuidv4()}`
+      : `turn-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    const userMessageId = isAutonomousThread ? `manual:${uuidv4()}` : undefined;
+    const assistantMessageId = isAutonomousThread ? `asst:${uuidv4()}` : undefined;
     addMessage(convId, {
       role: "user",
       content: messageToSend,
       senderEmail: session?.user?.email ?? undefined,
       senderName: session?.user?.name ?? undefined,
       senderImage: session?.user?.image ?? undefined,
-    }, turnId);
+    }, turnId, userMessageId);
 
-    // Add assistant message placeholder with same turnId
-    const assistantMsgId = addMessage(convId, { role: "assistant", content: "" }, turnId);
+    // Add assistant message placeholder with same turnId.
+    // For autonomous threads the assistant id MUST also be passed explicitly so
+    // saveMessagesToServer's POST passes the AUTONOMOUS_MSG_ID_RE check on the server.
+    const assistantMsgId = addMessage(convId, { role: "assistant", content: "" }, turnId, assistantMessageId);
 
     // Create protocol-agnostic adapter
     const adapter = createStreamAdapter({

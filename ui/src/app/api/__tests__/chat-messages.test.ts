@@ -1454,3 +1454,364 @@ describe('POST /api/chat/conversations/[id]/messages — admin audit write block
     expect(res.status).toBe(200);
   });
 });
+
+// ============================================================================
+// autonomous_comment — strict POST /messages branch
+// ============================================================================
+
+describe('POST /api/chat/conversations/[id]/messages — autonomous_comment', () => {
+  const AUTONOMOUS_CONV_ID = '11111111-1111-4111-8111-111111111111';
+  const VALID_USER_MSG_ID = 'manual:22222222-2222-4222-8222-222222222222';
+  const VALID_ASST_MSG_ID = 'asst:33333333-3333-4333-8333-333333333333';
+  const VALID_TURN_ID = 'manual-44444444-4444-4444-4444-444444444444';
+
+  let POST: any;
+  let warnSpy: jest.SpyInstance;
+
+  beforeEach(async () => {
+    jest.resetModules();
+    Object.keys(mockCollections).forEach((k) => delete mockCollections[k]);
+    mockGetCollection.mockClear();
+    mockGetServerSession.mockReset();
+    warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const mod = await import(
+      '@/app/api/chat/conversations/[id]/messages/route'
+    );
+    POST = mod.POST;
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  function adminSession() {
+    return {
+      user: { email: 'admin@example.com', name: 'Admin' },
+      role: 'admin',
+      canViewAdmin: true,
+    };
+  }
+
+  function adminViewSession() {
+    return {
+      user: { email: 'auditor@example.com', name: 'Auditor' },
+      role: 'user',
+      canViewAdmin: true,
+    };
+  }
+
+  function plainUserSession() {
+    return {
+      user: { email: 'plain@example.com', name: 'Plain User' },
+      role: 'user',
+      canViewAdmin: false,
+    };
+  }
+
+  function setupAutonomousConversation(opts: {
+    taskId?: string;
+    agentParticipantId?: string;
+  } = {}) {
+    const usersCol = createMockCollection();
+    usersCol.findOne.mockResolvedValue(null);
+    mockCollections['users'] = usersCol;
+
+    const conversation: Record<string, unknown> = {
+      _id: AUTONOMOUS_CONV_ID,
+      owner_id: 'autonomous@system',
+      title: 'Autonomous task',
+      source: 'autonomous',
+      sharing: { shared_with: [], shared_with_teams: [] },
+      ...(opts.taskId && { task_id: opts.taskId }),
+      participants: opts.agentParticipantId
+        ? [{ type: 'agent', id: opts.agentParticipantId }]
+        : [],
+    };
+    const convCol = createMockCollection();
+    convCol.findOne.mockResolvedValue(conversation);
+    mockCollections['conversations'] = convCol;
+
+    const sharingCol = createMockCollection();
+    sharingCol.findOne.mockResolvedValue(null);
+    mockCollections['sharing_access'] = sharingCol;
+
+    const teamsCol = createMockCollection();
+    teamsCol.find.mockReturnValue({
+      project: jest.fn().mockReturnValue({
+        toArray: jest.fn().mockResolvedValue([]),
+      }),
+    });
+    mockCollections['teams'] = teamsCol;
+
+    return { convCol, conversation };
+  }
+
+  function setupMessagesUpsertSuccess(returnDoc: Record<string, unknown>) {
+    const msgCol = createMockCollection();
+    const upsertedId = new ObjectId();
+    msgCol.updateOne.mockResolvedValue({
+      upsertedId,
+      upsertedCount: 1,
+      matchedCount: 0,
+      modifiedCount: 0,
+      acknowledged: true,
+    });
+    msgCol.findOne.mockResolvedValue({ _id: upsertedId, ...returnDoc });
+    mockCollections['messages'] = msgCol;
+    return msgCol;
+  }
+
+  function setupMessagesUpsertNoInsert() {
+    const msgCol = createMockCollection();
+    msgCol.updateOne.mockResolvedValue({
+      upsertedId: null,
+      upsertedCount: 0,
+      matchedCount: 1,
+      modifiedCount: 0,
+      acknowledged: true,
+    });
+    mockCollections['messages'] = msgCol;
+    return msgCol;
+  }
+
+  function postAutonomousComment(body: Record<string, unknown>) {
+    const req = makeRequest(
+      `/api/chat/conversations/${AUTONOMOUS_CONV_ID}/messages`,
+      { method: 'POST', body: JSON.stringify(body) },
+    );
+    return POST(req, { params: Promise.resolve({ id: AUTONOMOUS_CONV_ID }) });
+  }
+
+  it('admin posting role=user with manual:<uuid> succeeds and stamps sender + metadata server-side', async () => {
+    mockGetServerSession.mockResolvedValue(adminSession());
+    setupAutonomousConversation({ taskId: 'task-abc' });
+    const msgCol = setupMessagesUpsertSuccess({
+      message_id: VALID_USER_MSG_ID,
+      role: 'user',
+      content: 'follow-up question',
+    });
+
+    const res = await postAutonomousComment({
+      message_id: VALID_USER_MSG_ID,
+      role: 'user',
+      content: 'follow-up question',
+      // Spoofed fields that must be ignored.
+      sender_email: 'attacker@example.com',
+      sender_name: 'Attacker',
+      metadata: {
+        turn_id: VALID_TURN_ID,
+        kind: 'attempted_spoof',
+        actor_role: 'user',
+      },
+    });
+    expect(res.status).toBe(201);
+
+    const updateDoc = msgCol.updateOne.mock.calls[0][1];
+    expect(updateDoc.$setOnInsert.role).toBe('user');
+    expect(updateDoc.$setOnInsert.message_id).toBe(VALID_USER_MSG_ID);
+    expect(updateDoc.$setOnInsert.sender_email).toBe('admin@example.com');
+    expect(updateDoc.$setOnInsert.sender_name).toBe('Admin');
+    expect(updateDoc.$setOnInsert.metadata.kind).toBe('manual_followup');
+    expect(updateDoc.$setOnInsert.metadata.created_via_access_level).toBe('autonomous_comment');
+    expect(updateDoc.$setOnInsert.metadata.actor_role).toBe('admin');
+    expect(updateDoc.$setOnInsert.metadata.source).toBe('web');
+    expect(updateDoc.$setOnInsert.metadata.turn_id).toBe(VALID_TURN_ID);
+    expect(updateDoc.$setOnInsert.metadata.task_id).toBe('task-abc');
+
+    // Insert-only — never $set.
+    expect(updateDoc.$set).toBeUndefined();
+
+    // Conversation row updated and total_messages incremented.
+    const convCol = mockCollections['conversations'];
+    expect(convCol.updateOne).toHaveBeenCalledWith(
+      { _id: AUTONOMOUS_CONV_ID },
+      expect.objectContaining({
+        $set: expect.objectContaining({ updated_at: expect.any(Date) }),
+        $inc: { 'metadata.total_messages': 1 },
+      }),
+    );
+  });
+
+  it('admin posting role=assistant with asst:<uuid> succeeds and stamps sender from agent participant', async () => {
+    mockGetServerSession.mockResolvedValue(adminSession());
+    setupAutonomousConversation({ agentParticipantId: 'github-agent' });
+    const msgCol = setupMessagesUpsertSuccess({
+      message_id: VALID_ASST_MSG_ID,
+      role: 'assistant',
+      content: 'OK, doing it.',
+    });
+
+    const res = await postAutonomousComment({
+      message_id: VALID_ASST_MSG_ID,
+      role: 'assistant',
+      content: 'OK, doing it.',
+      metadata: { turn_id: VALID_TURN_ID },
+    });
+    expect(res.status).toBe(201);
+
+    const updateDoc = msgCol.updateOne.mock.calls[0][1];
+    expect(updateDoc.$setOnInsert.role).toBe('assistant');
+    expect(updateDoc.$setOnInsert.sender_email).toBe('github-agent');
+    expect(updateDoc.$setOnInsert.metadata.kind).toBe('manual_followup_response');
+  });
+
+  it('falls back to "supervisor" sender when no agent participant is present', async () => {
+    mockGetServerSession.mockResolvedValue(adminSession());
+    setupAutonomousConversation({});
+    const msgCol = setupMessagesUpsertSuccess({
+      message_id: VALID_ASST_MSG_ID,
+      role: 'assistant',
+      content: 'reply',
+    });
+
+    const res = await postAutonomousComment({
+      message_id: VALID_ASST_MSG_ID,
+      role: 'assistant',
+      content: 'reply',
+      metadata: { turn_id: VALID_TURN_ID },
+    });
+    expect(res.status).toBe(201);
+    const updateDoc = msgCol.updateOne.mock.calls[0][1];
+    expect(updateDoc.$setOnInsert.sender_email).toBe('supervisor');
+  });
+
+  it('admin-view session can also post (canViewAdmin path)', async () => {
+    mockGetServerSession.mockResolvedValue(adminViewSession());
+    setupAutonomousConversation({});
+    const msgCol = setupMessagesUpsertSuccess({
+      message_id: VALID_USER_MSG_ID,
+      role: 'user',
+      content: 'hi',
+    });
+
+    const res = await postAutonomousComment({
+      message_id: VALID_USER_MSG_ID,
+      role: 'user',
+      content: 'hi',
+      metadata: { turn_id: VALID_TURN_ID },
+    });
+    expect(res.status).toBe(201);
+    const updateDoc = msgCol.updateOne.mock.calls[0][1];
+    expect(updateDoc.$setOnInsert.metadata.actor_role).toBe('admin_view');
+  });
+
+  it('rejects role=system with 400 AUTONOMOUS_COMMENT_BAD_ROLE and emits structured log', async () => {
+    mockGetServerSession.mockResolvedValue(adminSession());
+    setupAutonomousConversation({});
+    setupMessagesUpsertSuccess({});
+
+    const res = await postAutonomousComment({
+      message_id: VALID_USER_MSG_ID,
+      role: 'system',
+      content: 'x',
+      metadata: { turn_id: VALID_TURN_ID },
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.code).toBe('AUTONOMOUS_COMMENT_BAD_ROLE');
+
+    const logCalls = warnSpy.mock.calls
+      .map((args) => args[0])
+      .filter((s) => typeof s === 'string' && s.includes('autonomous_comment.invalid'));
+    expect(logCalls.length).toBeGreaterThan(0);
+    const parsed = JSON.parse(logCalls[0]);
+    expect(parsed.event).toBe('autonomous_comment.invalid');
+    expect(parsed.code).toBe('AUTONOMOUS_COMMENT_BAD_ROLE');
+    expect(parsed.userId).toBe('admin@example.com');
+    expect(parsed.conversationId).toBe(AUTONOMOUS_CONV_ID);
+    expect(parsed.actor_role).toBe('admin');
+  });
+
+  it('rejects reserved id prefix run: with 400 AUTONOMOUS_COMMENT_BAD_NAMESPACE', async () => {
+    mockGetServerSession.mockResolvedValue(adminSession());
+    setupAutonomousConversation({});
+
+    const res = await postAutonomousComment({
+      message_id: 'run:55555555-5555-4555-8555-555555555555',
+      role: 'user',
+      content: 'x',
+      metadata: { turn_id: VALID_TURN_ID },
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.code).toBe('AUTONOMOUS_COMMENT_BAD_NAMESPACE');
+  });
+
+  it('rejects task: prefix with 400 AUTONOMOUS_COMMENT_BAD_NAMESPACE', async () => {
+    mockGetServerSession.mockResolvedValue(adminSession());
+    setupAutonomousConversation({});
+
+    const res = await postAutonomousComment({
+      message_id: 'task:55555555-5555-4555-8555-555555555555',
+      role: 'user',
+      content: 'x',
+      metadata: { turn_id: VALID_TURN_ID },
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.code).toBe('AUTONOMOUS_COMMENT_BAD_NAMESPACE');
+  });
+
+  it('rejects malformed turn_id with 400 AUTONOMOUS_COMMENT_BAD_TURN_ID', async () => {
+    mockGetServerSession.mockResolvedValue(adminSession());
+    setupAutonomousConversation({});
+
+    const res = await postAutonomousComment({
+      message_id: VALID_USER_MSG_ID,
+      role: 'user',
+      content: 'x',
+      metadata: { turn_id: 'turn-12345' },
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.code).toBe('AUTONOMOUS_COMMENT_BAD_TURN_ID');
+  });
+
+  it('returns 409 MESSAGE_ALREADY_EXISTS on re-POST and emits duplicate log', async () => {
+    mockGetServerSession.mockResolvedValue(adminSession());
+    setupAutonomousConversation({});
+    setupMessagesUpsertNoInsert();
+
+    const res = await postAutonomousComment({
+      message_id: VALID_USER_MSG_ID,
+      role: 'user',
+      content: 'dup',
+      metadata: { turn_id: VALID_TURN_ID },
+    });
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.code).toBe('MESSAGE_ALREADY_EXISTS');
+
+    const logCalls = warnSpy.mock.calls
+      .map((args) => args[0])
+      .filter((s) => typeof s === 'string' && s.includes('autonomous_comment.duplicate'));
+    expect(logCalls.length).toBeGreaterThan(0);
+    const parsed = JSON.parse(logCalls[0]);
+    expect(parsed.code).toBe('MESSAGE_ALREADY_EXISTS');
+    expect(parsed.actor_role).toBe('admin');
+  });
+
+  it('plain user is denied with 403 and emits denied log (shared_readonly path)', async () => {
+    mockGetServerSession.mockResolvedValue(plainUserSession());
+    setupAutonomousConversation({});
+
+    const res = await postAutonomousComment({
+      message_id: VALID_USER_MSG_ID,
+      role: 'user',
+      content: 'x',
+      metadata: { turn_id: VALID_TURN_ID },
+    });
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.code).toBe('FORBIDDEN');
+
+    const logCalls = warnSpy.mock.calls
+      .map((args) => args[0])
+      .filter((s) => typeof s === 'string' && s.includes('autonomous_comment.denied'));
+    expect(logCalls.length).toBeGreaterThan(0);
+    const parsed = JSON.parse(logCalls[0]);
+    expect(parsed.code).toBe('READ_ONLY');
+    expect(parsed.actor_role).toBe('user');
+  });
+});

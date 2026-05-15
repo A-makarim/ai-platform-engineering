@@ -29,6 +29,7 @@ import { AGENT_LOGOS } from "@/components/shared/AgentLogos";
 import { MetadataInputForm, type UserInputMetadata, type InputField } from "./MetadataInputForm";
 import { SlashCommandMenu, getFilteredCommands, type SlashCommand } from "./SlashCommandMenu";
 import { useSlashCommands } from "./useSlashCommands";
+import { v4 as uuidv4 } from "uuid";
 
 type ReadOnlyReason = 'admin_audit' | 'shared_readonly' | 'agent_deleted' | 'agent_disabled';
 
@@ -392,8 +393,17 @@ export function SupervisorChatPanel({ endpoint, conversationId, conversationTitl
     const postCleanConv = useChatStore.getState().conversations.find((c: any) => c.id === convId);
     console.log(`[A2A-DEBUG] 🧹 POST-CLEAR event count: ${postCleanConv?.a2aEvents?.length ?? 0}`);
 
-    // Add user message - generate turnId for this request/response pair
-    const turnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    // Add user message - generate turnId for this request/response pair.
+    // Autonomous threads use a strict `manual-<uuid>` / `manual:<uuid>` /
+    // `asst:<uuid>` namespace so the strict POST /messages branch accepts the
+    // follow-up; non-autonomous threads keep the legacy id format.
+    const isAutonomousThread =
+      (conversation as { source?: string } | undefined)?.source === 'autonomous';
+    const turnId = isAutonomousThread
+      ? `manual-${uuidv4()}`
+      : `turn-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    const userMessageId = isAutonomousThread ? `manual:${uuidv4()}` : undefined;
+    const assistantMessageId = isAutonomousThread ? `asst:${uuidv4()}` : undefined;
     addMessage(convId, {
       role: "user",
       content: messageToSend,
@@ -401,10 +411,12 @@ export function SupervisorChatPanel({ endpoint, conversationId, conversationTitl
       senderEmail: session?.user?.email ?? undefined,
       senderName: session?.user?.name ?? undefined,
       senderImage: session?.user?.image ?? undefined,
-    }, turnId);
+    }, turnId, userMessageId);
 
-    // Add assistant message placeholder with same turnId
-    const assistantMsgId = addMessage(convId, { role: "assistant", content: "" }, turnId);
+    // Add assistant message placeholder with same turnId.
+    // For autonomous threads the assistant id MUST also be passed explicitly so
+    // saveMessagesToServer's POST passes the AUTONOMOUS_MSG_ID_RE check on the server.
+    const assistantMsgId = addMessage(convId, { role: "assistant", content: "" }, turnId, assistantMessageId);
 
     // Create the appropriate client and stream based on whether a dynamic agent is selected.
     // Dynamic agents use SSE events, default supervisor uses A2A events.

@@ -96,7 +96,11 @@ export const POST = withErrorHandler(
         session,
       );
 
-      if (access_level === "admin_audit" || access_level === "shared_readonly") {
+      if (
+        access_level === "admin_audit" ||
+        access_level === "shared_readonly" ||
+        access_level === "autonomous_comment"
+      ) {
         throw new ApiError(
           "Read-only access — cannot write turns",
           403,

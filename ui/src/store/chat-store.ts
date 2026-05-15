@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
+import { v5 as uuidv5 } from "uuid";
 import { Conversation, ChatMessage, A2AEvent, MessageFeedback, TurnStatus, getAgentId, isDynamicAgentConversation, buildParticipants } from "@/types/a2a";
 import { StreamEvent } from "@/components/dynamic-agents/sse-types";
 import { generateId } from "@/lib/utils";
@@ -8,6 +9,93 @@ import type { StreamAdapter } from "@/lib/streaming";
 import { apiClient } from "@/lib/api-client";
 import { getStorageMode, shouldUseLocalStorage } from "@/lib/storage-config";
 import { getConfig } from "@/lib/config";
+
+/**
+ * UUID5 namespace for canonical autonomous conversation ids. MUST equal
+ * `AUTONOMOUS_NS` in `synthesize-conversation.ts` and `_AUTONOMOUS_NS` in
+ * `services/chat_history.py`. Inlined here to avoid pulling the autonomous
+ * module into the chat-store's eager import graph.
+ */
+const AUTONOMOUS_NS = "4b2c0d6e-5b71-4f4a-9b4d-7c1e9f0a2b8e";
+
+/**
+ * Compute the canonical UUIDv5 conversation id for an autonomous task.
+ * Mirrors `canonicalConversationId(task)` for the (no chat_conversation_id)
+ * fallback path, which is the path alias rows in MongoDB take.
+ */
+function canonicalAutonomousConvId(taskId: string): string {
+  return uuidv5(`task:${taskId}`, AUTONOMOUS_NS);
+}
+
+/**
+ * Collapse alias autonomous conversations sharing the same `task_id` into a
+ * single canonical row, deduped by message id. Used by both load paths
+ * (Mongo via `loadConversationsFromServer`, synth via
+ * `loadAutonomousConversationsFromService`) so alias rows arriving via either
+ * route surface as one sidebar entry.
+ *
+ * Rules:
+ *   - Only operates on `source === 'autonomous'` rows; non-autonomous rows pass through.
+ *   - Rows without a `task_id` are not deduped (no key to match on).
+ *   - Same-title-different-task rows remain distinct (we never key on title).
+ *   - Canonical pick: the row whose `id` matches `canonicalAutonomousConvId(task_id)`,
+ *     falling back to the first row in the group when no canonical exists.
+ *   - Messages from alias rows are folded in (deduped by message id) so manual
+ *     follow-ups typed against an alias survive the merge.
+ *   - `a2aEvents` / `streamEvents` from the canonical row are preserved as-is
+ *     (the synth path aggregates these across runs; alias rows are noise).
+ */
+export function mergeAutonomousByTaskId(conversations: Conversation[]): Conversation[] {
+  const autonomous: Conversation[] = [];
+  const others: Conversation[] = [];
+  for (const c of conversations) {
+    if (c.source === 'autonomous' && c.task_id) {
+      autonomous.push(c);
+    } else {
+      others.push(c);
+    }
+  }
+  if (autonomous.length === 0) return conversations;
+
+  const byTaskId = new Map<string, Conversation[]>();
+  for (const c of autonomous) {
+    const list = byTaskId.get(c.task_id!) ?? [];
+    list.push(c);
+    byTaskId.set(c.task_id!, list);
+  }
+
+  const merged: Conversation[] = [];
+  for (const [taskId, group] of byTaskId.entries()) {
+    if (group.length === 1) {
+      merged.push(group[0]);
+      continue;
+    }
+
+    const canonicalId = canonicalAutonomousConvId(taskId);
+    const canonical = group.find((c) => c.id === canonicalId) ?? group[0];
+    const aliases = group.filter((c) => c !== canonical);
+
+    const seenMessageIds = new Set<string>(canonical.messages.map((m) => m.id));
+    const foldedMessages: ChatMessage[] = [...canonical.messages];
+    for (const alias of aliases) {
+      for (const msg of alias.messages) {
+        if (!seenMessageIds.has(msg.id)) {
+          foldedMessages.push(msg);
+          seenMessageIds.add(msg.id);
+        }
+      }
+    }
+
+    foldedMessages.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+
+    merged.push({
+      ...canonical,
+      messages: foldedMessages,
+    });
+  }
+
+  return [...others, ...merged];
+}
 
 // Track streaming state per conversation
 interface StreamingState {
@@ -1008,8 +1096,16 @@ const storeImplementation = (set: any, get: any) => ({
             console.log(`[ChatStore] Keeping ${localOnlyPreserved.length} local-only conversations (streaming or active audit/shared)`);
           }
 
-          const allConversations = [...serverConversations, ...localOnlyPreserved];
-          const sortedConversations = allConversations.sort(compareConversationsForSidebar);
+          // Dedupe alias autonomous rows by task_id BEFORE sorting — Mongo can
+          // contain legacy rows whose `_id` is not the canonical UUIDv5 for the
+          // task. Without this collapse the sidebar shows two rows for the
+          // same autonomous task on first load (before the 30s autonomous
+          // resync via loadAutonomousConversationsFromService runs).
+          const dedupedConversations = mergeAutonomousByTaskId([
+            ...serverConversations,
+            ...localOnlyPreserved,
+          ]);
+          const sortedConversations = dedupedConversations.sort(compareConversationsForSidebar);
 
           // Check if active conversation was deleted on another device
           const activeId = currentState.activeConversationId;
@@ -1170,7 +1266,12 @@ const storeImplementation = (set: any, get: any) => ({
           });
 
           const others = state.conversations.filter((c) => c.source !== 'autonomous');
-          const final = [...others, ...merged].sort(
+          // Dedupe alias autonomous rows that share `task_id` but live under
+          // a non-canonical id (e.g. legacy Mongo rows). The synth path always
+          // produces canonical UUIDv5 ids, so this collapses any alias rows
+          // that landed via `loadConversationsFromServer` ahead of this resync.
+          const dedupedAutonomous = mergeAutonomousByTaskId(merged);
+          const final = [...others, ...dedupedAutonomous].sort(
             compareConversationsForSidebar,
           );
           return { conversations: final };

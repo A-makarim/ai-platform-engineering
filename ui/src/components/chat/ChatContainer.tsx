@@ -132,8 +132,16 @@ export function ChatContainer() {
         setConversation(localConv);
         setActiveConversation(uuid);
 
-        // Derive access level from store data
-        if (localConv.owner_id && session?.user?.email && localConv.owner_id !== session.user.email) {
+        // Derive access level from store data so the panel doesn't flash
+        // read-only before the GET response from the server lands.
+        // Autonomous threads owned by the publisher (`autonomous@system`)
+        // are read-only for plain users but writable for admin / admin-view
+        // sessions via the new `autonomous_comment` access level.
+        const sessionIsPrivilegedViewer =
+          session?.role === 'admin' || session?.canViewAdmin === true;
+        if ((localConv as { source?: string }).source === 'autonomous' && sessionIsPrivilegedViewer) {
+          setAccessLevel('autonomous_comment');
+        } else if (localConv.owner_id && session?.user?.email && localConv.owner_id !== session.user.email) {
           if (localConv.sharing?.is_public) {
             setAccessLevel('shared_readonly');
           } else if (localConv.sharing?.shared_with?.includes(session.user.email) ||

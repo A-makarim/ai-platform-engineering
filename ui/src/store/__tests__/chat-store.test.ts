@@ -50,7 +50,7 @@ jest.mock('@/lib/timeline-manager', () => ({
 // Imports — after mocks
 // ============================================================================
 
-import { useChatStore } from '../chat-store';
+import { useChatStore, mergeAutonomousByTaskId } from '../chat-store';
 import { apiClient } from '@/lib/api-client';
 import type { Conversation, ChatMessage } from '@/types/a2a';
 
@@ -2348,6 +2348,236 @@ describe('chat-store', () => {
       const updated = useChatStore.getState().conversations[0];
       expect(updated.a2aEvents).toHaveLength(1);
       expect(updated.a2aEvents?.[0].id).toBe('new-evt');
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // mergeAutonomousByTaskId — direct unit tests for the dedupe helper
+  // --------------------------------------------------------------------------
+
+  describe('mergeAutonomousByTaskId — alias dedupe by task_id', () => {
+    // Canonical UUIDv5 for 'task:t1' under the AUTONOMOUS_NS namespace —
+    // pinned by synthesize-conversation tests.
+    const CANONICAL_T1 = 'a25e9fc5-8be0-528f-98d8-e2fd6f73dcc8';
+
+    function makeAutonomousConv(overrides: Partial<Conversation>): Conversation {
+      return makeConversation({
+        source: 'autonomous',
+        a2aEvents: [],
+        streamEvents: [],
+        ...overrides,
+      });
+    }
+
+    it('passes non-autonomous rows through untouched', () => {
+      const web1 = makeConversation({ id: 'web-1', source: 'web' });
+      const web2 = makeConversation({ id: 'web-2' });
+      const out = mergeAutonomousByTaskId([web1, web2]);
+      expect(out).toHaveLength(2);
+    });
+
+    it('passes autonomous rows without task_id through untouched (no key to dedupe on)', () => {
+      const auto = makeAutonomousConv({ id: 'auto-no-task', source: 'autonomous' });
+      const out = mergeAutonomousByTaskId([auto]);
+      expect(out).toHaveLength(1);
+      expect(out[0].id).toBe('auto-no-task');
+    });
+
+    it('keeps a single autonomous row when no aliases share its task_id', () => {
+      const auto = makeAutonomousConv({
+        id: CANONICAL_T1,
+        source: 'autonomous',
+        task_id: 't1',
+      });
+      const out = mergeAutonomousByTaskId([auto]);
+      expect(out).toHaveLength(1);
+      expect(out[0].id).toBe(CANONICAL_T1);
+    });
+
+    it('collapses alias + canonical rows for the same task_id, keeping the canonical id', () => {
+      const aliasMsg = makeMessage({
+        id: 'manual:abc',
+        role: 'user',
+        content: 'follow-up on alias row',
+      });
+      const canonicalMsg = makeMessage({
+        id: 'task:t1:creation_intent',
+        role: 'user',
+        content: 'created',
+      });
+
+      const alias = makeAutonomousConv({
+        id: '00000000-0000-4000-8000-000000000099',
+        source: 'autonomous',
+        task_id: 't1',
+        title: 'alias row',
+        messages: [aliasMsg],
+      });
+      const canonical = makeAutonomousConv({
+        id: CANONICAL_T1,
+        source: 'autonomous',
+        task_id: 't1',
+        title: 'canonical row',
+        messages: [canonicalMsg],
+      });
+
+      const out = mergeAutonomousByTaskId([alias, canonical]);
+
+      expect(out).toHaveLength(1);
+      expect(out[0].id).toBe(CANONICAL_T1);
+      // Alias's manual follow-up message must survive the merge.
+      const ids = out[0].messages.map((m) => m.id);
+      expect(ids).toContain('manual:abc');
+      expect(ids).toContain('task:t1:creation_intent');
+    });
+
+    it('falls back to first row when no canonical id exists in the group', () => {
+      const a = makeAutonomousConv({
+        id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        source: 'autonomous',
+        task_id: 't1',
+        messages: [makeMessage({ id: 'msg-a' })],
+      });
+      const b = makeAutonomousConv({
+        id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+        source: 'autonomous',
+        task_id: 't1',
+        messages: [makeMessage({ id: 'msg-b' })],
+      });
+
+      const out = mergeAutonomousByTaskId([a, b]);
+
+      expect(out).toHaveLength(1);
+      // Neither id is the canonical UUIDv5, so first wins.
+      expect(out[0].id).toBe('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+      expect(out[0].messages.map((m) => m.id)).toEqual(
+        expect.arrayContaining(['msg-a', 'msg-b']),
+      );
+    });
+
+    it('does NOT dedupe by title — same-title-different-task rows remain distinct', () => {
+      const t1 = makeAutonomousConv({
+        id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        source: 'autonomous',
+        task_id: 't1',
+        title: 'Cleanup',
+      });
+      const t2 = makeAutonomousConv({
+        id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+        source: 'autonomous',
+        task_id: 't2',
+        title: 'Cleanup',
+      });
+
+      const out = mergeAutonomousByTaskId([t1, t2]);
+
+      expect(out).toHaveLength(2);
+    });
+
+    it('does not duplicate messages when alias and canonical share an id', () => {
+      const sharedMsg = makeMessage({ id: 'task:t1:creation_intent', content: 'shared' });
+      const alias = makeAutonomousConv({
+        id: '00000000-0000-4000-8000-000000000099',
+        source: 'autonomous',
+        task_id: 't1',
+        messages: [sharedMsg],
+      });
+      const canonical = makeAutonomousConv({
+        id: CANONICAL_T1,
+        source: 'autonomous',
+        task_id: 't1',
+        messages: [sharedMsg],
+      });
+
+      const out = mergeAutonomousByTaskId([alias, canonical]);
+      expect(out).toHaveLength(1);
+      const sharedCount = out[0].messages.filter((m) => m.id === 'task:t1:creation_intent').length;
+      expect(sharedCount).toBe(1);
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // loadConversationsFromServer — alias dedupe (Mongo path, no synth resync)
+  // --------------------------------------------------------------------------
+
+  describe('loadConversationsFromServer — alias dedupe by task_id', () => {
+    const CANONICAL_T1 = 'a25e9fc5-8be0-528f-98d8-e2fd6f73dcc8';
+
+    it('collapses two autonomous Mongo rows sharing task_id to a single canonical sidebar entry', async () => {
+      const now = new Date().toISOString();
+      mockApiClient.getConversations.mockResolvedValue({
+        items: [
+          {
+            _id: '00000000-0000-4000-8000-000000000099',
+            title: 'alias row',
+            source: 'autonomous',
+            task_id: 't1',
+            created_at: now,
+            updated_at: now,
+          } as any,
+          {
+            _id: CANONICAL_T1,
+            title: 'canonical row',
+            source: 'autonomous',
+            task_id: 't1',
+            created_at: now,
+            updated_at: now,
+          } as any,
+        ],
+        total: 2,
+        page: 1,
+        page_size: 100,
+        has_more: false,
+      });
+
+      await useChatStore.getState().loadConversationsFromServer();
+
+      const conversations = useChatStore.getState().conversations;
+      const autonomous = conversations.filter((c) => c.source === 'autonomous');
+      expect(autonomous).toHaveLength(1);
+      expect(autonomous[0].id).toBe(CANONICAL_T1);
+    });
+
+    it('keeps non-autonomous Mongo rows distinct even when alias collapse runs', async () => {
+      const now = new Date().toISOString();
+      mockApiClient.getConversations.mockResolvedValue({
+        items: [
+          {
+            _id: '00000000-0000-4000-8000-000000000099',
+            title: 'alias',
+            source: 'autonomous',
+            task_id: 't1',
+            created_at: now,
+            updated_at: now,
+          } as any,
+          {
+            _id: CANONICAL_T1,
+            title: 'canonical',
+            source: 'autonomous',
+            task_id: 't1',
+            created_at: now,
+            updated_at: now,
+          } as any,
+          {
+            _id: 'web-1',
+            title: 'web',
+            source: 'web',
+            created_at: now,
+            updated_at: now,
+          } as any,
+        ],
+        total: 3,
+        page: 1,
+        page_size: 100,
+        has_more: false,
+      });
+
+      await useChatStore.getState().loadConversationsFromServer();
+
+      const ids = useChatStore.getState().conversations.map((c) => c.id);
+      expect(ids).toContain('web-1');
+      expect(ids).toContain(CANONICAL_T1);
+      expect(ids).not.toContain('00000000-0000-4000-8000-000000000099');
     });
   });
 
