@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
-import inspect
 import logging
 import re
 import uuid
@@ -25,11 +24,9 @@ from a2a.types import (
     TextPart,
 )
 from a2a.utils import new_agent_text_message, new_task, new_text_artifact
-from ai_platform_engineering.multi_agents.platform_engineer.deep_agent import ENABLE_USER_INFO_TOOL
 from ai_platform_engineering.multi_agents.platform_engineer.protocol_bindings.a2a.agent import (
     AIPlatformEngineerA2ABinding
 )
-from ai_platform_engineering.utils.auth.jwt_context import get_jwt_user_context
 from cnoe_agent_utils.tracing import extract_trace_id_from_context
 from langchain_core.messages.base import message_to_dict
 from langgraph.types import Command
@@ -902,6 +899,169 @@ class AIPlatformEngineerA2AExecutor(AgentExecutor):
         logger.info(f"Task {task.id} completed (stream end, {state.sub_agents_completed} sub-agents).")
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Preflight (autonomous-agents acknowledgement on task creation)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_message_metadata(message) -> dict:
+        """Pull metadata off the A2A Message regardless of which slot it lives in.
+
+        The a2a-sdk has historically attached metadata as either a top-level
+        ``message.metadata`` attribute OR inside a DataPart on the message.
+        Probing both keeps us robust across SDK versions and across clients
+        that put their hint in either place.
+        """
+        meta: dict = {}
+        if message is None:
+            return meta
+
+        top_meta = getattr(message, "metadata", None)
+        if isinstance(top_meta, dict):
+            meta.update(top_meta)
+
+        parts = getattr(message, "parts", None) or []
+        for part in parts:
+            data = None
+            if hasattr(part, "root") and hasattr(part.root, "data"):
+                data = part.root.data
+            elif hasattr(part, "data"):
+                data = part.data
+            elif isinstance(part, dict) and "data" in part:
+                data = part.get("data")
+            if isinstance(data, dict):
+                # Only adopt keys we know are metadata-shaped to avoid eating
+                # form payloads. autonomous-agents sends agent / preflight /
+                # llm_provider / user_email and nothing else.
+                for key in ("preflight", "agent", "llm_provider", "user_email", "user_id"):
+                    if key in data and key not in meta:
+                        meta[key] = data[key]
+        return meta
+
+    def _build_preflight_ack(self, prompt: str, agent_hint: str | None,
+                             llm_provider: str | None) -> dict:
+        """Build a structured Acknowledgement payload without executing tools.
+
+        This is intentionally a *light* preflight — it confirms the routing
+        path is viable (sub-agent is loaded, tools are visible) but does NOT
+        actually invoke any sub-agent or call any external API. Operators
+        get fail-fast feedback for the high-leverage failure modes
+        (disabled agent, typo'd agent name) at task-creation time without
+        burning LLM tokens or hitting upstream APIs every time someone
+        edits a task.
+
+        Heavier preflight (real credential probes, dry-run tool routing
+        through the LLM) is intentionally out of scope for this first
+        iteration — see spec #099 for the planned follow-up.
+        """
+        from datetime import datetime, timezone
+
+        # Probe the MAS for what's actually loaded.  ``get_subagent_tools()``
+        # returns the snapshot captured at graph build time so this call is
+        # synchronous and free of side effects.
+        try:
+            subagent_tools = self.agent._mas_instance.get_subagent_tools()
+        except Exception as e:
+            # If the MAS isn't initialized yet (cold start), report that
+            # explicitly rather than crash — autonomous-agents will retry.
+            logger.warning(f"preflight: MAS not ready: {e}")
+            return {
+                "ack_status": "warn",
+                "ack_detail": f"Supervisor MAS not yet initialized: {e}",
+                "routed_to": None,
+                "tools": [],
+                "available_agents": [],
+                "credentials_status": {},
+                "dry_run_summary": "Supervisor is still loading sub-agents; retry in a few seconds.",
+                "ack_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        available_agents = sorted(subagent_tools.keys())
+        normalized_hint = (agent_hint or "").strip().lower() or None
+
+        if normalized_hint:
+            if normalized_hint in subagent_tools:
+                tools = subagent_tools[normalized_hint]
+                summary = (
+                    f"Will route to '{normalized_hint}' sub-agent which has "
+                    f"{len(tools)} tool(s) loaded. LLM provider: "
+                    f"{llm_provider or 'supervisor default'}."
+                )
+                return {
+                    "ack_status": "ok",
+                    "ack_detail": "Sub-agent loaded; ready for scheduled execution.",
+                    "routed_to": normalized_hint,
+                    "tools": tools,
+                    "available_agents": available_agents,
+                    "credentials_status": {},  # heavy probes deferred
+                    "dry_run_summary": summary,
+                    "ack_at": datetime.now(timezone.utc).isoformat(),
+                }
+            return {
+                "ack_status": "failed",
+                "ack_detail": (
+                    f"Sub-agent '{normalized_hint}' is not loaded in this supervisor. "
+                    f"Enable ENABLE_{normalized_hint.upper()}=true and restart, "
+                    f"or pick from {available_agents}."
+                ),
+                "routed_to": None,
+                "tools": [],
+                "available_agents": available_agents,
+                "credentials_status": {},
+                "dry_run_summary": (
+                    f"Routing target '{normalized_hint}' is unknown. Task will fail at "
+                    f"each scheduled run until this is resolved."
+                ),
+                "ack_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        # No agent hint — supervisor LLM router will pick at runtime.
+        return {
+            "ack_status": "ok",
+            "ack_detail": "No agent hint provided; LLM router will dispatch at run time.",
+            "routed_to": None,
+            "tools": [],
+            "available_agents": available_agents,
+            "credentials_status": {},
+            "dry_run_summary": (
+                f"At each scheduled run the supervisor's LLM will pick from "
+                f"{len(available_agents)} loaded sub-agents based on the prompt: "
+                f"{available_agents}."
+            ),
+            "ack_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    async def _handle_preflight(self, query: str, metadata: dict, task: A2ATask,
+                                event_queue: EventQueue) -> None:
+        """Short-circuit execute() with a structured Acknowledgement.
+
+        Emits exactly one ``preflight_ack`` artifact (as a DataPart) and a
+        terminal completion event, then returns. No LLM call, no sub-agent
+        invocation, no tool execution.
+        """
+        agent_hint = metadata.get("agent")
+        llm_provider = metadata.get("llm_provider")
+        ack_payload = self._build_preflight_ack(
+            prompt=query or "",
+            agent_hint=agent_hint,
+            llm_provider=llm_provider,
+        )
+
+        artifact = new_data_artifact(
+            name="preflight_ack",
+            description="Pre-flight acknowledgement from supervisor",
+            data=ack_payload,
+        )
+        await self._send_artifact(event_queue, task, artifact, append=False, last_chunk=True)
+        await self._send_completion(event_queue, task)
+        logger.info(
+            "preflight: status=%s routed_to=%s tools=%d agents=%d",
+            ack_payload.get("ack_status"),
+            ack_payload.get("routed_to"),
+            len(ack_payload.get("tools", [])),
+            len(ack_payload.get("available_agents", [])),
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Main Execute Method
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -920,6 +1080,15 @@ class AIPlatformEngineerA2AExecutor(AgentExecutor):
             if not task:
                 raise Exception("Failed to create task")
             await self._safe_enqueue_event(event_queue, task)
+
+        # Pre-flight short-circuit (autonomous-agents calls this on task
+        # create/update to surface fail-fast errors — broken token, disabled
+        # sub-agent, typo'd agent name — before the first scheduled run
+        # rather than at 3 AM when the cron fires.  See spec #099.
+        msg_meta = self._extract_message_metadata(context.message)
+        if msg_meta.get("preflight"):
+            await self._handle_preflight(query or "", msg_meta, task, event_queue)
+            return
 
         # Extract trace_id from A2A context (or generate if root)
         trace_id = extract_trace_id_from_context(context)
@@ -1074,92 +1243,21 @@ class AIPlatformEngineerA2AExecutor(AgentExecutor):
                     query = None  # Don't use query when resuming
                     logger.info(f"📦 Constructed resume Command from form text for task {task.id}")
 
-        # Extract user identity — prefer server-side JWT claims (ENABLE_USER_INFO_TOOL=true),
-        # fall back to the "by user: email" prefix injected by the UI.
+        # Extract user email from "by user: email\n\n..." prefix injected by UI
         user_email = None
-        user_name = None
-        user_groups = None
-
-        if ENABLE_USER_INFO_TOOL:
-            jwt_ctx = get_jwt_user_context()
-            if jwt_ctx and jwt_ctx.email != "unknown":
-                user_email = jwt_ctx.email
-                user_name = jwt_ctx.name
-                user_groups = jwt_ctx.groups
-                logger.info(
-                    f"📧 User context from JWT: email={user_email}, "
-                    f"name={user_name}, groups_count={len(user_groups or [])}"
-                )
-
-        if not user_email:
-            raw_query = context.get_user_input() or ""
-            if raw_query.startswith("by user: "):
-                first_line = raw_query.split("\n", 1)[0]
-                user_email = first_line.replace("by user: ", "").strip()
-                if user_email:
-                    logger.info(f"📧 Extracted user email from message prefix: {user_email}")
-
-        # Extract user_id from A2A message metadata (set by client or gateway),
-        # falling back to the email extracted from the query prefix.
-        user_id = None
-        obo_token = None
-        if context.message and context.message.metadata:
-            meta = context.message.metadata
-            if isinstance(meta, dict):
-                user_id = meta.get("user_id") or meta.get("user_email")
-                obo_token = meta.get("obo_token") or meta.get("access_token")
-        if not user_id and user_email:
-            user_id = user_email
-
-        # OBO exchange: if we have a user access token but no OBO-specific token,
-        # exchange it via Keycloak for an OBO token (FR-038d).
-        if obo_token:
-            try:
-                from ai_platform_engineering.utils.obo_exchange import (
-                    exchange_token_for_supervisor,
-                )
-                import os
-                if os.getenv("AGENT_GATEWAY_URL"):
-                    obo_result = await exchange_token_for_supervisor(obo_token)
-                    if obo_result:
-                        obo_token = obo_result.access_token
-                        logger.info("OBO token exchange succeeded for user delegation")
-                    else:
-                        logger.warning(
-                            "OBO exchange failed — using original access token"
-                        )
-            except Exception as exc:
-                logger.warning("OBO exchange import/call error: %s", exc)
+        raw_query = context.get_user_input() or ""
+        if raw_query.startswith("by user: "):
+            first_line = raw_query.split("\n", 1)[0]
+            user_email = first_line.replace("by user: ", "").strip()
+            if user_email:
+                logger.info(f"📧 Extracted user email from message: {user_email}")
 
         # Initialize state
         state = StreamState()
         state.trace_id = trace_id
 
         try:
-            # Smart-merge: combine RBAC's OBO/user_id propagation (PR #1257) with
-            # 1145's user_name/user_groups JWT-claim forwarding. RBAC's executor
-            # sets attributes on the agent for `obo_token`, then uses
-            # inspect.signature to safely pass `user_id`/`obo_token` only if the
-            # current `agent.stream` signature accepts them. We always pass
-            # `user_name`/`user_groups` because the merged `agent.stream`
-            # signature accepts them (verified at merge time).
-            self.agent._pending_user_email = user_email
-            if obo_token:
-                self.agent._obo_token = obo_token
-            stream_params = inspect.signature(self.agent.stream).parameters
-            stream_kwargs = {"user_id": user_id} if "user_id" in stream_params else {}
-            if "obo_token" in stream_params and obo_token:
-                stream_kwargs["obo_token"] = obo_token
-            async for event in self.agent.stream(
-                query,
-                context_id,
-                trace_id,
-                command=resume_cmd,
-                user_email=user_email,
-                user_name=user_name,
-                user_groups=user_groups,
-                **stream_kwargs,
-            ):
+            async for event in self.agent.stream(query, context_id, trace_id, command=resume_cmd, user_email=user_email):
                 # Drain remaining events after the executor has finished
                 # processing to let the LangGraph generator close naturally.
                 if state.stream_finished:

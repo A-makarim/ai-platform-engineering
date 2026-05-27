@@ -14,10 +14,12 @@ import { render, screen, waitFor } from "@testing-library/react";
 // ============================================================================
 
 const mockReplace = jest.fn();
-const mockFetch = jest.fn();
+const mockPush = jest.fn();
+let mockSearchParams = new URLSearchParams();
 
 jest.mock("next/navigation", () => ({
-  useRouter: () => ({ replace: mockReplace, push: jest.fn() }),
+  useRouter: () => ({ replace: mockReplace, push: mockPush }),
+  useSearchParams: () => mockSearchParams,
 }));
 
 jest.mock("next-auth/react", () => ({
@@ -30,6 +32,7 @@ jest.mock("@/lib/config", () => ({
     if (key === "appName") return "Test App";
     if (key === "logoStyle") return "default";
     if (key === "ssoEnabled") return false;
+    if (key === "autonomousAgentsEnabled") return true;
     return undefined;
   }),
   getLogoFilterClass: jest.fn(() => ""),
@@ -39,11 +42,12 @@ jest.mock("@/lib/storage-config", () => ({
   getStorageMode: () => "mongodb",
 }));
 
-const mockCreateConversation = jest.fn(() => "new-conv-id");
+const mockCreateConversation = jest.fn().mockResolvedValue("new-conv-id");
 const mockLoadConversationsFromServer = jest.fn().mockResolvedValue(undefined);
+const mockLoadAutonomousConversationsFromService = jest.fn().mockResolvedValue(undefined);
+
 let mockConversations: any[] = [];
 let mockActiveConversationId: string | null = null;
-const mockGetLastActiveConversationId = jest.fn(() => null);
 
 jest.mock("@/store/chat-store", () => {
   const getState = () => ({
@@ -55,6 +59,7 @@ jest.mock("@/store/chat-store", () => {
     const state = {
       createConversation: mockCreateConversation,
       loadConversationsFromServer: mockLoadConversationsFromServer,
+      loadAutonomousConversationsFromService: mockLoadAutonomousConversationsFromService,
       conversations: mockConversations,
       activeConversationId: mockActiveConversationId,
     };
@@ -65,10 +70,7 @@ jest.mock("@/store/chat-store", () => {
   store.setState = jest.fn();
   store.subscribe = jest.fn();
 
-  return {
-    useChatStore: store,
-    getLastActiveConversationId: () => mockGetLastActiveConversationId(),
-  };
+  return { useChatStore: store };
 });
 
 jest.mock("@/components/auth-guard", () => ({
@@ -88,13 +90,12 @@ import Chat from "../page";
 describe("Chat Redirect Page", () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    global.fetch = mockFetch;
-    mockFetch.mockResolvedValue({
-      json: async () => ({ success: true, data: { default_agent_id: "default-agent" } }),
-    });
+    mockSearchParams = new URLSearchParams();
     mockConversations = [];
     mockActiveConversationId = null;
-    mockGetLastActiveConversationId.mockReturnValue(null);
+    mockLoadConversationsFromServer.mockResolvedValue(undefined);
+    mockLoadAutonomousConversationsFromService.mockResolvedValue(undefined);
+    mockCreateConversation.mockResolvedValue("new-conv-id");
   });
 
   it("renders CAIPESpinner with branded loading message", () => {
@@ -115,43 +116,57 @@ describe("Chat Redirect Page", () => {
     expect(oldSpinner).not.toBeInTheDocument();
   });
 
-  it("redirects to the persisted last active conversation after reload", async () => {
-    mockGetLastActiveConversationId.mockReturnValue("conv-2");
+  it("source=autonomous selects an autonomous conversation instead of a normal conversation", async () => {
+    mockSearchParams = new URLSearchParams("source=autonomous");
+    mockActiveConversationId = "normal-conv";
     mockConversations = [
       {
-        id: "conv-1",
+        id: "normal-conv",
+        title: "Normal",
         owner_id: "test@example.com",
-        updatedAt: new Date("2026-05-18T09:00:00Z"),
+        source: "web",
+        updatedAt: new Date("2026-01-02"),
       },
       {
-        id: "conv-2",
+        id: "auto-conv",
+        title: "Auto",
         owner_id: "test@example.com",
-        updatedAt: new Date("2026-05-18T08:00:00Z"),
+        source: "autonomous",
+        updatedAt: new Date("2026-01-01"),
       },
     ];
 
     render(<Chat />);
 
-    await waitFor(() => expect(mockReplace).toHaveBeenCalledWith("/chat/conv-2"));
+    await waitFor(() => {
+      expect(mockLoadConversationsFromServer).toHaveBeenCalledWith({ source: "autonomous" });
+      expect(mockLoadAutonomousConversationsFromService).toHaveBeenCalled();
+    });
+    await screen.findByText("Loading conversations...");
+
+    await waitFor(() => {
+      expect(mockReplace).toHaveBeenCalledWith("/chat/auto-conv");
+    });
     expect(mockCreateConversation).not.toHaveBeenCalled();
   });
 
-  it("creates a new default-agent conversation when the user has no owned conversations", async () => {
+  it("source=autonomous with no autonomous conversations shows an empty state and does not create a normal chat", async () => {
+    mockSearchParams = new URLSearchParams("source=autonomous");
+    mockConversations = [
+      {
+        id: "normal-conv",
+        title: "Normal",
+        owner_id: "test@example.com",
+        source: "web",
+        updatedAt: new Date("2026-01-02"),
+      },
+    ];
+
     render(<Chat />);
 
-    await waitFor(() => expect(mockCreateConversation).toHaveBeenCalledWith("default-agent"));
-    expect(mockFetch).toHaveBeenCalledWith("/api/admin/platform-config");
-    expect(mockReplace).toHaveBeenCalledWith("/chat/new-conv-id");
-  });
-
-  it("falls back to supervisor when no default agent is configured", async () => {
-    mockFetch.mockResolvedValueOnce({
-      json: async () => ({ success: true, data: { default_agent_id: null } }),
-    });
-
-    render(<Chat />);
-
-    await waitFor(() => expect(mockCreateConversation).toHaveBeenCalledWith(undefined));
-    expect(mockReplace).toHaveBeenCalledWith("/chat/new-conv-id");
+    expect(await screen.findByText("No autonomous task threads yet")).toBeInTheDocument();
+    expect(screen.getByText("Go to Autonomous Agents")).toBeInTheDocument();
+    expect(mockCreateConversation).not.toHaveBeenCalled();
+    expect(mockReplace).not.toHaveBeenCalled();
   });
 });

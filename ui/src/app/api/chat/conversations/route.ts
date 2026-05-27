@@ -11,55 +11,12 @@ import {
   paginatedResponse,
   validateRequired,
   getPaginationParams,
-  requireRbacPermission,
+  getUserTeamIds,
 } from '@/lib/api-middleware';
 import type { Conversation, CreateConversationRequest, ClientType } from '@/types/mongodb';
 import { VALID_CLIENT_TYPES } from '@/types/mongodb';
 import { buildParticipants } from '@/types/a2a';
 import packageJson from '../../../../../package.json';
-import { filterConversationsByImplicitOrExplicitPermission } from '@/lib/rbac/conversation-implicit-authz';
-import { requireAgentUsePermission } from '@/lib/rbac/openfga-agent-authz';
-
-type ConversationWithAgentDisplay = Conversation & {
-  agent_id?: string;
-  agent_name?: string;
-};
-
-function getConversationAgentId(conversation: Conversation): string | undefined {
-  return conversation.participants?.find((participant) => participant.type === 'agent')?.id;
-}
-
-async function enrichConversationAgentNames(
-  items: Conversation[],
-): Promise<ConversationWithAgentDisplay[]> {
-  const agentIds = Array.from(
-    new Set(items.map(getConversationAgentId).filter((id): id is string => Boolean(id))),
-  );
-
-  if (agentIds.length === 0) {
-    return items;
-  }
-
-  const agents = await getCollection<{ _id: string; name?: string }>('dynamic_agents');
-  const agentDocs = await agents
-    .find({ _id: { $in: agentIds } })
-    .project({ _id: 1, name: 1 })
-    .toArray();
-  const agentNames = new Map(agentDocs.map((agent) => [agent._id, agent.name]));
-
-  return items.map((conversation) => {
-    const agentId = getConversationAgentId(conversation);
-    if (!agentId) {
-      return conversation;
-    }
-
-    return {
-      ...conversation,
-      agent_id: agentId,
-      agent_name: agentNames.get(agentId) ?? agentId,
-    };
-  });
-}
 
 // GET /api/chat/conversations
 export const GET = withErrorHandler(async (request: NextRequest) => {
@@ -74,12 +31,15 @@ export const GET = withErrorHandler(async (request: NextRequest) => {
     );
   }
 
-  const { user, session } = await getAuthFromBearerOrSession(request);
+  const { user } = await getAuthFromBearerOrSession(request);
   const { page, pageSize, skip } = getPaginationParams(request);
   const url = new URL(request.url);
   const archived = url.searchParams.get('archived') === 'true';
   const pinned = url.searchParams.get('pinned') === 'true';
   const clientTypeParam = url.searchParams.get('client_type') as ClientType | null;
+  const sourceParam = url.searchParams.get('source');
+  const sourceFilter =
+    sourceParam === 'autonomous' || sourceParam === 'web' ? sourceParam : null;
 
   // Validate client_type param if provided
   if (clientTypeParam && !VALID_CLIENT_TYPES.includes(clientTypeParam)) {
@@ -94,9 +54,25 @@ export const GET = withErrorHandler(async (request: NextRequest) => {
 
   const conversations = await getCollection<Conversation>('conversations');
 
-  // Fetch non-deleted candidates and let the ReBAC filter decide visibility.
-  // Legacy sharing fields are still stored for migration, but no longer prefilter reads.
+  // Resolve user's team memberships for team-shared conversations
+  const userTeamIds = await getUserTeamIds(user.email);
+
+  // Build query — include conversations owned, shared directly, via teams, or public
+  const ownershipConditions: any[] = [
+    { owner_id: user.email },
+    { 'sharing.shared_with': user.email },
+    { 'sharing.is_public': true },
+  ];
+
+  if (userTeamIds.length > 0) {
+    ownershipConditions.push({
+      'sharing.shared_with_teams': { $in: userTeamIds },
+    });
+  }
+
+  // Exclude soft-deleted conversations
   const query: any = {
+    $or: ownershipConditions,
     $and: [
       { $or: [{ deleted_at: null }, { deleted_at: { $exists: false } }] },
     ],
@@ -126,6 +102,23 @@ export const GET = withErrorHandler(async (request: NextRequest) => {
     query.is_pinned = true;
   }
 
+  // Source is a content filter, not an authz primitive — push into $and
+  // to narrow results without touching the ownership $or. The previous
+  // `delete query.$or` for source=autonomous was an IDOR.
+  if (sourceFilter === 'autonomous') {
+    query.$and.push({ source: 'autonomous' });
+  } else if (sourceFilter === 'web') {
+    query.$and.push({
+      source: { $in: ['web', null] } as { $in: (string | null)[] },
+    });
+  } else {
+    // Default ("All") view: include autonomous conversations alongside
+    // regular human chats so the sidebar's "All" filter actually shows
+    // both. Slack threads are still excluded because they have their
+    // own dedicated UI and were never wanted in this list.
+    query.$and.push({ source: { $nin: ['slack'] } });
+  }
+
   // Get total count
   const total = await conversations.countDocuments(query);
 
@@ -137,14 +130,7 @@ export const GET = withErrorHandler(async (request: NextRequest) => {
     .limit(pageSize)
     .toArray();
 
-  const visibleItems = await filterConversationsByImplicitOrExplicitPermission(session, user.email, items);
-
-  return paginatedResponse(
-    await enrichConversationAgentNames(visibleItems),
-    visibleItems.length < items.length ? visibleItems.length : total,
-    page,
-    pageSize
-  );
+  return paginatedResponse(items, total, page, pageSize);
 });
 
 // POST /api/chat/conversations
@@ -160,12 +146,7 @@ export const POST = withErrorHandler(async (request: NextRequest) => {
     );
   }
 
-  // Combine release/0.4.0's dual-auth (bearer token | session) with comprehensive
-  // RBAC enforcement. The bearer path is required by the Slack bot and other
-  // first-party service callers; the RBAC check is required to enforce the
-  // 098-enterprise-rbac scope on supervisor invocations.
-  const { user, session } = await getAuthFromBearerOrSession(request);
-  await requireRbacPermission(session, 'supervisor', 'invoke');
+  const { user } = await getAuthFromBearerOrSession(request);
   const body: CreateConversationRequest = await request.json();
 
   validateRequired(body, ['title', 'client_type']);
@@ -179,17 +160,6 @@ export const POST = withErrorHandler(async (request: NextRequest) => {
       },
       { status: 400 }
     );
-  }
-
-  if (body.agent_id) {
-    const denial = await requireAgentUsePermission({
-      subject: session.sub,
-      agentId: body.agent_id,
-      email: user.email,
-    });
-    if (denial) {
-      return denial;
-    }
   }
 
   const conversations = await getCollection<Conversation>('conversations');
@@ -229,9 +199,6 @@ export const POST = withErrorHandler(async (request: NextRequest) => {
     title: body.title,
     client_type: body.client_type,
     owner_id: ownerId,
-    ...(typeof session.sub === 'string' && session.sub.trim() && ownerId === user.email
-      ? { owner_subject: session.sub.trim(), owner_identity_version: 2 }
-      : {}),
     ...(body.idempotency_key && { idempotency_key: body.idempotency_key }),
     participants: buildParticipants(body.agent_id, ownerId),
     created_at: now,

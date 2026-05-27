@@ -10,7 +10,6 @@ export interface User {
   _id?: ObjectId;
   email: string;
   name: string;
-  keycloak_sub?: string;
   avatar_url?: string;
   created_at: Date;
   updated_at: Date;
@@ -19,7 +18,6 @@ export interface User {
   metadata: {
     sso_provider: string;
     sso_id: string;
-    keycloak_sub?: string;
     role: 'user' | 'admin';
   };
 }
@@ -35,10 +33,10 @@ export interface UserPublicInfo {
 // ============================================================================
 
 /** Valid client types for conversation creation. */
-export type ClientType = 'webui' | 'slack' | 'webex';
+export type ClientType = 'webui' | 'slack';
 
 /** All valid client_type values — used for runtime validation. */
-export const VALID_CLIENT_TYPES: readonly ClientType[] = ['webui', 'slack', 'webex'] as const;
+export const VALID_CLIENT_TYPES: readonly ClientType[] = ['webui', 'slack'] as const;
 
 /**
  * A conversation participant — either an agent or a user.
@@ -56,8 +54,6 @@ export interface Conversation {
   title: string;
   client_type: ClientType; // Top-level: 'webui' | 'slack' (promoted from metadata)
   owner_id: string; // User email
-  owner_subject?: string; // Keycloak subject for schema-versioned ownership checks
-  owner_identity_version?: number; // 2 when owner_subject has been normalized
   idempotency_key?: string; // Maps integration-specific identity (e.g. Slack thread_ts) to conversation_id used by UI/checkpoints
   participants: Participant[]; // Agents and users involved in this conversation
   created_at: Date;
@@ -73,12 +69,6 @@ export interface Conversation {
     agent_version?: string;
     /** @deprecated Kept for backward compat with old conversations */
     model_used?: string;
-    owner_identity_migration?: {
-      migration_id: string;
-      migrated_at: string;
-      migrated_by: string;
-      source_field: 'owner_id';
-    };
   };
   sharing: {
     is_public: boolean;
@@ -93,6 +83,19 @@ export interface Conversation {
   is_archived: boolean;
   is_pinned: boolean;
   deleted_at?: Date | null; // Soft-delete timestamp; null = not deleted; auto-purged after 7 days
+  // Origin marker. The chat sidebar's "All" view shows both human-typed
+  // and autonomous conversations; only `slack` is excluded from the
+  // default listing because Slack threads have their own dedicated UI.
+  // The autonomous_agents service writes conversations with
+  // `source: 'autonomous'` so operators can also pivot the sidebar to
+  // "what did the autonomous agent do today?" via the Autonomous filter
+  // chip. Undefined = legacy human-typed conversation.
+  source?: 'web' | 'slack' | 'autonomous';
+  // Set when `source === 'autonomous'`: the upstream autonomous task
+  // and the specific run that produced this conversation. Lets the
+  // run-history UI deep-link from a run row into the chat thread.
+  task_id?: string;
+  run_id?: string;
 }
 
 // ============================================================================
@@ -192,8 +195,6 @@ export interface UserSettings {
     show_thinking_enabled: string;
     auto_scroll_enabled: string;
     show_timestamps_enabled: string;
-    releaseNotesDismissedVersions?: string[];
-    releaseNotesDismissedAnnouncementIds?: string[];
   };
   notifications: {
     email_enabled: boolean;
@@ -424,26 +425,4 @@ export interface AuditLogFilters {
   date_to?: string;
   include_deleted?: boolean;
   status?: 'active' | 'archived' | 'deleted';
-}
-
-// ============================================================================
-// Webex Bot Collections
-// ============================================================================
-
-/** Single-use nonce for Webex user ↔ Keycloak linking (expires after 10 minutes). */
-export interface WebexLinkNonce {
-  nonce: string;
-  webex_user_id: string;
-  created_at: Date;
-  consumed?: boolean;
-}
-
-/** Operational metrics for Webex bot usage (space-level aggregates). */
-export interface WebexUserMetrics {
-  webex_user_id: string;
-  workspace_id?: string;
-  space_id?: string;
-  event_count?: number;
-  last_seen_at?: string;
-  updated_at?: string;
 }

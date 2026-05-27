@@ -1,24 +1,14 @@
 "use client";
 
 import React, { useEffect, useRef } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useSession } from "next-auth/react";
 import { useChatStore } from "@/store/chat-store";
-import { getLastActiveConversationId } from "@/store/chat-store";
 import { getStorageMode } from "@/lib/storage-config";
+import { getConfig } from "@/lib/config";
 import { AuthGuard } from "@/components/auth-guard";
 import { CAIPESpinner } from "@/components/ui/caipe-spinner";
-
-async function resolveDefaultAgentId(): Promise<string | undefined> {
-  try {
-    const response = await fetch("/api/admin/platform-config");
-    const data = await response.json();
-    const agentId = data?.success ? data.data?.default_agent_id : null;
-    return typeof agentId === "string" && agentId.trim() ? agentId.trim() : undefined;
-  } catch {
-    return undefined;
-  }
-}
+import { Button } from "@/components/ui/button";
 
 /**
  * /chat landing page — resumes the last active conversation, falls back to
@@ -38,27 +28,41 @@ async function resolveDefaultAgentId(): Promise<string | undefined> {
  */
 function ChatRedirectPage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const { data: session } = useSession();
   const redirected = useRef(false);
+  const autonomousOnly = searchParams.get("source") === "autonomous";
+  const autonomousAgentsEnabled = getConfig('autonomousAgentsEnabled');
+  const [showAutonomousEmpty, setShowAutonomousEmpty] = React.useState(false);
 
   const createConversation = useChatStore((s) => s.createConversation);
   const loadConversationsFromServer = useChatStore((s) => s.loadConversationsFromServer);
+  const loadAutonomousConversationsFromService = useChatStore((s) => s.loadAutonomousConversationsFromService);
 
   useEffect(() => {
     if (redirected.current) return;
+    if (autonomousOnly && !autonomousAgentsEnabled) {
+      redirected.current = true;
+      router.replace("/chat");
+      return;
+    }
+    setShowAutonomousEmpty(false);
 
     const resolve = async () => {
       const storageMode = getStorageMode();
 
       // In MongoDB mode, ensure conversations are loaded from the server first
       if (storageMode === "mongodb") {
-        await loadConversationsFromServer();
+        await loadConversationsFromServer(autonomousOnly ? { source: "autonomous" } : undefined);
+      }
+
+      if (autonomousOnly) {
+        await loadAutonomousConversationsFromService();
       }
 
       // Re-read from the store after potential server load
       const state = useChatStore.getState();
       const { conversations: currentConversations, activeConversationId } = state;
-      const lastActiveConversationId = activeConversationId ?? getLastActiveConversationId();
       const userEmail = session?.user?.email;
 
       // Only consider conversations OWNED by the current user for auto-redirect.
@@ -69,25 +73,30 @@ function ChatRedirectPage() {
       const ownedConversations = userEmail
         ? currentConversations.filter((c) => !c.owner_id || c.owner_id === userEmail)
         : currentConversations;
+      const redirectCandidates = autonomousOnly
+        ? ownedConversations.filter((c) => c.source === "autonomous")
+        : ownedConversations;
 
       // 1. Resume the last active conversation if it still exists and is owned
-      if (lastActiveConversationId) {
-        const stillOwned = ownedConversations.some((c) => c.id === lastActiveConversationId);
+      if (activeConversationId) {
+        const stillOwned = redirectCandidates.some((c) => c.id === activeConversationId);
         if (stillOwned) {
           redirected.current = true;
-          router.replace(`/chat/${lastActiveConversationId}`);
+          router.replace(`/chat/${activeConversationId}`);
           return;
         }
       }
 
       // 2. Fall back to the most recent OWNED conversation (sorted by updatedAt)
-      if (ownedConversations.length > 0) {
-        const latestId = ownedConversations[0].id;
+      if (redirectCandidates.length > 0) {
+        const latestId = redirectCandidates[0].id;
         redirected.current = true;
         router.replace(`/chat/${latestId}`);
+      } else if (autonomousOnly) {
+        setShowAutonomousEmpty(true);
       } else {
         // 3. No owned conversations — create a new one
-        const newId = await createConversation(await resolveDefaultAgentId());
+        const newId = await createConversation();
         redirected.current = true;
         router.replace(`/chat/${newId}`);
       }
@@ -97,13 +106,32 @@ function ChatRedirectPage() {
       console.error("[ChatRedirect] Failed to resolve conversation:", error);
       // Fallback: create a new conversation
       if (!redirected.current) {
-        const newId = await createConversation(await resolveDefaultAgentId());
+        if (autonomousOnly) {
+          setShowAutonomousEmpty(true);
+          return;
+        }
+        const newId = await createConversation();
         redirected.current = true;
         router.replace(`/chat/${newId}`);
       }
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [autonomousOnly, autonomousAgentsEnabled, createConversation, loadAutonomousConversationsFromService, loadConversationsFromServer, router, session?.user?.email]);
+
+  if (showAutonomousEmpty) {
+    return (
+      <div className="flex-1 flex items-center justify-center h-full bg-background">
+        <div className="flex flex-col items-center gap-3 text-center">
+          <p className="text-sm font-medium text-foreground">No autonomous task threads yet</p>
+          <p className="max-w-sm text-xs text-muted-foreground">
+            Create or run an autonomous task to generate a thread here.
+          </p>
+          <Button type="button" size="sm" onClick={() => router.push("/autonomous")}>
+            Go to Autonomous Agents
+          </Button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex-1 flex items-center justify-center h-full bg-background">

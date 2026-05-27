@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import { ArrowLeft, Loader2, Globe, Users, ChevronLeft, ChevronRight, Check, Sparkles, Eye, Pencil, GripHorizontal, ChevronDown } from "lucide-react";
+import { ArrowLeft, Loader2, Globe, Users, Lock, ChevronLeft, ChevronRight, Check, Sparkles, Eye, Pencil, GripHorizontal, Bot, ChevronDown } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -36,16 +36,14 @@ import { BuiltinToolsPicker } from "./BuiltinToolsPicker";
 import { InterruptConfigPicker } from "./InterruptConfigPicker";
 import { MiddlewarePicker } from "./MiddlewarePicker";
 import { SubagentPicker } from "./SubagentPicker";
+import { AutonomousTasksStep } from "./AutonomousTasksStep";
+import { syncAutonomousTasks } from "./syncAutonomousTasks";
+import { isTaskOwnedByAgent } from "./taskOwnership";
+import { autonomousApi, AutonomousApiError } from "@/components/autonomous/api";
+import type { AutonomousTask } from "@/components/autonomous/types";
 import { SkillsSelector } from "./SkillsSelector";
-import { WorkflowToolsPicker } from "./WorkflowToolsPicker";
-import { gradientThemes } from "@/lib/gradient-themes";
-import { AgentAvatar } from "./AgentAvatar";
-import {
-  useAiReview,
-  AiReviewButton,
-  AiReviewPanel,
-  buildLastReview,
-} from "@/components/ai-review";
+import { gradientThemes, getGradientStyle, getAccentColor } from "@/lib/gradient-themes";
+import { getConfig } from "@/lib/config";
 
 interface DynamicAgentEditorProps {
   agent: DynamicAgentConfig | null; // null = creating new
@@ -70,34 +68,26 @@ function generateSlug(name: string): string {
   return slug ? `agent-${slug}` : "";
 }
 
-// Visibility picker — `private` was retired on 2026-05-22 (see
-// `docs/docs/changes/2026-05-22-remove-private-agents.md` and the
-// `VisibilityType` definition in `@/types/dynamic-agent`). Every dynamic
-// agent is now team-owned; users who want a truly personal agent should
-// create a single-member team and own the agent through that team.
 const VISIBILITY_OPTIONS: { value: VisibilityType; label: string; icon: React.ReactNode; description: string }[] = [
-  {
-    value: "team",
-    label: "Team",
-    icon: <Users className="h-4 w-4" />,
-    description: "Owner-team members can use; admins can manage. Optionally share with other teams.",
+  { 
+    value: "private", 
+    label: "Private", 
+    icon: <Lock className="h-4 w-4" />,
+    description: "Only you can use this agent" 
   },
-  {
-    value: "global",
-    label: "Global",
+  { 
+    value: "team", 
+    label: "Team", 
+    icon: <Users className="h-4 w-4" />,
+    description: "Share with specific teams" 
+  },
+  { 
+    value: "global", 
+    label: "Global", 
     icon: <Globe className="h-4 w-4" />,
-    description: "Available to all users; owner-team admins manage it.",
+    description: "Available to all users" 
   },
 ];
-
-interface TeamOption {
-  _id: string;
-  name: string;
-  slug?: string;
-  description?: string;
-  user_role?: string | null;
-  can_own_agents?: boolean;
-}
 
 // Step definitions for the wizard
 const STEPS = [
@@ -126,6 +116,11 @@ const STEPS = [
     label: "Advanced", 
     hint: "Subagents, approval rules, and middleware" 
   },
+  {
+    id: "autonomous" as const,
+    label: "Autonomous",
+    hint: "Optional: schedule this agent to run automatically",
+  },
 ];
 
 type StepId = typeof STEPS[number]["id"];
@@ -138,7 +133,7 @@ function StepIndicator({
   currentStep, 
   onStepClick 
 }: { 
-  steps: typeof STEPS; 
+  steps: readonly (typeof STEPS[number])[];
   currentStep: StepId; 
   onStepClick: (stepId: StepId) => void;
 }) {
@@ -233,7 +228,6 @@ function AdvancedStep({
   setInterruptOn,
   allowedTools,
   builtinTools,
-  setBuiltinTools,
   features,
   setFeatures,
   availableModels,
@@ -246,9 +240,8 @@ function AdvancedStep({
   setSubagents: (v: SubAgentRef[]) => void;
   interruptOn: InterruptOn;
   setInterruptOn: (v: InterruptOn) => void;
-  allowedTools: Record<string, string[] | boolean>;
+  allowedTools: Record<string, string[]>;
   builtinTools?: BuiltinToolsConfig;
-  setBuiltinTools: (v: BuiltinToolsConfig) => void;
   features: FeaturesConfig | undefined;
   setFeatures: (v: FeaturesConfig | undefined) => void;
   availableModels: { model_id: string; name: string; provider: string }[];
@@ -260,7 +253,6 @@ function AdvancedStep({
     (sum, tools) => sum + Object.keys(tools).length, 0
   );
   const middlewareCount = features?.middleware?.length ?? 0;
-  const workflowCount = builtinTools?.workflows?.length ?? 0;
 
   return (
     <div className="space-y-4 pt-2">
@@ -310,24 +302,6 @@ function AdvancedStep({
           onError={setMiddlewareError}
         />
       </CollapsibleSection>
-
-      <CollapsibleSection
-        title="Workflows"
-        description="Allow this agent to trigger and monitor workflows"
-        badge={`${workflowCount} workflow${workflowCount !== 1 ? "s" : ""}`}
-        defaultExpanded={false}
-      >
-        <WorkflowToolsPicker
-          value={builtinTools?.workflows ?? []}
-          onChange={(ids) => {
-            setBuiltinTools({
-              ...builtinTools,
-              workflows: ids.length > 0 ? ids : undefined,
-            } as BuiltinToolsConfig);
-          }}
-          disabled={loading}
-        />
-      </CollapsibleSection>
     </div>
   );
 }
@@ -336,6 +310,7 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
   const isEditing = !!agent;
   const isCloning = !!cloneFrom;
   const { toast } = useToast();
+  const autonomousAgentsEnabled = getConfig('autonomousAgentsEnabled');
   
   // Source for initial values: editing agent > cloning source > empty defaults
   const source = agent || cloneFrom;
@@ -346,24 +321,11 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
   );
   const [description, setDescription] = React.useState(source?.description || "");
   const [systemPrompt, setSystemPrompt] = React.useState(source?.system_prompt || "");
-  // Default to `team` for new agents — every agent must have an owner
-  // team, and team-scoped sharing is the safest default. `private` is
-  // retired (see `VisibilityType` in `@/types/dynamic-agent`); legacy
-  // docs that still carry `visibility: 'private'` on the wire are coerced
-  // to `team` here so the picker has a matching tile to highlight. The
-  // BFF-side `coerceAgentVisibilityOnRead` helper does the same on read,
-  // but we coerce defensively in the UI in case a stale GET response
-  // slips through before that helper is wired into every route.
-  const [visibility, setVisibility] = React.useState<VisibilityType>(() => {
-    const raw = source?.visibility as VisibilityType | "private" | undefined;
-    if (raw === "team" || raw === "global") return raw;
-    return "team";
-  });
+  const [visibility, setVisibility] = React.useState<VisibilityType>(source?.visibility || "private");
   const [sharedWithTeams, setSharedWithTeams] = React.useState<string[]>(
     source?.shared_with_teams || []
   );
-  const [ownerTeamSlug, setOwnerTeamSlug] = React.useState(source?.owner_team_slug || "");
-  const [allowedTools, setAllowedTools] = React.useState<Record<string, string[] | boolean>>(
+  const [allowedTools, setAllowedTools] = React.useState<Record<string, string[]>>(
     source?.allowed_tools || {}
   );
   const [builtinTools, setBuiltinTools] = React.useState<BuiltinToolsConfig | undefined>(
@@ -386,6 +348,10 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
   const [gradientTheme, setGradientTheme] = React.useState<string>(
     source?.ui?.gradient_theme || "default"
   );
+  const [autonomousTasks, setAutonomousTasks] = React.useState<AutonomousTask[]>([]);
+  const [autonomousTasksLoaded, setAutonomousTasksLoaded] = React.useState<AutonomousTask[]>([]);
+  const [autonomousTasksLoading, setAutonomousTasksLoading] = React.useState(false);
+  const [autonomousTasksError, setAutonomousTasksError] = React.useState<string | null>(null);
   const [customThemeConfig, setCustomThemeConfig] = React.useState<CustomThemeConfig>(
     source?.ui?.custom_theme_config || { gradient_from: "#6366f1", gradient_to: "#1e1b4b", accent_color: "#ffffff" }
   );
@@ -428,7 +394,7 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
   >([]);
   const [modelsLoading, setModelsLoading] = React.useState(false);
   const [availableTeams, setAvailableTeams] = React.useState<
-    TeamOption[]
+    { _id: string; name: string; description?: string }[]
   >([]);
 
   // AI suggestion state
@@ -443,20 +409,6 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
   const [enhanceExisting, setEnhanceExisting] = React.useState(false);
   const [enhanceExistingBasic, setEnhanceExistingBasic] = React.useState(false);
   const [promptStyle, setPromptStyle] = React.useState<"concise" | "comprehensive">("concise");
-
-  // AI Review hook for the system prompt (Instructions step). The hook is a no-op
-  // when `/api/review-configs/agent-system-prompt` is not configured / disabled —
-  // both the button and panel render null in that case.
-  const review = useAiReview({
-    target: "agent-system-prompt",
-    content: systemPrompt,
-    context: {
-      name,
-      agent_description: description,
-      extra_context: undefined,
-    },
-    onApplyFix: setSystemPrompt,
-  });
 
   // Editor resize drag handlers
   const handleDragStart = React.useCallback((e: React.MouseEvent) => {
@@ -602,6 +554,41 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
     fetchTeams();
   }, []);
 
+  React.useEffect(() => {
+    if (!autonomousAgentsEnabled) return;
+    if (!isEditing || !agent?._id) return;
+    let cancelled = false;
+    const agentId = agent._id;
+    setAutonomousTasksLoading(true);
+    setAutonomousTasksError(null);
+    autonomousApi
+      .listTasks()
+      .then((all) => {
+        if (cancelled) return;
+        const mine = all.filter((t) => isTaskOwnedByAgent(t, agentId));
+        setAutonomousTasks(mine);
+        setAutonomousTasksLoaded(mine);
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        if (err instanceof AutonomousApiError && (err.status === 401 || err.status === 403)) {
+          setAutonomousTasksError(
+            "You do not have permission to view autonomous schedules for this agent.",
+          );
+        } else {
+          setAutonomousTasksError(
+            err instanceof Error ? err.message : "Failed to load autonomous schedules.",
+          );
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setAutonomousTasksLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isEditing, agent?._id, autonomousAgentsEnabled]);
+
   // Step wizard state
   const [activeStep, setActiveStep] = React.useState<StepId>("basic");
 
@@ -628,7 +615,6 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
       systemPrompt,
       visibility,
       sharedWithTeams,
-      ownerTeamSlug,
       allowedTools,
       builtinTools,
       subagents,
@@ -644,7 +630,6 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
       systemPrompt,
       visibility,
       sharedWithTeams,
-      ownerTeamSlug,
       allowedTools,
       builtinTools,
       subagents,
@@ -668,28 +653,32 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
     currentValues: currentFormValues,
     snapshotKey,
   });
-  const currentStepIndex = STEPS.findIndex((s) => s.id === activeStep);
-  const currentStepConfig = STEPS.find((s) => s.id === activeStep);
+
+  // Filter the wizard step list when the autonomous-agents feature flag is off
+  // so the "Autonomous" step is hidden and step navigation math (next/prev,
+  // current index) stays consistent with what the operator actually sees.
+  const visibleSteps = React.useMemo(
+    () => STEPS.filter((step) => autonomousAgentsEnabled || step.id !== "autonomous"),
+    [autonomousAgentsEnabled],
+  );
+  const currentStepIndex = visibleSteps.findIndex((s) => s.id === activeStep);
+  const currentStepConfig = visibleSteps.find((s) => s.id === activeStep);
+
+  React.useEffect(() => {
+    if (!autonomousAgentsEnabled && activeStep === "autonomous") {
+      setActiveStep("basic");
+    }
+  }, [autonomousAgentsEnabled, activeStep]);
 
   const goToPreviousStep = () => {
     if (currentStepIndex > 0) {
-      setActiveStep(STEPS[currentStepIndex - 1].id);
+      setActiveStep(visibleSteps[currentStepIndex - 1].id);
     }
   };
 
-  const goToNextStep = async () => {
-    // Gate the instructions → tools transition behind a passing AI Review when
-    // the admin has flagged this target as "blocking". `ensurePassedOrRun` is a
-    // no-op when the config is disabled or informational.
-    if (activeStep === "instructions" && review.isBlocking) {
-      const ok = await review.ensurePassedOrRun();
-      if (!ok) {
-        setError("AI Review failed — address comments before continuing.");
-        return;
-      }
-    }
-    if (currentStepIndex < STEPS.length - 1) {
-      setActiveStep(STEPS[currentStepIndex + 1].id);
+  const goToNextStep = () => {
+    if (currentStepIndex < visibleSteps.length - 1) {
+      setActiveStep(visibleSteps[currentStepIndex + 1].id);
     }
   };
 
@@ -834,26 +823,9 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
     setLoading(true);
     setError(null);
 
-    // Gate save behind a passing AI Review when the admin has flagged this
-    // target as "blocking". `ensurePassedOrRun` is a no-op when the config is
-    // disabled or informational.
-    if (review.isBlocking) {
-      const ok = await review.ensurePassedOrRun();
-      if (!ok) {
-        setError("AI Review failed — address comments before saving.");
-        setLoading(false);
-        return;
-      }
-    }
-
     // Validate required fields
     if (!modelId || !modelProvider) {
       setError("Model selection is required");
-      setLoading(false);
-      return;
-    }
-    if (!isEditing && !ownerTeamSlug) {
-      setError("Owner team is required");
       setLoading(false);
       return;
     }
@@ -880,12 +852,7 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
             ...(gradientTheme === "custom" ? { custom_theme_config: customThemeConfig } : {}),
           }
         : undefined;
-
-      // Stamp the latest in-memory review verdict onto the saved row so the
-      // list view can show a grade badge without re-running the LLM. Only
-      // emit the field when we actually have a result this session — never
-      // overwrite a prior `last_review` with null.
-      const lastReview = buildLastReview(review.result, "agent-system-prompt");
+      let savedAgentId: string;
 
       if (isEditing) {
         // Update existing agent
@@ -903,7 +870,6 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
           ui: uiConfig,
           features: features,
           interrupt_on: interruptOn,
-          ...(lastReview ? { last_review: lastReview } : {}),
         };
 
         const response = await fetch(`/api/dynamic-agents?id=${agent._id}`, {
@@ -916,6 +882,7 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
         if (!data.success) {
           throw new Error(data.error || "Failed to update agent");
         }
+        savedAgentId = agent._id;
       } else {
         // Create new agent
         const createData: DynamicAgentConfigCreate = {
@@ -924,7 +891,6 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
           description: description || undefined,
           system_prompt: systemPrompt,
           visibility,
-          owner_team_slug: ownerTeamSlug,
           shared_with_teams: visibility === "team" ? sharedWithTeams : undefined,
           allowed_tools: allowedTools,
           builtin_tools: builtinTools,
@@ -934,7 +900,6 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
           ui: uiConfig,
           features: features,
           interrupt_on: interruptOn,
-          ...(lastReview ? { last_review: lastReview } : {}),
         };
 
         const response = await fetch("/api/dynamic-agents", {
@@ -946,6 +911,30 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
         const data = await response.json();
         if (!data.success) {
           throw new Error(data.error || "Failed to create agent");
+        }
+        savedAgentId = data.data?._id || generatedId;
+      }
+
+      if (autonomousAgentsEnabled && (autonomousTasks.length > 0 || autonomousTasksLoaded.length > 0)) {
+        try {
+          const results = await syncAutonomousTasks({
+            agentId: savedAgentId,
+            drafts: autonomousTasks,
+            serverTasks: autonomousTasksLoaded,
+            api: autonomousApi,
+          });
+          const failures = results.filter((r) => !r.ok);
+          if (failures.length > 0) {
+            toast(
+              `Saved agent, but ${failures.length} schedule change${failures.length === 1 ? "" : "s"} failed. See the Autonomous tab.`,
+              "error",
+            );
+          }
+        } catch (err: unknown) {
+          toast(
+            err instanceof Error ? err.message : "Failed to save autonomous schedules",
+            "error",
+          );
         }
       }
 
@@ -965,7 +954,7 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
     }
   };
 
-  const isValid = name.trim() && systemPrompt.trim() && modelId && availableModels.length > 0 && (isEditing || ownerTeamSlug);
+  const isValid = name.trim() && systemPrompt.trim() && modelId && availableModels.length > 0;
 
   // Back-button click handler. When the form has unsaved changes, we surface
   // an in-app confirmation modal instead of silently discarding work. The
@@ -1017,14 +1006,12 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
                 : "Configure a new custom AI agent"}
             </CardDescription>
           </div>
-          <AgentAvatar
-            gradientTheme={gradientTheme}
-            customThemeConfig={gradientTheme === "custom" ? customThemeConfig : undefined}
-            rounded="rounded-lg"
-            size="ml-auto h-9 w-9"
-            iconSize="h-5 w-5"
-            className="transition-all"
-          />
+          <div
+            className="ml-auto h-9 w-9 rounded-lg flex items-center justify-center shrink-0 transition-all"
+            style={getGradientStyle(gradientTheme, gradientTheme === "custom" ? customThemeConfig : null)}
+          >
+            <Bot className="h-5 w-5" style={{ color: getAccentColor(gradientTheme, customThemeConfig) || "white" }} />
+          </div>
         </div>
       </CardHeader>
       <CardContent>
@@ -1036,7 +1023,7 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
               <p className="text-xs text-muted-foreground mt-0.5">{currentStepConfig?.hint}</p>
             </div>
             <StepIndicator 
-              steps={STEPS} 
+              steps={visibleSteps}
               currentStep={activeStep} 
               onStepClick={setActiveStep} 
             />
@@ -1280,14 +1267,12 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
                       <div className="absolute right-full top-0 mr-2 p-4 rounded-lg border border-border bg-card shadow-lg space-y-4 w-72 z-50">
                         {/* Preview */}
                         <div className="flex items-center gap-3">
-                          <AgentAvatar
-                            gradientTheme="custom"
-                            customThemeConfig={customThemeConfig}
-                            rounded="rounded-xl"
-                            size="h-12 w-12"
-                            iconSize="h-6 w-6"
-                            className="transition-all"
-                          />
+                          <div
+                            className="h-12 w-12 rounded-xl flex items-center justify-center shrink-0 transition-all"
+                            style={getGradientStyle("custom", customThemeConfig)}
+                          >
+                            <Bot className="h-6 w-6" style={{ color: customThemeConfig.accent_color }} />
+                          </div>
                           <div className="text-xs text-muted-foreground">
                             Live preview
                           </div>
@@ -1364,39 +1349,8 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="ownerTeam">
-                  Owner Team {!isEditing && <span className="text-destructive">*</span>}
-                </Label>
-                <select
-                  id="ownerTeam"
-                  value={ownerTeamSlug}
-                  onChange={(e) => setOwnerTeamSlug(e.target.value)}
-                  disabled={loading || isEditing}
-                  className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                >
-                  <option value="">Select a team that will own this agent</option>
-                  {availableTeams
-                    .filter((team) => team.slug)
-                    .map((team) => (
-                      <option key={team._id} value={team.slug} disabled={!team.can_own_agents}>
-                        {team.name}
-                        {team.user_role ? ` (${team.user_role})` : ""}
-                      </option>
-                    ))}
-                </select>
-                <p className="text-xs text-muted-foreground">
-                  Owner-team members can use the agent; owner-team admins can manage it.
-                </p>
-                {!isEditing && availableTeams.every((team) => !team.can_own_agents) && (
-                  <p className="text-xs text-destructive">
-                    You need to be a platform admin or a team admin to create a team-owned agent.
-                  </p>
-                )}
-              </div>
-
-              <div className="space-y-2">
                 <Label>Visibility</Label>
-                <div className="grid grid-cols-2 gap-2">
+                <div className="grid grid-cols-3 gap-2">
                   {VISIBILITY_OPTIONS.map((opt) => (
                     <button
                       key={opt.value}
@@ -1468,7 +1422,6 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
                   <Label htmlFor="systemPrompt">
                     System Prompt <span className="text-destructive">*</span>
                   </Label>
-                  <div className="flex items-center gap-2">
                   <div className="relative">
                     <Button
                       type="button"
@@ -1572,11 +1525,6 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
                       )}
                     </AnimatePresence>
                   </div>
-                  {/* AI Review button — sibling to AI Suggest. Renders disabled
-                      when the target isn't configured; the panel below renders
-                      null in the same case so this is the only visible affordance. */}
-                  <AiReviewButton review={review} size="sm" />
-                  </div>
                 </div>
 
                 {/* Edit / Preview tabs */}
@@ -1609,83 +1557,63 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
                   </button>
                 </div>
 
-                {/* Editor column + AI Review panel side-by-side. Panel renders
-                    null when the target isn't configured / disabled, so the
-                    flex container collapses to just the editor in that case. */}
-                <div className="flex gap-3 min-h-0">
-                  <div className="flex-1 min-w-0">
-                    {promptTab === "edit" ? (
-                      <div className="rounded-lg overflow-hidden border border-border/30 bg-[#1e1e2e]" style={{ height: `${editorHeight}px` }}>
-                        <React.Suspense
-                          fallback={
-                            <div className="flex items-center justify-center h-48 text-zinc-500">
-                              <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                              <span className="text-sm">Loading editor...</span>
-                            </div>
-                          }
-                        >
-                          <CodeMirrorEditor
-                            value={systemPrompt}
-                            onChange={(val: string) => setSystemPrompt(val)}
-                            extensions={cmExtensions}
-                            theme="dark"
-                            height={`${editorHeight}px`}
-                            style={{ fontSize: "15px" }}
-                            basicSetup={{
-                              lineNumbers: true,
-                              foldGutter: true,
-                              highlightActiveLine: true,
-                              bracketMatching: true,
-                              autocompletion: false,
-                              indentOnInput: true,
-                            }}
-                            placeholder="You are a helpful AI assistant that specializes in..."
-                            editable={!loading && generatingField !== "system_prompt"}
-                          />
-                        </React.Suspense>
-                      </div>
-                    ) : (
-                      <div className="rounded-lg border p-4 overflow-y-auto prose prose-sm dark:prose-invert max-w-none" style={{ height: `${editorHeight}px` }}>
-                        {systemPrompt.trim() ? (
-                          <ReactMarkdown
-                            remarkPlugins={[remarkGfm]}
-                            components={getMarkdownComponents()}
-                          >
-                            {systemPrompt}
-                          </ReactMarkdown>
-                        ) : (
-                          <p className="text-muted-foreground italic text-sm">
-                            Nothing to preview. Switch to Edit to write your system prompt.
-                          </p>
-                        )}
-                      </div>
-                    )}
-
-                    {/* Drag handle to resize editor */}
-                    <div
-                      onMouseDown={handleDragStart}
-                      className="flex items-center justify-center h-3 cursor-row-resize group hover:bg-muted/50 rounded-b-lg transition-colors"
-                    >
-                      <GripHorizontal className="h-3 w-3 text-muted-foreground/40 group-hover:text-muted-foreground" />
-                    </div>
-                  </div>
-                  <AiReviewPanel
-                    review={review}
-                    style={{ height: `${editorHeight + 12}px` }}
-                    onClickAnchor={(anchor) => {
-                      // Phase 1: no-op stub. A follow-up will scroll the
-                      // CodeMirror view to `anchor.line_start` and flash a
-                      // gutter decoration. Logging keeps the wiring observable
-                      // during development.
-                      if (process.env.NODE_ENV !== "production") {
-                        console.debug("[ai-review] anchor click", anchor);
+                {promptTab === "edit" ? (
+                  <div className="rounded-lg overflow-hidden border border-border/30 bg-[#1e1e2e]" style={{ height: `${editorHeight}px` }}>
+                    <React.Suspense
+                      fallback={
+                        <div className="flex items-center justify-center h-48 text-zinc-500">
+                          <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                          <span className="text-sm">Loading editor...</span>
+                        </div>
                       }
-                    }}
-                  />
+                    >
+                      <CodeMirrorEditor
+                        value={systemPrompt}
+                        onChange={(val: string) => setSystemPrompt(val)}
+                        extensions={cmExtensions}
+                        theme="dark"
+                        height={`${editorHeight}px`}
+                        style={{ fontSize: "15px" }}
+                        basicSetup={{
+                          lineNumbers: true,
+                          foldGutter: true,
+                          highlightActiveLine: true,
+                          bracketMatching: true,
+                          autocompletion: false,
+                          indentOnInput: true,
+                        }}
+                        placeholder="You are a helpful AI assistant that specializes in..."
+                        editable={!loading && generatingField !== "system_prompt"}
+                      />
+                    </React.Suspense>
+                  </div>
+                ) : (
+                  <div className="rounded-lg border p-4 overflow-y-auto prose prose-sm dark:prose-invert max-w-none" style={{ height: `${editorHeight}px` }}>
+                    {systemPrompt.trim() ? (
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm]}
+                        components={getMarkdownComponents()}
+                      >
+                        {systemPrompt}
+                      </ReactMarkdown>
+                    ) : (
+                      <p className="text-muted-foreground italic text-sm">
+                        Nothing to preview. Switch to Edit to write your system prompt.
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                {/* Drag handle to resize editor */}
+                <div
+                  onMouseDown={handleDragStart}
+                  className="flex items-center justify-center h-3 cursor-row-resize group hover:bg-muted/50 rounded-b-lg transition-colors"
+                >
+                  <GripHorizontal className="h-3 w-3 text-muted-foreground/40 group-hover:text-muted-foreground" />
                 </div>
 
                 <p className="text-sm text-muted-foreground">
-                  Define your agent&apos;s behavior, personality, and capabilities.
+                  Define your agent&apos;s behavior, personality, and capabilities. 
                   You can paste content from an AGENTS.md file here.
                 </p>
               </div>
@@ -1716,16 +1644,6 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
                   value={allowedTools}
                   onChange={setAllowedTools}
                   disabled={loading}
-                />
-              </div>
-
-              {/* Advanced: Middleware */}
-              <div className="border-t pt-4">
-                <MiddlewarePicker
-                  value={features}
-                  onChange={setFeatures}
-                  disabled={loading}
-                  availableModels={availableModels}
                 />
               </div>
             </div>
@@ -1759,13 +1677,24 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
               setInterruptOn={setInterruptOn}
               allowedTools={allowedTools}
               builtinTools={builtinTools}
-              setBuiltinTools={(v) => setBuiltinTools(v)}
               features={features}
               setFeatures={setFeatures}
               availableModels={availableModels}
               setMiddlewareError={setMiddlewareError}
               loading={loading}
               visibility={visibility}
+            />
+          )}
+
+          {autonomousAgentsEnabled && activeStep === "autonomous" && (
+            <AutonomousTasksStep
+              agentId={isEditing ? agent?._id || "" : generatedId}
+              tasks={autonomousTasks}
+              onChange={setAutonomousTasks}
+              loading={autonomousTasksLoading}
+              error={autonomousTasksError}
+              disabled={loading}
+              isCloning={isCloning}
             />
           )}
 
@@ -1789,11 +1718,11 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
               <ChevronLeft className="h-4 w-4 mr-1" />
               Previous
             </Button>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => void goToNextStep()}
-              disabled={currentStepIndex === STEPS.length - 1 || loading}
+            <Button 
+              type="button" 
+              variant="outline" 
+              onClick={goToNextStep}
+              disabled={currentStepIndex === visibleSteps.length - 1 || loading}
               size="sm"
             >
               Next
@@ -1811,7 +1740,7 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
           ) : (
             <>
               {builtinTools?.fetch_url?.enabled ? "1 built-in, " : ""}
-              {Object.keys(allowedTools).length} MCP server(s), {subagents.length} subagent(s)
+              {Object.keys(allowedTools).length} MCP server(s), {subagents.length} subagent(s), {autonomousTasks.length} schedule(s)
             </>
           )}
         </div>
@@ -1819,7 +1748,7 @@ export function DynamicAgentEditor({ agent, cloneFrom, readOnly, onSave, onCance
           {readOnly ? "Close" : "Cancel"}
         </Button>
         {!readOnly && (
-          <Button onClick={handleSubmit} disabled={loading || !isValid}>
+          <Button onClick={handleSubmit} disabled={loading || !isValid || middlewareError}>
             {loading ? (
               <>
                 <Loader2 className="h-4 w-4 mr-2 animate-spin" />

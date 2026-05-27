@@ -9,11 +9,7 @@ const mockGetServerSession = jest.fn();
 jest.mock('next-auth', () => ({
   getServerSession: (...args: any[]) => mockGetServerSession(...args),
 }));
-jest.mock('@/lib/auth-config', () => ({
-  authOptions: {},
-  isBootstrapAdmin: jest.fn().mockReturnValue(false),
-  REQUIRED_ADMIN_GROUP: '',
-}));
+jest.mock('@/lib/auth-config', () => ({ authOptions: {} }));
 jest.mock('@/lib/config', () => ({
   getConfig: (key: string) => key === 'ssoEnabled',
 }));
@@ -168,6 +164,114 @@ describe('requireConversationAccess — admin audit', () => {
     expect(result.conversation).toEqual(conv);
   });
 
+  it('admin viewing autonomous-source conversation they do not own returns admin_audit', async () => {
+    // After removing the source==='autonomous' bypass, admins now receive
+    // admin_audit rather than 'shared' for autonomous conversations they don't own.
+    const conv = {
+      _id: CONV_ID,
+      owner_id: 'owner@example.com',
+      title: 'Autonomous Task',
+      sharing: { shared_with: [], shared_with_teams: [] },
+      source: 'autonomous',
+    };
+    const convsCol = createMockCollection();
+    convsCol.findOne.mockResolvedValue(conv);
+    mockCollections['conversations'] = convsCol;
+
+    const sharingAccessCol = createMockCollection();
+    sharingAccessCol.findOne.mockResolvedValue(null);
+    mockCollections['sharing_access'] = sharingAccessCol;
+
+    const result = await requireConversationAccess(
+      CONV_ID,
+      'admin@example.com',
+      mockGetCollection,
+      { role: 'admin' }
+    );
+
+    // The autonomous bypass (Inv-D) has been removed. Admins get audit access,
+    // not broad 'shared' access. Autonomous conversations now follow standard
+    // per-user ownership — only the task owner gets full interactive access.
+    expect(result.access_level).toBe('admin_audit');
+    expect(result.conversation).toEqual(conv);
+  });
+
+  it('non-admin viewing autonomous-source conversation owned by another user returns 403', async () => {
+    // After removing the source==='autonomous' bypass, non-owners of autonomous
+    // conversations receive 403, just like any other conversation type.
+    const conv = {
+      _id: CONV_ID,
+      owner_id: 'autonomous@system',
+      title: 'Autonomous Task',
+      sharing: { shared_with: [], shared_with_teams: [] },
+      source: 'autonomous',
+    };
+    const convsCol = createMockCollection();
+    convsCol.findOne.mockResolvedValue(conv);
+    mockCollections['conversations'] = convsCol;
+
+    const sharingAccessCol = createMockCollection();
+    sharingAccessCol.findOne.mockResolvedValue(null);
+    mockCollections['sharing_access'] = sharingAccessCol;
+
+    await expect(
+      requireConversationAccess(CONV_ID, 'user@example.com', mockGetCollection, { role: 'user' })
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  it('admin viewing non-autonomous non-owned conversation still returns admin_audit (regression guard)', async () => {
+    const conv = {
+      _id: CONV_ID,
+      owner_id: 'owner@example.com',
+      title: 'Web conversation',
+      sharing: { shared_with: [], shared_with_teams: [] },
+      // No `source` field — exercises the non-autonomous path.
+    };
+    const convsCol = createMockCollection();
+    convsCol.findOne.mockResolvedValue(conv);
+    mockCollections['conversations'] = convsCol;
+
+    const sharingAccessCol = createMockCollection();
+    sharingAccessCol.findOne.mockResolvedValue(null);
+    mockCollections['sharing_access'] = sharingAccessCol;
+
+    const result = await requireConversationAccess(
+      CONV_ID,
+      'admin@example.com',
+      mockGetCollection,
+      { role: 'admin' }
+    );
+
+    expect(result.access_level).toBe('admin_audit');
+    expect(result.conversation).toEqual(conv);
+  });
+
+  it('returns access_level admin_audit when canViewAdmin=true session is provided', async () => {
+    const conv = {
+      _id: CONV_ID,
+      owner_id: 'owner@example.com',
+      title: 'Test',
+      sharing: { shared_with: [], shared_with_teams: [] },
+    };
+    const convsCol = createMockCollection();
+    convsCol.findOne.mockResolvedValue(conv);
+    mockCollections['conversations'] = convsCol;
+
+    const sharingAccessCol = createMockCollection();
+    sharingAccessCol.findOne.mockResolvedValue(null);
+    mockCollections['sharing_access'] = sharingAccessCol;
+
+    const result = await requireConversationAccess(
+      CONV_ID,
+      'auditor@example.com',
+      mockGetCollection,
+      { role: 'user', canViewAdmin: true }
+    );
+
+    expect(result.access_level).toBe('admin_audit');
+    expect(result.conversation).toEqual(conv);
+  });
+
   it('throws 403 when non-admin non-shared non-owner user without session', async () => {
     const conv = {
       _id: CONV_ID,
@@ -188,7 +292,7 @@ describe('requireConversationAccess — admin audit', () => {
     await expect(err).rejects.toMatchObject({ statusCode: 403 });
   });
 
-  it('throws 403 when non-admin user with session (role=user)', async () => {
+  it('throws 403 when non-admin user even with session (role=user, canViewAdmin=false)', async () => {
     const conv = {
       _id: CONV_ID,
       owner_id: 'owner@example.com',
@@ -205,6 +309,7 @@ describe('requireConversationAccess — admin audit', () => {
 
     const err = requireConversationAccess(CONV_ID, 'other@example.com', mockGetCollection, {
       role: 'user',
+      canViewAdmin: false,
     });
     await expect(err).rejects.toThrow(ApiError);
     await expect(err).rejects.toMatchObject({ statusCode: 403 });
@@ -310,6 +415,7 @@ describe('GET /api/chat/conversations/[id] — access_level in response', () => 
     mockGetServerSession.mockResolvedValue({
       user: { email: 'admin@example.com', name: 'Admin' },
       role: 'admin',
+      canViewAdmin: true,
     });
 
     const convsCol = createMockCollection();
@@ -368,6 +474,6 @@ describe('GET /api/chat/conversations/[id] — access_level in response', () => 
     expect(res.status).toBe(403);
     const body = await res.json();
     expect(body.success).toBe(false);
-    expect(body.error).toContain('You do not have access to this conversation.');
+    expect(body.error).toContain('Forbidden');
   });
 });

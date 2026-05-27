@@ -20,11 +20,14 @@ import {
 } from "lucide-react";
 import type { DynamicAgentConfig } from "@/types/dynamic-agent";
 import { DynamicAgentEditor } from "./DynamicAgentEditor";
-import { AgentAvatar } from "./AgentAvatar";
+import { autonomousApi } from "@/components/autonomous/api";
+import { getGradientStyle, getAccentColor } from "@/lib/gradient-themes";
 import { toYaml } from "@/lib/yaml-serializer";
-import { LastReviewBadge } from "@/components/ai-review";
+import { isTaskOwnedByAgent } from "./taskOwnership";
+import { getConfig } from "@/lib/config";
 
 export function DynamicAgentsTab() {
+  const autonomousAgentsEnabled = getConfig('autonomousAgentsEnabled');
   const [agents, setAgents] = React.useState<DynamicAgentConfig[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
@@ -73,14 +76,41 @@ export function DynamicAgentsTab() {
   };
 
   const handleToggleEnabled = async (agent: DynamicAgentConfig) => {
+    const nextEnabled = !agent.enabled;
     try {
       const response = await fetch(`/api/dynamic-agents?id=${agent._id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled: !agent.enabled }),
+        body: JSON.stringify({ enabled: nextEnabled }),
       });
       const data = await response.json();
       if (data.success) {
+        if (autonomousAgentsEnabled) {
+          try {
+            const tasks = await autonomousApi.listTasks();
+            const linkedTasks = tasks.filter((task) => isTaskOwnedByAgent(task, agent._id));
+            const tasksToUpdate = linkedTasks.filter((task) => task.enabled !== nextEnabled);
+            const results = await Promise.allSettled(
+              tasksToUpdate.map((task) =>
+                autonomousApi.updateTask(task.id, {
+                  ...task,
+                  enabled: nextEnabled,
+                }),
+              ),
+            );
+            const failures = results.filter((result) => result.status === "rejected");
+            if (failures.length > 0) {
+              alert(
+                `Agent status updated, but ${failures.length} linked autonomous task${failures.length === 1 ? "" : "s"} failed to sync.`,
+              );
+            }
+          } catch (err: any) {
+            alert(
+              err.message ||
+                "Agent status updated, but linked autonomous tasks failed to sync.",
+            );
+          }
+        }
         fetchAgents();
       } else {
         alert(data.error || "Failed to update agent");
@@ -230,8 +260,7 @@ export function DynamicAgentsTab() {
             <div className="grid grid-cols-12 gap-4 pb-2 border-b text-xs font-medium text-muted-foreground px-2">
               <div className="col-span-4">Name</div>
               <div className="col-span-2">Visibility</div>
-              <div className="col-span-1">Tools</div>
-              <div className="col-span-1">Grade</div>
+              <div className="col-span-2">Tools</div>
               <div className="col-span-2">Status</div>
               <div className="col-span-2 text-right">Actions</div>
             </div>
@@ -245,12 +274,12 @@ export function DynamicAgentsTab() {
               >
                 <div className="col-span-4">
                     <div className="flex items-center gap-3">
-                      <AgentAvatar
-                        agent={agent}
-                        rounded="rounded-lg"
-                        size="h-9 w-9"
-                        iconSize="h-5 w-5"
-                      />
+                      <div 
+                        className="h-9 w-9 rounded-lg flex items-center justify-center shrink-0"
+                        style={getGradientStyle(agent.ui?.gradient_theme, agent.ui?.custom_theme_config)}
+                      >
+                        <Bot className="h-5 w-5" style={{ color: getAccentColor(agent.ui?.gradient_theme, agent.ui?.custom_theme_config) || "white" }} />
+                      </div>
                       <div className="min-w-0 flex-1">
                         <div className="font-medium text-sm truncate">{agent.name}</div>
                         {agent.description && (
@@ -272,14 +301,10 @@ export function DynamicAgentsTab() {
                   </Badge>
                 </div>
 
-                <div className="col-span-1">
+                <div className="col-span-2">
                   <span className="text-sm text-muted-foreground">
-                    {Object.keys(agent.allowed_tools || {}).length}
+                    {Object.keys(agent.allowed_tools || {}).length} server(s)
                   </span>
-                </div>
-
-                <div className="col-span-1">
-                  <LastReviewBadge review={agent.last_review} />
                 </div>
 
                 <div className="col-span-2">

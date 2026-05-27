@@ -14,7 +14,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { useChatStore } from "@/store/chat-store";
 import { A2ASDKClient, type ParsedA2AEvent, type HITLDecision, toStoreEvent } from "@/lib/a2a-sdk-client";
 import { DynamicAgentClient } from "@/lib/dynamic-agent-client";
-import { type SSEAgentEvent } from "@/lib/streaming/types";
+import { type SSEAgentEvent } from "@/components/dynamic-agents/sse-types";
 import { isFeatureEnabled, useFeatureFlagStore } from "@/store/feature-flag-store";
 import { cn, deduplicateByKey } from "@/lib/utils";
 import { ChatMessage as ChatMessageType, A2AEvent, SupervisorTimelineSegment, PlanStep } from "@/types/a2a";
@@ -107,6 +107,7 @@ export function SupervisorChatPanel({ endpoint, conversationId, conversationTitl
     cancelConversationRequest,
     updateMessageFeedback,
     consumePendingMessage,
+    consumeInputDraft,
     recoverInterruptedTask,
     evictOldMessageContent,
     loadMessagesFromServer,
@@ -365,6 +366,16 @@ export function SupervisorChatPanel({ endpoint, conversationId, conversationTitl
     if (!convId) {
       convId = await createConversation();
     }
+
+    // Spec #099 Story 2 — autonomous-task chat threads use the SAME
+    // A2A streaming pipeline as regular chats. The conversation id is
+    // the deterministic UUIDv5 derived from task_id (set by the
+    // synthesiser in ``loadAutonomousConversationsFromService``), and
+    // that's the same contextId scheduled fires use, so the
+    // supervisor's checkpointer naturally keeps a single conversation
+    // thread across typed and scheduled messages — no bypass, no
+    // separate endpoint, full A2A debug + plan + tool timeline render
+    // for free.
 
     // Clear previous turn's events (tasks, tool completions, stream events)
     // Dynamic agents use SSE events, default supervisor uses A2A events
@@ -1056,6 +1067,35 @@ export function SupervisorChatPanel({ endpoint, conversationId, conversationTitl
       submitMessage(pendingMessage);
     }
   }, [activeConversationId, consumePendingMessage, submitMessage]);
+
+  // Spec #099 Phase 3 — one-shot input draft pre-fill (does NOT auto-send,
+  // distinct from pendingMessage above). Used by "+ New Chat" on the
+  // Autonomous tab to seed the textbox with a starter prompt the operator
+  // can edit and decide when to submit.
+  useEffect(() => {
+    const draft = consumeInputDraft();
+    if (draft && !input) {
+      setInput(draft);
+    }
+    // Run once per conversation activation. Intentionally exclude
+    // ``input`` from deps so we don't re-trigger when the user starts typing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConversationId, consumeInputDraft]);
+
+  // Spec #099 Phase B — when an autonomous-task chat thread is open,
+  // poll the autonomous-agents service every 15 s so newly-fired
+  // scheduled runs (and the rich A2A events Phase B captures for them)
+  // auto-append to the open thread without the operator having to
+  // toggle the sidebar chip or hard-refresh. The merge logic in
+  // ``loadAutonomousConversationsFromService`` preserves any in-progress
+  // user-typed turns + a2aEvents so the poll is non-destructive.
+  useEffect(() => {
+    if (conversation?.source !== 'autonomous') return;
+    const interval = window.setInterval(() => {
+      useChatStore.getState().loadAutonomousConversationsFromService().catch(() => {});
+    }, 15_000);
+    return () => window.clearInterval(interval);
+  }, [conversation?.source]);
 
   const handleStop = useCallback(() => {
     if (activeConversationId) {
@@ -1822,7 +1862,7 @@ export function SupervisorChatPanel({ endpoint, conversationId, conversationTitl
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-amber-600/20 text-amber-700 dark:text-amber-300 hover:bg-amber-600/30 transition-colors"
             >
               <ArrowLeft className="h-3 w-3" />
-              {adminOrigin === 'audit-logs' ? 'Back to Chat Audit' : 'Back to Feedback'}
+              {adminOrigin === 'audit-logs' ? 'Back to Audit Logs' : 'Back to Feedback'}
             </a>
             )}
           </div>
